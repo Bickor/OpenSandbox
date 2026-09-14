@@ -22,7 +22,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, TypeVar
 
 from opensandbox.adapters.factory import AdapterFactory
 from opensandbox.config import ConnectionConfig
@@ -33,7 +33,10 @@ from opensandbox.exceptions import (
     SandboxInternalException,
 )
 from opensandbox.internal.lifecycle_metrics import report_sandbox_create_metric
-from opensandbox.internal.readiness import ReadinessBudget
+from opensandbox.internal.readiness import (
+    ReadinessBudget,
+    validate_polling_interval,
+)
 from opensandbox.models.diagnostics import DiagnosticContent
 from opensandbox.models.sandboxes import (
     CreateSnapshotRequest,
@@ -63,6 +66,33 @@ from opensandbox.services import (
 )
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+
+
+async def _gather_fail_fast(*awaitables: Awaitable[_T]) -> list[_T]:
+    """Await concurrent coroutines, cancelling the rest once one fails.
+
+    ``asyncio.gather`` propagates the first exception without cancelling the
+    sibling coroutines, so a permanently failing endpoint lookup (401/403 or a
+    non-retryable 404) would leave the sibling endpoint's retry loop polling
+    until the shared readiness deadline, issuing requests against a sandbox
+    that ``create`` is about to clean up. Cancel and await the remaining
+    tasks on the first failure (including cancellation of this task), then
+    let the original exception propagate. Python 3.10 compatible; no
+    ``asyncio.TaskGroup`` (3.11+).
+    """
+    tasks = [asyncio.ensure_future(awaitable) for awaitable in awaitables]
+    try:
+        return list(await asyncio.gather(*tasks))
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        # return_exceptions suppresses the siblings' CancelledError (and any
+        # concurrent failure) so the original exception is the one re-raised.
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
 class Sandbox:
@@ -498,7 +528,7 @@ class Sandbox:
         Args:
             image: Container image specification including image reference and optional auth
             timeout: Maximum sandbox lifetime. Pass None to require explicit cleanup.
-            ready_timeout: Maximum time to wait for sandbox to become ready
+            ready_timeout: Total budget for endpoint publication and health checks.
             env: Environment variables for the sandbox
             metadata: Custom metadata for the sandbox
             resource: Resource limits (CPU, memory, etc.)
@@ -512,8 +542,8 @@ class Sandbox:
                 Each volume specifies a backend (host path, PVC, or OSSFS) and mount configuration.
             connection_config: Connection configuration
             health_check: Custom async health check function
-            health_check_polling_interval: Time between health check attempts
-            skip_health_check: If True, do NOT wait for sandbox readiness/health; returned instance may not be ready yet.
+            health_check_polling_interval: Polling interval used while waiting for endpoint publication and readiness/health.
+            skip_health_check: Skip health checks; endpoint publication is still awaited.
             lifecycle: Optional pre-start and periodic lifecycle hooks.
 
         Returns:
@@ -526,6 +556,8 @@ class Sandbox:
             raise InvalidArgumentException(
                 "Exactly one of image or snapshot_id must be specified"
             )
+        if not skip_health_check:
+            validate_polling_interval(health_check_polling_interval)
 
         config = (connection_config or ConnectionConfig()).with_transport_if_missing()
         entrypoint = entrypoint or ["tail", "-f", "/dev/null"]
@@ -570,13 +602,14 @@ class Sandbox:
             )
             sandbox_id = response.id
 
-            execd_endpoint, egress_endpoint = await asyncio.gather(
-                sandbox_service.get_sandbox_endpoint(
+            budget = ReadinessBudget(ready_timeout, health_check_polling_interval)
+            execd_endpoint, egress_endpoint = await _gather_fail_fast(
+                budget.endpoint(lambda: sandbox_service.get_sandbox_endpoint(
                     response.id, DEFAULT_EXECD_PORT, config.use_server_proxy
-                ),
-                sandbox_service.get_sandbox_endpoint(
+                )),
+                budget.endpoint(lambda: sandbox_service.get_sandbox_endpoint(
                     response.id, DEFAULT_EGRESS_PORT, config.use_server_proxy
-                ),
+                )),
             )
 
             sandbox = cls(
@@ -596,7 +629,7 @@ class Sandbox:
             )
 
             if not skip_health_check:
-                await sandbox.check_ready(ready_timeout, health_check_polling_interval)
+                await sandbox._check_ready(budget)
                 logger.info(f"Sandbox {sandbox.id} is ready")
             else:
                 logger.info(
@@ -751,6 +784,7 @@ class Sandbox:
         if not sandbox_id:
             raise InvalidArgumentException("Sandbox ID must be specified")
         sandbox_id = str(sandbox_id)
+        validate_polling_interval(health_check_polling_interval)
 
         config = (connection_config or ConnectionConfig()).with_transport_if_missing()
 

@@ -137,7 +137,7 @@ func TestReconcileDeletingPod(t *testing.T) {
 			require.NoError(t, apiClient.Status().Update(testContext, snapshot))
 			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name + "-0", Namespace: "default",
 				Finalizers:      []string{"test.opensandbox.io/hold"},
-				Labels:          map[string]string{LabelBatchSandboxNameKey: name, LabelBatchSandboxPodIndexKey: "0"},
+				Labels:          map[string]string{labelBatchSandboxNameKey: name, labelBatchSandboxPodIndexKey: "0"},
 				OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(bs, sandboxv1alpha1.GroupVersion.WithKind("BatchSandbox"))},
 			}, Spec: *bs.Spec.Template.Spec.DeepCopy()}
 			require.NoError(t, apiClient.Create(testContext, pod))

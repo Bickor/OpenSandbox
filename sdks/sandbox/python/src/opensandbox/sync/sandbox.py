@@ -31,7 +31,10 @@ from opensandbox.exceptions import (
     SandboxInternalException,
 )
 from opensandbox.internal.lifecycle_metrics import report_sandbox_create_metric
-from opensandbox.internal.readiness import ReadinessBudget
+from opensandbox.internal.readiness import (
+    ReadinessBudget,
+    validate_polling_interval,
+)
 from opensandbox.models.diagnostics import DiagnosticContent
 from opensandbox.models.sandboxes import (
     CreateSnapshotRequest,
@@ -494,7 +497,7 @@ class SandboxSync:
         Args:
             image: Container image specification including image reference and optional auth
             timeout: Maximum sandbox lifetime. Pass None to require explicit cleanup.
-            ready_timeout: Maximum time to wait for sandbox to become ready
+            ready_timeout: Total budget for endpoint publication and health checks.
             env: Environment variables for the sandbox
             metadata: Custom metadata for the sandbox
             resource: Resource limits (CPU, memory, etc.)
@@ -507,8 +510,8 @@ class SandboxSync:
             volumes: Optional list of volumes to mount in the sandbox.
             connection_config: Connection configuration
             health_check: Custom sync health check function
-            health_check_polling_interval: Time between health check attempts
-            skip_health_check: If True, do NOT wait for sandbox readiness/health; returned instance may not be ready yet.
+            health_check_polling_interval: Polling interval used while waiting for endpoint publication and readiness/health.
+            skip_health_check: Skip health checks; endpoint publication is still awaited.
             lifecycle: Optional pre-start and periodic lifecycle hooks.
 
         Returns:
@@ -521,6 +524,8 @@ class SandboxSync:
             raise InvalidArgumentException(
                 "Exactly one of image or snapshot_id must be specified"
             )
+        if not skip_health_check:
+            validate_polling_interval(health_check_polling_interval)
 
         config = (
             connection_config or ConnectionConfigSync()
@@ -566,12 +571,13 @@ class SandboxSync:
                 lifecycle=lifecycle,
             )
             sandbox_id = response.id
-            execd_endpoint = sandbox_service.get_sandbox_endpoint(
+            budget = ReadinessBudget(ready_timeout, health_check_polling_interval)
+            execd_endpoint = budget.endpoint_sync(lambda: sandbox_service.get_sandbox_endpoint(
                 response.id, DEFAULT_EXECD_PORT, config.use_server_proxy
-            )
-            egress_endpoint = sandbox_service.get_sandbox_endpoint(
+            ))
+            egress_endpoint = budget.endpoint_sync(lambda: sandbox_service.get_sandbox_endpoint(
                 response.id, DEFAULT_EGRESS_PORT, config.use_server_proxy
-            )
+            ))
 
             sandbox = cls(
                 sandbox_id=response.id,
@@ -590,7 +596,7 @@ class SandboxSync:
             )
 
             if not skip_health_check:
-                sandbox.check_ready(ready_timeout, health_check_polling_interval)
+                sandbox._check_ready(budget)
                 logger.info(f"Sandbox {sandbox.id} is ready")
             else:
                 logger.info(
@@ -738,6 +744,7 @@ class SandboxSync:
             raise InvalidArgumentException("Sandbox ID must be specified")
 
         sandbox_id = str(sandbox_id)
+        validate_polling_interval(health_check_polling_interval)
 
         config = (
             connection_config or ConnectionConfigSync()
