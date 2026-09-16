@@ -41,7 +41,8 @@ const (
 // directory beneath it and changes that directory to the target child UID/GID.
 type ProcessSessionConfig struct {
 	// ParentDir must remain at the same path and must not be group/world
-	// writable for the complete child lifetime.
+	// writable for the complete child lifetime. Its mode must grant search to
+	// the target UID/GID class so the child can reach its owned directory.
 	ParentDir         string
 	UID               int
 	GID               int
@@ -57,6 +58,8 @@ type ProcessSession struct {
 	parentPath    string
 	parentRoot    *os.Root
 	parentInfo    os.FileInfo
+	targetUID     int
+	targetGID     int
 	directoryName string
 	directoryInfo os.FileInfo
 	launch        mitmproxy.RevisionIPCConfig
@@ -78,7 +81,7 @@ func NewProcessSession(cfg ProcessSessionConfig) (*ProcessSession, error) {
 		return nil, revision.ErrInvalid
 	}
 	pathInfo, err := os.Lstat(cfg.ParentDir)
-	if err != nil || !validProcessSessionParentInfo(pathInfo) {
+	if err != nil || !validProcessSessionParentInfo(pathInfo, cfg.UID, cfg.GID) {
 		return nil, revision.ErrInvalid
 	}
 	parentRoot, err := os.OpenRoot(cfg.ParentDir)
@@ -86,7 +89,8 @@ func NewProcessSession(cfg ProcessSessionConfig) (*ProcessSession, error) {
 		return nil, revision.ErrTransportUnavailable
 	}
 	parentInfo, err := parentRoot.Stat(".")
-	if err != nil || !os.SameFile(pathInfo, parentInfo) || !validProcessSessionParentInfo(parentInfo) {
+	if err != nil || !os.SameFile(pathInfo, parentInfo) ||
+		!validProcessSessionParentInfo(parentInfo, cfg.UID, cfg.GID) {
 		_ = parentRoot.Close()
 		return nil, revision.ErrInvalid
 	}
@@ -172,6 +176,8 @@ func NewProcessSession(cfg ProcessSessionConfig) (*ProcessSession, error) {
 		parentPath:    cfg.ParentDir,
 		parentRoot:    parentRoot,
 		parentInfo:    parentInfo,
+		targetUID:     cfg.UID,
+		targetGID:     cfg.GID,
 		directoryName: directoryName,
 		directoryInfo: directoryInfo,
 		launch:        launch,
@@ -191,8 +197,25 @@ func validProcessSessionID(value int) bool {
 	return value >= 0 && uint64(value) < uint64(math.MaxUint32)
 }
 
-func validProcessSessionParentInfo(info os.FileInfo) bool {
-	return info.IsDir() && info.Mode()&os.ModeSymlink == 0 && info.Mode().Perm()&0o022 == 0
+func validProcessSessionParentInfo(info os.FileInfo, uid, gid int) bool {
+	return info.IsDir() && info.Mode()&os.ModeSymlink == 0 && info.Mode().Perm()&0o022 == 0 &&
+		processSessionCanTraverse(info, uid, gid)
+}
+
+func processSessionCanTraverse(info os.FileInfo, uid, gid int) bool {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	mode := info.Mode().Perm()
+	switch {
+	case uint64(stat.Uid) == uint64(uid):
+		return mode&0o100 != 0
+	case uint64(stat.Gid) == uint64(gid):
+		return mode&0o010 != 0
+	default:
+		return mode&0o001 != 0
+	}
 }
 
 func processSessionOwnerMatches(info os.FileInfo, uid, gid int) bool {
@@ -277,7 +300,8 @@ func (s *ProcessSession) WaitReady(ctx context.Context) error {
 
 func (s *ProcessSession) parentPathMatches() bool {
 	current, err := os.Lstat(s.parentPath)
-	return err == nil && os.SameFile(current, s.parentInfo) && validProcessSessionParentInfo(current)
+	return err == nil && os.SameFile(current, s.parentInfo) &&
+		validProcessSessionParentInfo(current, s.targetUID, s.targetGID)
 }
 
 // Close fences local coordination and removes only the directory identity

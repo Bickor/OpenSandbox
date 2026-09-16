@@ -195,6 +195,35 @@ func TestProcessSessionRejectsWritableOrSymlinkParent(t *testing.T) {
 	require.ErrorIs(t, err, revision.ErrInvalid)
 }
 
+func TestProcessSessionRejectsParentWithoutTargetTraversal(t *testing.T) {
+	parent := processSessionParent(t)
+	config := processSessionConfig(parent)
+	config.UID++
+	config.GID++
+	session, err := NewProcessSession(config)
+	require.Nil(t, session)
+	require.ErrorIs(t, err, revision.ErrInvalid)
+	entries, readErr := os.ReadDir(parent)
+	require.NoError(t, readErr)
+	require.Empty(t, entries)
+}
+
+func TestProcessSessionParentTraversalUsesTargetIdentityClass(t *testing.T) {
+	parent := processSessionParent(t)
+	info := func(mode os.FileMode) os.FileInfo {
+		require.NoError(t, os.Chmod(parent, mode))
+		value, err := os.Lstat(parent)
+		require.NoError(t, err)
+		return value
+	}
+	owner := info(0o700).Sys().(*syscall.Stat_t)
+	uid, gid := int(owner.Uid), int(owner.Gid)
+	require.True(t, processSessionCanTraverse(info(0o700), uid, gid))
+	require.True(t, processSessionCanTraverse(info(0o710), uid+1, gid))
+	require.True(t, processSessionCanTraverse(info(0o701), uid+1, gid+1))
+	require.False(t, processSessionCanTraverse(info(0o700), uid+1, gid+1))
+}
+
 func TestProcessSessionWaitReadyRequiresFreshEmptyReceiver(t *testing.T) {
 	tests := []struct {
 		name     string

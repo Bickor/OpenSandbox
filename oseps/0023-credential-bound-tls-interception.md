@@ -834,7 +834,8 @@ high-entropy control generation and token, matching launcher bundle, Unix
 transport, and coordinator. It accepts readiness only from an authenticated
 fresh receiver with no active revision. Directory operations stay anchored to a
 caller-owned stable non-writable parent, verify the child UID/GID and mode, and
-cleanup refuses a replaced directory identity. Live launch/restart consumption,
+require the target identity to have directory search permission. Cleanup refuses
+a replaced directory identity. Live launch/restart consumption,
 authoritative empty or restored snapshot installation, connection teardown, and
 the public Vault mutation path
 remain unwired. Startup/recovery and atomic public-store finalization under the
