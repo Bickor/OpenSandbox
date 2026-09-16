@@ -20,11 +20,11 @@
 set -euo pipefail
 
 LICENSE_YEAR=$(date +%Y)
-LICENSE_OWNER="Alibaba Group Holding Ltd."
-LICENSE_MARKER_REGEX="Copyright [0-9]{4} ${LICENSE_OWNER// / }"
+LICENSE_OWNER="The OpenSandbox Authors"
+LICENSE_MARKER_REGEX="Copyright [0-9]{4} (${LICENSE_OWNER// / }|Alibaba Group Holding Ltd\.)"
 LICENSE_TEXT_TEMPLATE=$(
   cat <<'EOF'
-Copyright __YEAR__ Alibaba Group Holding Ltd.
+Copyright __YEAR__ The OpenSandbox Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -205,13 +205,13 @@ process_file() {
 }
 
 main() {
-  local files
+  local files=()
   if [[ "$#" -gt 0 ]]; then
     IFS=$'\n' read -r -d '' -a files < <(git ls-files -- "$@" && printf '\0')
   else
     IFS=$'\n' read -r -d '' -a files < <(git ls-files && printf '\0')
   fi
-  for f in "${files[@]}"; do
+  for f in "${files[@]+"${files[@]}"}"; do
     process_file "$f"
   done
 }

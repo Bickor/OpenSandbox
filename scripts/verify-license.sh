@@ -28,8 +28,8 @@ echo "Working directory: $(pwd)"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CURRENT_YEAR="$(date +%Y)"
 MIN_YEAR="2025"
-LICENSE_OWNER="Alibaba Group Holding Ltd."
-LICENSE_REGEX="Copyright [0-9]{4} ${LICENSE_OWNER// / }"
+LICENSE_OWNER="The OpenSandbox Authors"
+LICENSE_REGEX="Copyright [0-9]{4} (${LICENSE_OWNER// / }|Alibaba Group Holding Ltd\.)"
 
 # File extensions that are expected to carry a license header.
 LICENSE_EXTS=(
