@@ -118,6 +118,22 @@ func (c *Controller) RunInBashSession(ctx context.Context, req *ExecuteCodeReque
 	return c.runBashSession(ctx, req)
 }
 
+// ValidateBashSessionCwd validates a run's cwd against the target session's
+// environment (daemon env, EXECD_ENVS file values, and variables exported in
+// earlier runs of the session), so requests referencing session-scoped
+// variables pass web-layer validation instead of failing at expansion time.
+// Returns ErrContextNotFound when the session does not exist.
+func (c *Controller) ValidateBashSessionCwd(sessionID, cwd string) error {
+	session := c.getBashSession(sessionID)
+	if session == nil {
+		return ErrContextNotFound
+	}
+	session.mu.Lock()
+	envSnapshot := copyEnvMap(session.env)
+	session.mu.Unlock()
+	return ValidateWorkingDirWithEnv(cwd, envSnapshot)
+}
+
 func (c *Controller) DeleteBashSession(sessionID string) error {
 	return c.closeBashSession(sessionID)
 }

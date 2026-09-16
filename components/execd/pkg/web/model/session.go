@@ -16,8 +16,6 @@ package model
 
 import (
 	"github.com/go-playground/validator/v10"
-
-	"github.com/alibaba/opensandbox/execd/pkg/runtime"
 )
 
 type CreateSessionRequest struct {
@@ -34,10 +32,14 @@ type RunInSessionRequest struct {
 	Timeout int64  `json:"timeout,omitempty" validate:"omitempty,gte=0"`
 }
 
+// Validate performs structural validation only. The cwd is validated against
+// the target session's environment by the runtime (see
+// Controller.ValidateBashSessionCwd), because it can reference EXECD_ENVS
+// file variables and variables exported in earlier runs of the session.
 func (r *RunInSessionRequest) Validate() error {
 	validate := validator.New()
 	if err := validate.Struct(r); err != nil {
 		return err
 	}
-	return runtime.ValidateWorkingDir(r.Cwd)
+	return nil
 }

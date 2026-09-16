@@ -18,7 +18,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -32,8 +35,9 @@ import (
 )
 
 type fakeCodeRunner struct {
-	execute          func(request *runtime.ExecuteCodeRequest) error
-	runInBashSession func(_ context.Context, _ *runtime.ExecuteCodeRequest) error
+	execute                func(request *runtime.ExecuteCodeRequest) error
+	runInBashSession       func(_ context.Context, _ *runtime.ExecuteCodeRequest) error
+	validateBashSessionCwd func(_, _ string) error
 }
 
 func (f *fakeCodeRunner) CreateContext(_ *runtime.CreateContextRequest) (string, error) {
@@ -74,6 +78,13 @@ func (f *fakeCodeRunner) CreateBashSession(_ *runtime.CreateContextRequest) (str
 func (f *fakeCodeRunner) RunInBashSession(ctx context.Context, req *runtime.ExecuteCodeRequest) error {
 	if f.runInBashSession != nil {
 		return f.runInBashSession(ctx, req)
+	}
+	return nil
+}
+
+func (f *fakeCodeRunner) ValidateBashSessionCwd(sessionID, cwd string) error {
+	if f.validateBashSessionCwd != nil {
+		return f.validateBashSessionCwd(sessionID, cwd)
 	}
 	return nil
 }
@@ -420,4 +431,55 @@ func TestRunCodeSuccessStillEmitsSSE(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 	require.Contains(t, w.Header().Get("Content-Type"), "text/event-stream")
 	require.NotEmpty(t, w.Body.Bytes(), "successful run should write SSE events")
+}
+
+func TestRunInSession_InvalidCwdReturns400(t *testing.T) {
+	previousRunner := codeRunner
+	codeRunner = &fakeCodeRunner{
+		validateBashSessionCwd: func(_, _ string) error {
+			return errors.New(`cannot resolve working directory "$NOPE": path references undefined environment variables: NOPE`)
+		},
+	}
+	t.Cleanup(func() { codeRunner = previousRunner })
+
+	body := []byte(`{"command":"echo hi","cwd":"$NOPE","timeout":0}`)
+	ctx, w := newTestContext(http.MethodPost, "/sessions/session-1/run", body)
+	ctx.Params = append(ctx.Params, gin.Param{Key: "sessionId", Value: "session-1"})
+	ctrl := NewCodeInterpretingController(ctx)
+
+	ctrl.RunInSession()
+
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	var resp model.ErrorResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Equal(t, model.ErrorCodeInvalidRequest, resp.Code)
+	require.Contains(t, resp.Message, "NOPE")
+}
+
+func TestRunInSession_CwdWithExecdEnvsVarPassesValidation(t *testing.T) {
+	requireBash(t)
+
+	workspace := t.TempDir()
+	envFile := filepath.Join(t.TempDir(), "env")
+	require.NoError(t, os.WriteFile(envFile, []byte("SESSION_WORKSPACE="+workspace), 0o644))
+	t.Setenv("EXECD_ENVS", envFile)
+
+	previousRunner := codeRunner
+	codeRunner = runtime.NewController("", "")
+	t.Cleanup(func() { codeRunner = previousRunner })
+	runner := codeRunner.(*runtime.Controller)
+
+	sessionID, err := runner.CreateBashSession(&runtime.CreateContextRequest{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = runner.DeleteBashSession(sessionID) })
+
+	body := fmt.Sprintf(`{"command":"pwd","cwd":"$SESSION_WORKSPACE","timeout":0}`)
+	ctx, w := newTestContext(http.MethodPost, "/sessions/"+sessionID+"/run", []byte(body))
+	ctx.Params = append(ctx.Params, gin.Param{Key: "sessionId", Value: sessionID})
+	ctrl := NewCodeInterpretingController(ctx)
+
+	ctrl.RunInSession()
+
+	require.Equal(t, http.StatusOK, w.Code, "cwd referencing an EXECD_ENVS variable must pass validation: %s", w.Body.String())
+	require.Contains(t, w.Body.String(), workspace)
 }
