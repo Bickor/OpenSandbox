@@ -20,6 +20,8 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +29,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/alibaba/opensandbox/execd/pkg/isolation"
 	"github.com/alibaba/opensandbox/execd/pkg/jupyter/execute"
 	"github.com/alibaba/opensandbox/internal/safego"
 )
@@ -88,7 +91,7 @@ func TestBashSession_NonZeroExitEmitsError(t *testing.T) {
 func TestBashSession_FallsBackToSh(t *testing.T) {
 	useShOnlyPath(t)
 
-	session := newBashSession("")
+	session := newBashSession("", nil)
 	t.Cleanup(func() { _ = session.close() })
 	require.NoError(t, session.start())
 
@@ -113,7 +116,7 @@ func TestBashSession_FallsBackToSh(t *testing.T) {
 func TestBashSession_FallsBackToSh_PersistsSingleQuotedValue(t *testing.T) {
 	useShOnlyPath(t)
 
-	session := newBashSession("")
+	session := newBashSession("", nil)
 	t.Cleanup(func() { _ = session.close() })
 	require.NoError(t, session.start())
 
@@ -267,7 +270,7 @@ func TestShellEscapeParseExportLine_RoundTrip(t *testing.T) {
 }
 
 func TestBashSession_envAndExitCode(t *testing.T) {
-	session := newBashSession("")
+	session := newBashSession("", nil)
 	t.Cleanup(func() { _ = session.close() })
 
 	require.NoError(t, session.start())
@@ -337,7 +340,7 @@ func TestBashSession_envAndExitCode(t *testing.T) {
 }
 
 func TestBashSession_envLargeOutputChained(t *testing.T) {
-	session := newBashSession("")
+	session := newBashSession("", nil)
 	t.Cleanup(func() { _ = session.close() })
 
 	require.NoError(t, session.start())
@@ -390,7 +393,7 @@ func TestBashSession_envLargeOutputChained(t *testing.T) {
 }
 
 func TestBashSession_cwdPersistsWithoutOverride(t *testing.T) {
-	session := newBashSession("")
+	session := newBashSession("", nil)
 	t.Cleanup(func() { _ = session.close() })
 
 	require.NoError(t, session.start())
@@ -430,7 +433,7 @@ func TestBashSession_cwdPersistsWithoutOverride(t *testing.T) {
 }
 
 func TestBashSession_requestCwdOverridesAfterCd(t *testing.T) {
-	session := newBashSession("")
+	session := newBashSession("", nil)
 	t.Cleanup(func() { _ = session.close() })
 
 	require.NoError(t, session.start())
@@ -473,7 +476,7 @@ func TestBashSession_requestCwdOverridesAfterCd(t *testing.T) {
 }
 
 func TestBashSession_envDumpNotLeakedWhenNoTrailingNewline(t *testing.T) {
-	session := newBashSession("")
+	session := newBashSession("", nil)
 	t.Cleanup(func() { _ = session.close() })
 
 	require.NoError(t, session.start())
@@ -501,7 +504,7 @@ func TestBashSession_envDumpNotLeakedWhenNoTrailingNewline(t *testing.T) {
 }
 
 func TestBashSession_envDumpNotLeakedWhenNoOutput(t *testing.T) {
-	session := newBashSession("")
+	session := newBashSession("", nil)
 	t.Cleanup(func() { _ = session.close() })
 
 	require.NoError(t, session.start())
@@ -583,7 +586,7 @@ cat "$reward_dir/reward.txt"
 }
 
 func TestBashSession_execReplacesShell(t *testing.T) {
-	session := newBashSession("")
+	session := newBashSession("", nil)
 	t.Cleanup(func() { _ = session.close() })
 
 	require.NoError(t, session.start())
@@ -623,7 +626,7 @@ exec /tmp/exec_child.sh
 }
 
 func TestBashSession_complexExec(t *testing.T) {
-	session := newBashSession("")
+	session := newBashSession("", nil)
 	t.Cleanup(func() { _ = session.close() })
 
 	require.NoError(t, session.start())
@@ -680,7 +683,7 @@ func containsLine(lines []string, target string) bool {
 func TestBashSession_CloseKillsRunningProcess(t *testing.T) {
 	requireBash(t)
 
-	session := newBashSession("")
+	session := newBashSession("", nil)
 	require.NoError(t, session.start())
 
 	runDone := make(chan error, 1)
@@ -742,7 +745,7 @@ func TestBashSession_DeleteBashSessionKillsRunningProcess(t *testing.T) {
 }
 
 func TestBashSession_CloseWithNoActiveRun(t *testing.T) {
-	session := newBashSession("")
+	session := newBashSession("", nil)
 	require.NoError(t, session.start())
 
 	done := make(chan struct{}, 1)
@@ -755,5 +758,70 @@ func TestBashSession_CloseWithNoActiveRun(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		require.Fail(t, "close() did not return within 2s when no run was active")
+	}
+}
+
+func writeExecdEnvsFile(t *testing.T, lines ...string) string {
+	t.Helper()
+	envFile := filepath.Join(t.TempDir(), "env")
+	require.NoError(t, os.WriteFile(envFile, []byte(strings.Join(lines, "\n")), 0o644))
+	t.Setenv("EXECD_ENVS", envFile)
+	return envFile
+}
+
+func TestBashSession_ExecdEnvsFileAppliedToSession(t *testing.T) {
+	requireBash(t)
+
+	writeExecdEnvsFile(t, "SESSION_FOO=bar")
+
+	c := NewController("", "")
+	sessionID, err := c.CreateBashSession(&CreateContextRequest{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.DeleteBashSession(sessionID) })
+
+	var stdoutLines []string
+	require.NoError(t, c.RunInBashSession(context.Background(), &ExecuteCodeRequest{
+		Language: Bash,
+		Context:  sessionID,
+		Code:     `printf '%s\n' "$SESSION_FOO"`,
+		Timeout:  5 * time.Second,
+		Hooks: ExecuteResultHook{
+			OnExecuteStdout: func(line string) { stdoutLines = append(stdoutLines, line) },
+		},
+	}))
+	require.Contains(t, stdoutLines, "bar")
+}
+
+func TestBashSession_ExecdEnvsFileExpandsSessionCwd(t *testing.T) {
+	requireBash(t)
+
+	workspace := t.TempDir()
+	writeExecdEnvsFile(t, "SESSION_WORKSPACE="+workspace)
+
+	c := NewController("", "")
+	sessionID, err := c.CreateBashSession(&CreateContextRequest{Cwd: "$SESSION_WORKSPACE"})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.DeleteBashSession(sessionID) })
+
+	var stdoutLines []string
+	require.NoError(t, c.RunInBashSession(context.Background(), &ExecuteCodeRequest{
+		Language: Bash,
+		Context:  sessionID,
+		Code:     `pwd`,
+		Timeout:  5 * time.Second,
+		Hooks: ExecuteResultHook{
+			OnExecuteStdout: func(line string) { stdoutLines = append(stdoutLines, line) },
+		},
+	}))
+	require.Contains(t, stdoutLines, workspace)
+}
+
+func TestNewBashSessionEnvOverlaysFileAndKeepsBlacklist(t *testing.T) {
+	writeExecdEnvsFile(t, "SESSION_FOO=bar", "EXECD_ACCESS_TOKEN=leak", "EXECD_ENVS=/elsewhere")
+
+	env := newBashSessionEnv()
+	require.Equal(t, "bar", env["SESSION_FOO"])
+	for _, name := range isolation.ExecdConfigEnvBlacklist() {
+		require.NotContains(t, env, name, "blacklisted execd var %s must not enter the session env", name)
 	}
 }

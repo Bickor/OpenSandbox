@@ -55,7 +55,8 @@ const (
 )
 
 func (c *Controller) createBashSession(req *CreateContextRequest) (string, error) {
-	resolvedCwd, err := pathutil.ExpandPath(req.Cwd)
+	env := newBashSessionEnv()
+	resolvedCwd, err := pathutil.ExpandPathWithEnv(req.Cwd, env)
 	if err != nil {
 		return "", fmt.Errorf("resolve request cwd %s: %w", req.Cwd, err)
 	}
@@ -66,7 +67,7 @@ func (c *Controller) createBashSession(req *CreateContextRequest) (string, error
 		}
 	}
 
-	session := newBashSession(resolvedCwd)
+	session := newBashSession(resolvedCwd, env)
 	if err := session.start(); err != nil {
 		return "", fmt.Errorf("failed to start bash session: %w", err)
 	}
@@ -121,12 +122,24 @@ func (c *Controller) DeleteBashSession(sessionID string) error {
 	return c.closeBashSession(sessionID)
 }
 
-func newBashSession(cwd string) *bashSession {
+func newBashSession(cwd string, env map[string]string) *bashSession {
 	config := &bashSessionConfig{
 		Session:        uuidString(),
 		StartupTimeout: 5 * time.Second,
 	}
 
+	return &bashSession{
+		config: config,
+		env:    env,
+		cwd:    cwd,
+	}
+}
+
+// newBashSessionEnv builds the initial environment for a new bash session:
+// execd's process environment minus its own config/credential vars, overlaid
+// with the EXECD_ENVS file values (same source the command path applies, with
+// the same precedence over the daemon environment).
+func newBashSessionEnv() map[string]string {
 	// The session env snapshot is exported into the wrapped script at the
 	// top, after the launcher has stripped the process environment — so it
 	// must not carry execd's own config/credential vars or a session user
@@ -139,11 +152,17 @@ func newBashSession(cwd string) *bashSession {
 		}
 	}
 
-	return &bashSession{
-		config: config,
-		env:    env,
-		cwd:    cwd,
+	// EXECD_ENVS file vars are user-code environment, not execd config.
+	// Blacklisted names stay excluded even if the file redefines them, so
+	// the snapshot cannot be used to smuggle execd credentials back in.
+	for k, v := range loadExtraEnvFromFile() {
+		if containsStr(blacklist, k) {
+			continue
+		}
+		env[k] = v
 	}
+
+	return env
 }
 
 func (s *bashSession) start() error {
@@ -182,7 +201,7 @@ func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) erro
 
 	cwd := s.cwd
 	if request.Cwd != "" {
-		expandedCwd, err := pathutil.ExpandPath(request.Cwd)
+		expandedCwd, err := pathutil.ExpandPathWithEnv(request.Cwd, envSnapshot)
 		if err != nil {
 			s.mu.Unlock()
 			return fmt.Errorf("resolve cwd: %w", err)
