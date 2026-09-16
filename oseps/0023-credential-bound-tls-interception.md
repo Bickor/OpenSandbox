@@ -828,11 +828,17 @@ when the Go launcher supplies a complete internal per-process session bundle;
 missing configuration keeps it disabled, partial configuration fails startup,
 and addon shutdown fences the receiver and removes its owned socket. The Go
 launcher strips inherited bundle values and can hand off a validated bundle,
-but the current sidecar and fast-sandbox assembly still pass none. Socket-parent
-provisioning, per-process session generation, coordinator construction and
-reconciliation, connection teardown, and the public Vault mutation path remain
-unwired. Startup/recovery and atomic public-store finalization under the shared
-mutation barrier remain integration work.
+but the current sidecar and fast-sandbox assembly still pass none. An unused Go
+process-session owner now creates a private per-process receiver directory,
+high-entropy control generation and token, matching launcher bundle, Unix
+transport, and coordinator. It accepts readiness only from an authenticated
+fresh receiver with no active revision. Directory operations stay anchored to a
+caller-owned stable non-writable parent, verify the child UID/GID and mode, and
+cleanup refuses a replaced directory identity. Live launch/restart consumption,
+authoritative empty or restored snapshot installation, connection teardown, and
+the public Vault mutation path
+remain unwired. Startup/recovery and atomic public-store finalization under the
+shared mutation barrier remain integration work.
 
 The proxy-side transaction receiver validates
 generation/epoch/digest identities, stages immutable bytes, and implements
@@ -846,10 +852,11 @@ selectors, or rendered credential/redaction coverage. A matching unused Python
 validator now strictly decodes those exact bytes, checks envelope vault/policy
 agreement, recomputes active state and HTTPS selectors from the full bindings,
 and rejects incomplete redaction coverage with a fixed sanitized error. The
-next integration must provision a fresh process session, construct and reconcile
-the Go coordinator, and add connection fences before acknowledging public Vault
-mutations. Existing request processing continues to use the conditional ETag
-lookup until that integration is ready.
+next integration must consume a fresh process session during launch/restart,
+install the authoritative empty or restored snapshot before readiness, and add
+connection fences before acknowledging public Vault mutations. Existing request
+processing continues to use the conditional ETag lookup until that integration
+is ready.
 
 Implementation has started with the internal host-selector algebra and shared
 Go/Python conformance vectors. The control plane owns non-transitional UTS #46
