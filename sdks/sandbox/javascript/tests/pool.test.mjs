@@ -231,7 +231,6 @@ for (const creator of ["SDK instance", "custom object"]) {
       creationSpec: { image: "ubuntu", adapterFactory: fixture.adapterFactory },
       sandboxCreator: fixture.sandboxCreator,
       warmupReadyTimeoutSeconds: 0.02,
-      reconcileIntervalSeconds: 0.01,
       warmupHealthCheck: sandbox => sandbox.id === "warm-1" ? pending.promise : true,
     });
     t.after(async () => {
@@ -338,7 +337,6 @@ test("SandboxPool warms, acquires, renews, and replenishes an idle sandbox", asy
     poolName: "unit-pool",
     maxIdle: 2,
     warmupConcurrency: 2,
-    reconcileIntervalSeconds: 60,
     connectionConfig: fixture.connectionConfig,
     creationSpec: { image: "ubuntu", adapterFactory: fixture.adapterFactory },
     sandboxCreator: fixture.sandboxCreator,
@@ -404,7 +402,6 @@ test("SandboxPool renews primary ownership while warmup creation is in flight", 
     maxIdle: 1,
     stateStore: store,
     primaryLockTtlSeconds: 0.3,
-    reconcileIntervalSeconds: 60,
     connectionConfig: fixture.connectionConfig,
     creationSpec: { image: "ubuntu", adapterFactory: fixture.adapterFactory },
     sandboxCreator: async (context) => {
@@ -486,7 +483,6 @@ test("SandboxPool resize and releaseAllIdle update observable state", async () =
     poolName: "resize-pool",
     maxIdle: 1,
     stateStore: store,
-    reconcileIntervalSeconds: 60,
     connectionConfig: fixture.connectionConfig,
     creationSpec: { image: "ubuntu", adapterFactory: fixture.adapterFactory },
     sandboxCreator: fixture.sandboxCreator,

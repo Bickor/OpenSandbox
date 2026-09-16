@@ -24,6 +24,8 @@ export {
   PoolEmptyException,
   PoolNotRunningException,
   PoolStateStoreUnavailableException,
+  PoolDestroyedException,
+  PoolDestroyIncompleteException,
 } from "./core/exceptions.js";
 
 // Factory pattern (stable public interface; does NOT expose OpenAPI generated models).
@@ -146,16 +148,22 @@ export type {
 export { Sandbox } from "./sandbox.js";
 
 export { SandboxPool } from "./pool.js";
+export { SandboxPoolManager } from "./poolManager.js";
+export type { SandboxPoolManagerOptions } from "./poolManager.js";
 export { InMemoryPoolStateStore } from "./poolStore.js";
 export {
   AcquirePolicy,
-  PoolHealthState,
+  PoolDestroyState,
+  PoolDestroyStrategy,
   PoolLifecycleState,
+  PoolState,
   PooledSandboxCreateReason,
 } from "./poolTypes.js";
 export type {
   IdleEntry,
   PoolCreationSpec,
+  PoolDestroyOptions,
+  PoolDestroyResult,
   PoolHealthCheck,
   PoolLogger,
   PoolSandboxPreparer,

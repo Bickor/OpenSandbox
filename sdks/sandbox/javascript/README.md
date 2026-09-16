@@ -101,9 +101,34 @@ try {
 }
 ```
 
-`InMemoryPoolStateStore` is process-local. Applications that share a logical
-pool across processes must provide a distributed `PoolStateStore` whose take,
-membership, and primary-lock operations are atomic.
+`InMemoryPoolStateStore` is process-local. For a distributed pool, install a
+Redis client only in the application that needs it and import the optional
+pool subpath:
+
+```bash
+npm install redis
+```
+
+```ts
+import { createClient } from "redis";
+import { RedisPoolStateStore } from "@alibaba-group/opensandbox/pool-redis";
+
+const redis = createClient({ url: process.env.REDIS_URL });
+await redis.connect();
+
+const stateStore = new RedisPoolStateStore({ client: redis });
+```
+
+The SDK does not import `redis` from its main entry point and does not create,
+connect, or close the injected client. Any compatible client that implements
+`sendCommand(string[])` can be used.
+
+Pool warmup is admitted at `warmupCreateQps` per one-second reconcile tick.
+Creation is asynchronous; `warmupConcurrency` limits the post-create readiness,
+preparation, renewal, and commit stages. Use `warmupSandboxPreparer`,
+`warmupPostPrepareHealthCheck`, and the corresponding timeout/polling options
+for staged warmup. Set `connectionConfig.enableTracing` to emit OpenTelemetry
+`pool.warmup` traces with one child span per stage.
 
 ## Usage Examples
 

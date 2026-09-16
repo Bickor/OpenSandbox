@@ -15,16 +15,19 @@
 import { ConnectionConfig } from "./config/connection.js";
 import {
   PoolAcquireFailedException,
+  PoolDestroyedException,
   PoolEmptyException,
   PoolNotRunningException,
   PoolStateStoreUnavailableException,
 } from "./core/exceptions.js";
 import { ReadinessBudget } from "./internal/readiness.js";
+import { PoolTracer, POOL_WARMUP_SPANS } from "./internal/poolTracing.js";
 import { InMemoryPoolStateStore } from "./poolStore.js";
 import {
   AcquirePolicy,
-  PoolHealthState,
   PoolLifecycleState,
+  PoolDestroyState,
+  PoolState,
   PooledSandboxCreateReason,
   type IdleEntry,
   type PoolCreationSpec,
@@ -50,24 +53,62 @@ interface ResolvedPoolOptions {
   sandboxCreator?: SandboxPoolOptions["sandboxCreator"];
   stateStore: PoolStateStore;
   ownerId: string;
+  warmupCreateQps: number;
   warmupConcurrency: number;
-  warmupConcurrencyConfigured: boolean;
   primaryLockTtlSeconds: number;
-  reconcileIntervalSeconds: number;
   degradedThreshold: number;
-  emptyBehavior: AcquirePolicy;
   idleTimeoutSeconds: number;
   drainTimeoutSeconds: number;
   acquireMinRemainingTtlSeconds: number;
   acquireReadyTimeoutSeconds: number;
   acquireHealthCheckPollingIntervalMillis: number;
   acquireHealthCheck?: PoolHealthCheck;
+  acquireSkipHealthCheck: boolean;
   maxAcquireRetries: number;
   warmupReadyTimeoutSeconds: number;
+  warmupHealthCheckInitialDelayMillis: number;
   warmupHealthCheckPollingIntervalMillis: number;
   warmupHealthCheck?: PoolHealthCheck;
-  warmupPreparer?: SandboxPoolOptions["warmupPreparer"];
+  warmupSandboxPreparer?: SandboxPoolOptions["warmupSandboxPreparer"];
+  warmupPostPrepareHealthCheck?: PoolHealthCheck;
+  warmupPostPrepareHealthCheckTimeoutSeconds: number;
+  warmupSkipHealthCheck: boolean;
   logger?: SandboxPoolOptions["logger"];
+}
+
+class AsyncSemaphore {
+  private active = 0;
+  private readonly waiters: (() => void)[] = [];
+
+  constructor(private readonly limit: number) {}
+
+  async acquire(signal?: AbortSignal): Promise<() => void> {
+    signal?.throwIfAborted();
+    if (this.active < this.limit) {
+      this.active += 1;
+      return () => this.release();
+    }
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = () => {
+        const index = this.waiters.indexOf(onReady);
+        if (index >= 0) this.waiters.splice(index, 1);
+        reject(signal?.reason);
+      };
+      const onReady = () => {
+        signal?.removeEventListener("abort", onAbort);
+        this.active += 1;
+        resolve();
+      };
+      this.waiters.push(onReady);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+    return () => this.release();
+  }
+
+  private release(): void {
+    this.active -= 1;
+    this.waiters.shift()?.();
+  }
 }
 
 function makeOwnerId(): string {
@@ -88,6 +129,7 @@ function cloneConnectionConfig(config: ConnectionConfig): ConnectionConfig {
     endpointCacheSize: config.endpointCacheSize,
     endpointCacheDisabled: config.endpointCacheDisabled,
     disableMetrics: config.disableMetrics,
+    enableTracing: config.enableTracing,
   });
 }
 
@@ -135,27 +177,36 @@ export class SandboxPool {
   private readonly options: ResolvedPoolOptions;
   private manager?: SandboxManager;
   private lifecycleState = PoolLifecycleState.NOT_STARTED;
-  private healthState = PoolHealthState.HEALTHY;
+  private operatingState = PoolState.HEALTHY;
   private failureCount = 0;
   private lastError?: string;
-  private backoffUntilMs = 0;
   private inFlightOperations = 0;
   private timer?: ReturnType<typeof setInterval>;
+  private heartbeatTimer?: ReturnType<typeof setInterval>;
   private startPromise?: Promise<void>;
   private reconcilePromise?: Promise<void>;
   private shutdownPromise?: Promise<void>;
   private abortController?: AbortController;
   private allowWarmupCommitWhileDraining = false;
+  private runGeneration = 0;
+  private leaderEpoch = 0;
+  private primaryOwned = false;
+  private readonly warmupTasks = new Map<Promise<void>, number>();
+  private postCreateSemaphore: AsyncSemaphore;
+  private readonly tracer: PoolTracer;
 
   private constructor(options: SandboxPoolOptions) {
     const poolName = options.poolName?.trim();
     if (!poolName) throw new Error("poolName is required");
+    if (options.ownerId !== undefined && !options.ownerId.trim()) {
+      throw new Error("ownerId must not be blank");
+    }
     requireNonNegativeInteger(options.maxIdle, "maxIdle");
 
     const idleTimeoutSeconds = options.idleTimeoutSeconds ?? DEFAULT_IDLE_TIMEOUT_SECONDS;
     const acquireMinRemainingTtlSeconds =
       options.acquireMinRemainingTtlSeconds ?? Math.min(idleTimeoutSeconds / 2, 60);
-    const warmupConcurrency = options.warmupConcurrency ?? Math.max(1, Math.ceil(options.maxIdle * 0.2));
+    const warmupConcurrency = options.warmupConcurrency ?? 128;
     const creationSpec = options.creationSpec ?? ({} as PoolCreationSpec);
     if (
       !options.sandboxCreator &&
@@ -167,9 +218,15 @@ export class SandboxPool {
     requirePositive(idleTimeoutSeconds, "idleTimeoutSeconds");
     requirePositive(warmupConcurrency, "warmupConcurrency");
     if (!Number.isInteger(warmupConcurrency)) throw new Error("warmupConcurrency must be an integer");
+    requirePositive(options.warmupCreateQps ?? 10, "warmupCreateQps");
+    if (!Number.isInteger(options.warmupCreateQps ?? 10)) {
+      throw new Error("warmupCreateQps must be an integer");
+    }
     requirePositive(options.primaryLockTtlSeconds ?? 60, "primaryLockTtlSeconds");
-    requirePositive(options.reconcileIntervalSeconds ?? 30, "reconcileIntervalSeconds");
     requirePositive(options.degradedThreshold ?? 3, "degradedThreshold");
+    if (!Number.isInteger(options.degradedThreshold ?? 3)) {
+      throw new Error("degradedThreshold must be an integer");
+    }
     requireNonNegative(options.drainTimeoutSeconds ?? 30, "drainTimeoutSeconds");
     requireNonNegative(acquireMinRemainingTtlSeconds, "acquireMinRemainingTtlSeconds");
     if (acquireMinRemainingTtlSeconds >= idleTimeoutSeconds) {
@@ -177,18 +234,23 @@ export class SandboxPool {
     }
     requirePositive(options.acquireReadyTimeoutSeconds ?? DEFAULT_READY_TIMEOUT_SECONDS, "acquireReadyTimeoutSeconds");
     requirePositive(options.warmupReadyTimeoutSeconds ?? DEFAULT_READY_TIMEOUT_SECONDS, "warmupReadyTimeoutSeconds");
+    requireNonNegative(options.warmupHealthCheckInitialDelayMillis ?? 0, "warmupHealthCheckInitialDelayMillis");
     requirePositive(
       options.acquireHealthCheckPollingIntervalMillis ?? DEFAULT_POLLING_INTERVAL_MILLIS,
       "acquireHealthCheckPollingIntervalMillis",
     );
     requirePositive(
-      options.warmupHealthCheckPollingIntervalMillis ?? DEFAULT_POLLING_INTERVAL_MILLIS,
+      options.warmupHealthCheckPollingIntervalMillis ?? 500,
       "warmupHealthCheckPollingIntervalMillis",
     );
     requirePositive(options.maxAcquireRetries ?? 3, "maxAcquireRetries");
     if (!Number.isInteger(options.maxAcquireRetries ?? 3)) {
       throw new Error("maxAcquireRetries must be an integer");
     }
+    requirePositive(
+      options.warmupPostPrepareHealthCheckTimeoutSeconds ?? DEFAULT_READY_TIMEOUT_SECONDS,
+      "warmupPostPrepareHealthCheckTimeoutSeconds",
+    );
 
     this.options = {
       poolName,
@@ -200,13 +262,11 @@ export class SandboxPool {
       creationSpec,
       sandboxCreator: options.sandboxCreator,
       stateStore: options.stateStore ?? new InMemoryPoolStateStore(),
-      ownerId: options.ownerId?.trim() ? options.ownerId.trim() : makeOwnerId(),
+      ownerId: options.ownerId?.trim() ?? makeOwnerId(),
+      warmupCreateQps: options.warmupCreateQps ?? 10,
       warmupConcurrency,
-      warmupConcurrencyConfigured: options.warmupConcurrency !== undefined,
       primaryLockTtlSeconds: options.primaryLockTtlSeconds ?? 60,
-      reconcileIntervalSeconds: options.reconcileIntervalSeconds ?? 30,
       degradedThreshold: options.degradedThreshold ?? 3,
-      emptyBehavior: options.emptyBehavior ?? AcquirePolicy.DIRECT_CREATE,
       idleTimeoutSeconds,
       drainTimeoutSeconds: options.drainTimeoutSeconds ?? 30,
       acquireMinRemainingTtlSeconds,
@@ -214,14 +274,22 @@ export class SandboxPool {
       acquireHealthCheckPollingIntervalMillis:
         options.acquireHealthCheckPollingIntervalMillis ?? DEFAULT_POLLING_INTERVAL_MILLIS,
       acquireHealthCheck: options.acquireHealthCheck,
+      acquireSkipHealthCheck: options.acquireSkipHealthCheck ?? false,
       maxAcquireRetries: options.maxAcquireRetries ?? 3,
       warmupReadyTimeoutSeconds: options.warmupReadyTimeoutSeconds ?? DEFAULT_READY_TIMEOUT_SECONDS,
+      warmupHealthCheckInitialDelayMillis: options.warmupHealthCheckInitialDelayMillis ?? 0,
       warmupHealthCheckPollingIntervalMillis:
-        options.warmupHealthCheckPollingIntervalMillis ?? DEFAULT_POLLING_INTERVAL_MILLIS,
+        options.warmupHealthCheckPollingIntervalMillis ?? 500,
       warmupHealthCheck: options.warmupHealthCheck,
-      warmupPreparer: options.warmupPreparer,
+      warmupSandboxPreparer: options.warmupSandboxPreparer,
+      warmupPostPrepareHealthCheck: options.warmupPostPrepareHealthCheck,
+      warmupPostPrepareHealthCheckTimeoutSeconds:
+        options.warmupPostPrepareHealthCheckTimeoutSeconds ?? DEFAULT_READY_TIMEOUT_SECONDS,
+      warmupSkipHealthCheck: options.warmupSkipHealthCheck ?? false,
       logger: options.logger,
     };
+    this.postCreateSemaphore = new AsyncSemaphore(warmupConcurrency);
+    this.tracer = PoolTracer.from(this.options.connectionConfig);
   }
 
   static create(options: SandboxPoolOptions): SandboxPool {
@@ -255,12 +323,14 @@ export class SandboxPool {
 
   private async finishStart(): Promise<void> {
     try {
+      await this.ensurePoolNamespaceActive();
       await this.options.stateStore.setMaxIdle(this.options.poolName, this.options.maxIdle);
       await this.options.stateStore.setIdleEntryTtl(this.options.poolName, this.options.idleTimeoutSeconds);
     } catch (cause) {
       if (this.lifecycleState === PoolLifecycleState.STARTING) {
         this.lifecycleState = PoolLifecycleState.STOPPED;
       }
+      if (cause instanceof PoolDestroyedException || cause instanceof PoolStateStoreUnavailableException) throw cause;
       throw new PoolStateStoreUnavailableException("start", cause);
     }
     if (this.lifecycleState !== PoolLifecycleState.STARTING) {
@@ -268,6 +338,8 @@ export class SandboxPool {
     }
 
     this.abortController = new AbortController();
+    this.runGeneration += 1;
+    this.postCreateSemaphore = new AsyncSemaphore(this.options.warmupConcurrency);
     try {
       this.manager ??= this.createManager();
     } catch (cause) {
@@ -278,8 +350,18 @@ export class SandboxPool {
     }
     this.recordSuccess();
     this.lifecycleState = PoolLifecycleState.RUNNING;
-    this.timer = setInterval(() => this.triggerReconcile(), this.options.reconcileIntervalSeconds * 1000);
+    this.timer = setInterval(() => this.triggerReconcile(), 1_000);
     (this.timer as unknown as { unref?: () => void }).unref?.();
+    const heartbeatIntervalMillis = Math.max(
+      1,
+      Math.min(1_000, Math.floor((this.options.primaryLockTtlSeconds * 1_000) / 3)),
+    );
+    const heartbeatGeneration = this.runGeneration;
+    this.heartbeatTimer = setInterval(
+      () => void this.runPrimaryHeartbeat(heartbeatGeneration),
+      heartbeatIntervalMillis,
+    );
+    (this.heartbeatTimer as unknown as { unref?: () => void }).unref?.();
     if (this.options.primaryLockTtlSeconds <= this.options.warmupReadyTimeoutSeconds) {
       this.options.logger?.warn?.("pool primary lock TTL may expire during warmup", {
         poolName: this.options.poolName,
@@ -292,10 +374,13 @@ export class SandboxPool {
 
   async acquire(options: SandboxAcquireOptions = {}): Promise<Sandbox> {
     if (this.lifecycleState !== PoolLifecycleState.RUNNING) {
+      await this.throwIfPoolNamespaceDestroyed();
       throw new PoolNotRunningException(this.options.poolName, this.lifecycleState);
     }
     options.signal?.throwIfAborted();
-    const policy = options.policy ?? this.options.emptyBehavior;
+    const policy = options.policy ?? AcquirePolicy.DIRECT_CREATE;
+    await this.ensurePoolNamespaceActiveForAcquire(policy);
+    const generation = this.runGeneration;
     const maxAttempts = policyRetries(policy) ? this.options.maxAcquireRetries : 1;
     const minTtl = options.minRemainingTtlSeconds ?? this.options.acquireMinRemainingTtlSeconds;
     requireNonNegative(minTtl, "minRemainingTtlSeconds");
@@ -312,6 +397,7 @@ export class SandboxPool {
         try {
           result = await this.options.stateStore.tryTakeIdleWithMinTtl(this.options.poolName, minTtl);
         } catch (cause) {
+          if (cause instanceof PoolDestroyedException) throw cause;
           if (!policyCreates(policy)) throw new PoolStateStoreUnavailableException("tryTakeIdle", cause);
           this.options.logger?.warn?.("pool state store unavailable; falling back to direct create", {
             poolName: this.options.poolName,
@@ -332,7 +418,7 @@ export class SandboxPool {
             skipHealthCheck: true,
             signal: options.signal,
           });
-          if (!options.skipHealthCheck) {
+          if (!(options.skipHealthCheck ?? this.options.acquireSkipHealthCheck)) {
             await this.waitUntilHealthy(
               sandbox,
               this.options.acquireHealthCheck,
@@ -355,12 +441,13 @@ export class SandboxPool {
           if (this.lifecycleState !== PoolLifecycleState.RUNNING) {
             throw new PoolNotRunningException(this.options.poolName, this.lifecycleState);
           }
+          await this.ensurePoolNamespaceActive();
           if (!policyRetries(policy)) break;
           continue;
         }
         try {
           await this.renewAcquired(sandbox, options.sandboxTimeoutSeconds);
-          this.ensureAcquireStillRunning();
+          await this.ensureAcquireStillRunning(generation);
         } catch (cause) {
           await this.killAndClose(sandbox);
           throw cause;
@@ -373,9 +460,10 @@ export class SandboxPool {
         throw new PoolEmptyException(this.options.poolName);
       }
 
+      await this.ensurePoolNamespaceActiveForAcquire(policy);
       const sandbox = await this.createSandbox(PooledSandboxCreateReason.DIRECT_CREATE, options.signal);
       try {
-        if (!options.skipHealthCheck) {
+        if (!(options.skipHealthCheck ?? this.options.acquireSkipHealthCheck)) {
           await this.waitUntilHealthy(
             sandbox,
             this.options.acquireHealthCheck,
@@ -385,7 +473,8 @@ export class SandboxPool {
           );
         }
         await this.renewAcquired(sandbox, options.sandboxTimeoutSeconds);
-        this.ensureAcquireStillRunning();
+        await this.ensurePoolNamespaceActiveForAcquire(policy);
+        await this.ensureAcquireStillRunning(generation);
         return sandbox;
       } catch (cause) {
         await this.killAndClose(sandbox);
@@ -393,44 +482,51 @@ export class SandboxPool {
       }
     } finally {
       this.inFlightOperations -= 1;
-      this.triggerReconcile();
     }
   }
 
   async resize(maxIdle: number): Promise<void> {
     requireNonNegativeInteger(maxIdle, "maxIdle");
-    this.ensureRunning();
+    await this.ensurePoolNamespaceActive();
     this.inFlightOperations += 1;
     try {
       await this.storeCall("setMaxIdle", () => this.options.stateStore.setMaxIdle(this.options.poolName, maxIdle));
       this.options.maxIdle = maxIdle;
-      if (!this.options.warmupConcurrencyConfigured) {
-        this.options.warmupConcurrency = Math.max(1, Math.ceil(maxIdle * 0.2));
-      }
-      this.triggerReconcile();
     } finally {
       this.inFlightOperations -= 1;
     }
   }
 
-  async releaseAllIdle(): Promise<number> {
+  async releaseAllIdle(concurrency = 1): Promise<number> {
+    requirePositive(concurrency, "concurrency");
+    if (!Number.isInteger(concurrency)) throw new Error("concurrency must be an integer");
     this.inFlightOperations += 1;
     try {
-      const initialIdleCount = (
-        await this.storeCall("snapshotCounters", () =>
-          this.options.stateStore.snapshotCounters(this.options.poolName),
-        )
-      ).idleCount;
-      let released = 0;
-      while (released < initialIdleCount) {
-        const sandboxId = await this.storeCall("tryTakeIdle", () =>
-          this.options.stateStore.tryTakeIdle(this.options.poolName),
-        );
-        if (!sandboxId) return released;
-        await this.killSandboxId(sandboxId);
-        released += 1;
+      const sandboxIds: string[] = [];
+      let drainFailure: unknown;
+      while (true) {
+        try {
+          const sandboxId = await this.storeCall("tryTakeIdle", () =>
+            this.options.stateStore.tryTakeIdle(this.options.poolName),
+          );
+          if (!sandboxId) break;
+          sandboxIds.push(sandboxId);
+        } catch (error) {
+          drainFailure = error;
+          break;
+        }
       }
-      return released;
+      let next = 0;
+      await Promise.all(
+        Array.from({ length: Math.min(concurrency, sandboxIds.length) }, async () => {
+          while (next < sandboxIds.length) {
+            const sandboxId = sandboxIds[next++];
+            await this.killSandboxId(sandboxId!);
+          }
+        }),
+      );
+      if (drainFailure !== undefined) throw drainFailure;
+      return sandboxIds.length;
     } finally {
       this.inFlightOperations -= 1;
     }
@@ -442,11 +538,19 @@ export class SandboxPool {
     );
     return {
       lifecycleState: this.lifecycleState,
-      healthState: this.healthState,
+      state:
+        this.lifecycleState === PoolLifecycleState.DRAINING
+          ? PoolState.DRAINING
+          : this.lifecycleState === PoolLifecycleState.NOT_STARTED || this.lifecycleState === PoolLifecycleState.STOPPED
+            ? PoolState.STOPPED
+            : this.operatingState,
       idleCount: counters.idleCount,
-      maxIdle: await this.storeCall("getMaxIdle", () => this.options.stateStore.getMaxIdle(this.options.poolName)),
+      maxIdle:
+        (await this.storeCall("getMaxIdle", () =>
+          this.options.stateStore.getMaxIdle(this.options.poolName),
+        )) ?? this.options.maxIdle,
       failureCount: this.failureCount,
-      backoffActive: Date.now() < this.backoffUntilMs,
+      backoffActive: false,
       lastError: this.lastError,
       inFlightOperations: this.inFlightOperations,
     };
@@ -478,6 +582,8 @@ export class SandboxPool {
       await this.startPromise?.catch(() => undefined);
       if (this.timer) clearInterval(this.timer);
       this.timer = undefined;
+      if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = undefined;
 
       if (graceful) {
         const deadline = Date.now() + this.options.drainTimeoutSeconds * 1000;
@@ -498,6 +604,7 @@ export class SandboxPool {
         // Shutdown still transitions to STOPPED when transport cleanup fails.
       }
       this.manager = undefined;
+      this.markPrimaryLost();
     } finally {
       this.allowWarmupCommitWhileDraining = false;
       this.lifecycleState = PoolLifecycleState.STOPPED;
@@ -509,126 +616,145 @@ export class SandboxPool {
     return this.shutdown(true);
   }
 
-  private ensureRunning(): void {
-    if (this.lifecycleState !== PoolLifecycleState.RUNNING) {
-      throw new PoolNotRunningException(this.options.poolName, this.lifecycleState);
-    }
-  }
-
   private triggerReconcile(): void {
     if (this.lifecycleState !== PoolLifecycleState.RUNNING || this.reconcilePromise) return;
-    if (Date.now() < this.backoffUntilMs) return;
-    let runAgain = false;
     this.reconcilePromise = this.reconcile()
-      .then((shouldContinue) => {
-        runAgain = shouldContinue;
-        this.recordSuccess();
+      .catch((error: unknown) => {
+        this.markPrimaryLost();
+        this.recordFailure(error);
       })
-      .catch((error: unknown) => this.recordFailure(error))
       .finally(() => {
         this.reconcilePromise = undefined;
-        if (runAgain) this.triggerReconcile();
       });
   }
 
-  private async reconcile(): Promise<boolean> {
+  private async reconcile(): Promise<void> {
     const { poolName, ownerId, primaryLockTtlSeconds, stateStore } = this.options;
-    if (!(await stateStore.tryAcquirePrimaryLock(poolName, ownerId, primaryLockTtlSeconds))) return false;
-
-    let heartbeatError: unknown;
-    let leadershipLost = false;
-    let heartbeatInFlight = Promise.resolve();
-    const heartbeatIntervalMillis = Math.max(1, Math.floor((primaryLockTtlSeconds * 1000) / 3));
-    const heartbeat = setInterval(() => {
-      heartbeatInFlight = heartbeatInFlight.then(async () => {
-        try {
-          if (!(await stateStore.renewPrimaryLock(poolName, ownerId, primaryLockTtlSeconds))) {
-            leadershipLost = true;
-          }
-        } catch (error) {
-          heartbeatError = error;
-        }
-      });
-    }, heartbeatIntervalMillis);
-    (heartbeat as unknown as { unref?: () => void }).unref?.();
-
-    try {
-      const reaped = await stateStore.reapExpiredIdleWithMinTtl(
-        poolName,
-        new Date(),
-        this.options.acquireMinRemainingTtlSeconds,
-      );
-      await this.killSandboxIds(reaped.discardedAliveSandboxIds);
-
-      const maxIdle = await stateStore.getMaxIdle(poolName);
-      let idleCount = (await stateStore.snapshotCounters(poolName)).idleCount;
-      while (idleCount > maxIdle) {
-        const sandboxId = await stateStore.tryTakeIdle(poolName);
-        if (!sandboxId) break;
-        await this.killSandboxId(sandboxId);
-        idleCount -= 1;
-      }
-
-      const deficit = maxIdle - idleCount;
-      const createCount = Math.min(deficit, this.options.warmupConcurrency);
-      if (createCount <= 0) {
-        if (!(await stateStore.renewPrimaryLock(poolName, ownerId, primaryLockTtlSeconds))) {
-          leadershipLost = true;
-        }
-      } else {
-        const results = await Promise.allSettled(
-          Array.from({ length: createCount }, () => this.createIdleSandbox()),
-        );
-        const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
-        for (const failure of failures) {
-          this.options.logger?.warn?.("pool warmup sandbox creation failed", {
-            poolName,
-            error: failure.reason,
-          });
-        }
-        if (failures.length > 0) throw failures[0].reason;
-      }
-    } finally {
-      clearInterval(heartbeat);
-      await heartbeatInFlight;
+    const destroyState = await stateStore.getDestroyState(poolName);
+    if (destroyState !== PoolDestroyState.ACTIVE) {
+      await this.stopAfterNamespaceDestroyed(destroyState);
+      return;
     }
-    if (heartbeatError) throw heartbeatError;
-    if (leadershipLost) {
-      this.options.logger?.warn?.("pool lost primary ownership during reconcile", { poolName });
-      return false;
+    if (!(await stateStore.tryAcquirePrimaryLock(poolName, ownerId, primaryLockTtlSeconds))) {
+      this.markPrimaryLost();
+      return;
     }
-    const latestMaxIdle = await stateStore.getMaxIdle(poolName);
-    return (await stateStore.snapshotCounters(poolName)).idleCount < latestMaxIdle;
+    this.markPrimaryAcquired();
+
+    const reaped = await stateStore.reapExpiredIdleWithMinTtl(
+      poolName,
+      new Date(),
+      this.options.acquireMinRemainingTtlSeconds,
+    );
+    await this.killSandboxIds(reaped.discardedAliveSandboxIds);
+
+    const maxIdle = (await stateStore.getMaxIdle(poolName)) ?? this.options.maxIdle;
+    let idleCount = (await stateStore.snapshotCounters(poolName)).idleCount;
+    while (idleCount > maxIdle) {
+      const sandboxId = await stateStore.tryTakeIdle(poolName);
+      if (!sandboxId) break;
+      await this.killSandboxId(sandboxId);
+      idleCount -= 1;
+    }
+
+    const warmingCount = [...this.warmupTasks.values()].filter((value) => value === this.runGeneration).length;
+    const deficit = Math.max(0, maxIdle - idleCount - warmingCount);
+    const createCount = Math.min(deficit, this.options.warmupCreateQps);
+    const generation = this.runGeneration;
+    const leaderEpoch = this.leaderEpoch;
+    const signal = this.abortController?.signal;
+    const postCreateSemaphore = this.postCreateSemaphore;
+    for (let index = 0; index < createCount; index += 1) {
+      const task = this.tracer.runWarmup(
+        {
+          "pool.name": poolName,
+          "pool.owner": ownerId,
+          "pool.run.generation": generation,
+          "pool.leader.epoch": this.leaderEpoch,
+        },
+        () => this.createIdleSandbox(generation, leaderEpoch, postCreateSemaphore, signal),
+      )
+        .then(() => this.recordSuccess())
+        .catch((error: unknown) => {
+          this.recordFailure(error);
+          this.options.logger?.warn?.("pool warmup sandbox creation failed", { poolName, error });
+        })
+        .finally(() => this.warmupTasks.delete(task));
+      this.warmupTasks.set(task, generation);
+    }
   }
 
-  private async createIdleSandbox(): Promise<void> {
+  private async createIdleSandbox(
+    generation: number,
+    leaderEpoch: number,
+    postCreateSemaphore: AsyncSemaphore,
+    signal?: AbortSignal,
+  ): Promise<void> {
     this.inFlightOperations += 1;
     let sandbox: Sandbox | undefined;
     let committed = false;
     try {
-      sandbox = await this.createSandbox(PooledSandboxCreateReason.WARMUP, this.abortController?.signal);
-      await this.waitUntilHealthy(
-        sandbox,
-        this.options.warmupHealthCheck,
-        this.options.warmupReadyTimeoutSeconds,
-        this.options.warmupHealthCheckPollingIntervalMillis,
-        this.abortController?.signal,
+      sandbox = await this.tracer.runPhase(POOL_WARMUP_SPANS.create, async () =>
+        await this.createSandbox(PooledSandboxCreateReason.WARMUP, signal, true),
       );
-      await this.options.warmupPreparer?.(sandbox);
-      await sandbox.renew(this.options.idleTimeoutSeconds);
-      const stillPrimary = await this.options.stateStore.renewPrimaryLock(
-        this.options.poolName,
-        this.options.ownerId,
-        this.options.primaryLockTtlSeconds,
-      );
-      const mayCommit =
-        this.lifecycleState === PoolLifecycleState.RUNNING ||
-        (this.lifecycleState === PoolLifecycleState.DRAINING && this.allowWarmupCommitWhileDraining);
-      if (!stillPrimary || !mayCommit) {
+      if (this.options.warmupHealthCheckInitialDelayMillis > 0) {
+        await sleep(this.options.warmupHealthCheckInitialDelayMillis, signal);
+      }
+      const release = await postCreateSemaphore.acquire(signal);
+      try {
+        if (!this.options.warmupSkipHealthCheck) {
+          await this.tracer.runPhase(POOL_WARMUP_SPANS.readiness, async () =>
+            await this.waitUntilHealthy(
+              sandbox!,
+              this.options.warmupHealthCheck,
+              this.options.warmupReadyTimeoutSeconds,
+              this.options.warmupHealthCheckPollingIntervalMillis,
+              signal,
+            ),
+          );
+        }
+        if (this.options.warmupSandboxPreparer) {
+          await this.tracer.runPhase(POOL_WARMUP_SPANS.prepare, async () =>
+            await this.options.warmupSandboxPreparer!(sandbox!),
+          );
+        }
+        if (this.options.warmupPostPrepareHealthCheck) {
+          await this.tracer.runPhase(POOL_WARMUP_SPANS.postPrepareReadiness, async () =>
+            await this.waitUntilHealthy(
+              sandbox!,
+              this.options.warmupPostPrepareHealthCheck,
+              this.options.warmupPostPrepareHealthCheckTimeoutSeconds,
+              this.options.warmupHealthCheckPollingIntervalMillis,
+              signal,
+            ),
+          );
+        }
+        await this.tracer.runPhase(POOL_WARMUP_SPANS.renew, async () =>
+          await sandbox!.renew(this.options.idleTimeoutSeconds),
+        );
+      } finally {
+        release();
+      }
+      const didCommit = await this.tracer.runPhase(POOL_WARMUP_SPANS.commit, async () => {
+        const stillPrimary = await this.options.stateStore.renewPrimaryLock(
+          this.options.poolName,
+          this.options.ownerId,
+          this.options.primaryLockTtlSeconds,
+        );
+        const mayCommit =
+          generation === this.runGeneration &&
+          leaderEpoch === this.leaderEpoch &&
+          this.primaryOwned &&
+          (this.lifecycleState === PoolLifecycleState.RUNNING ||
+            (this.lifecycleState === PoolLifecycleState.DRAINING && this.allowWarmupCommitWhileDraining));
+        if (!stillPrimary || !mayCommit) return false;
+        await this.options.stateStore.putIdle(this.options.poolName, String(sandbox!.id));
+        return true;
+      });
+      if (!didCommit) {
         await this.killAndClose(sandbox);
         return;
       }
-      await this.options.stateStore.putIdle(this.options.poolName, String(sandbox.id));
       committed = true;
       await sandbox.close().catch((error: unknown) => {
         this.options.logger?.warn?.("failed to close pooled sandbox client", {
@@ -644,7 +770,14 @@ export class SandboxPool {
     }
   }
 
-  private async createSandbox(reason: PooledSandboxCreateReason, signal?: AbortSignal): Promise<Sandbox> {
+  private async createSandbox(
+    reason: PooledSandboxCreateReason,
+    signal?: AbortSignal,
+    injectTraceContext = false,
+  ): Promise<Sandbox> {
+    const createConnectionConfig = injectTraceContext
+      ? this.tracer.createConnectionConfig(this.options.connectionConfig)
+      : this.options.connectionConfig;
     if (this.options.sandboxCreator) {
       return await this.options.sandboxCreator({
         poolName: this.options.poolName,
@@ -660,14 +793,19 @@ export class SandboxPool {
             ? this.options.warmupHealthCheckPollingIntervalMillis
             : this.options.acquireHealthCheckPollingIntervalMillis,
         skipHealthCheck: true,
+        healthCheck:
+          reason === PooledSandboxCreateReason.WARMUP
+            ? this.options.warmupHealthCheck
+            : this.options.acquireHealthCheck,
         connectionConfig: this.options.connectionConfig,
+        createConnectionConfig,
         creationSpec: this.options.creationSpec,
         signal,
       });
     }
     return await Sandbox.create({
       ...this.options.creationSpec,
-      connectionConfig: this.options.connectionConfig,
+      connectionConfig: createConnectionConfig,
       timeoutSeconds: this.options.idleTimeoutSeconds,
       skipHealthCheck: true,
       signal,
@@ -750,28 +888,107 @@ export class SandboxPool {
     await sandbox.close().catch(() => undefined);
   }
 
-  private ensureAcquireStillRunning(): void {
-    if (this.lifecycleState === PoolLifecycleState.RUNNING) return;
+  private async ensureAcquireStillRunning(generation: number): Promise<void> {
+    if (this.lifecycleState === PoolLifecycleState.RUNNING && generation === this.runGeneration) return;
     throw new PoolNotRunningException(this.options.poolName, this.lifecycleState);
+  }
+
+  private async ensurePoolNamespaceActive(): Promise<void> {
+    const state = await this.storeCall("getDestroyState", () =>
+      this.options.stateStore.getDestroyState(this.options.poolName),
+    );
+    if (state !== PoolDestroyState.ACTIVE) {
+      throw new PoolDestroyedException(this.options.poolName, state);
+    }
+  }
+
+  private async throwIfPoolNamespaceDestroyed(): Promise<void> {
+    try {
+      await this.ensurePoolNamespaceActive();
+    } catch (error) {
+      if (error instanceof PoolDestroyedException) throw error;
+      // A stopped local pool remains observably stopped when the shared store
+      // cannot answer the stronger destroy-state question.
+    }
+  }
+
+  private async ensurePoolNamespaceActiveForAcquire(policy: AcquirePolicy): Promise<void> {
+    try {
+      await this.ensurePoolNamespaceActive();
+    } catch (error) {
+      if (error instanceof PoolDestroyedException) throw error;
+      if (!policyCreates(policy)) throw error;
+      this.options.logger?.warn?.(
+        "pool state store unavailable during destroy-state check; falling back to direct create",
+        { poolName: this.options.poolName, policy, error },
+      );
+    }
+  }
+
+  private async runPrimaryHeartbeat(generation: number): Promise<void> {
+    if (
+      generation !== this.runGeneration ||
+      !this.primaryOwned ||
+      (this.lifecycleState !== PoolLifecycleState.RUNNING &&
+        this.lifecycleState !== PoolLifecycleState.DRAINING)
+    ) return;
+    try {
+      const renewed = await this.options.stateStore.renewPrimaryLock(
+        this.options.poolName,
+        this.options.ownerId,
+        this.options.primaryLockTtlSeconds,
+      );
+      if (generation !== this.runGeneration) return;
+      if (!renewed) this.markPrimaryLost();
+    } catch (error) {
+      this.options.logger?.warn?.("pool primary heartbeat failed", {
+        poolName: this.options.poolName,
+        error,
+      });
+    }
+  }
+
+  private async stopAfterNamespaceDestroyed(state: PoolDestroyState): Promise<void> {
+    if (this.lifecycleState !== PoolLifecycleState.RUNNING) return;
+    this.lifecycleState = PoolLifecycleState.STOPPED;
+    if (this.timer) clearInterval(this.timer);
+    this.timer = undefined;
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = undefined;
+    this.abortController?.abort(new PoolDestroyedException(this.options.poolName, state));
+    try {
+      await this.options.stateStore.releasePrimaryLock(this.options.poolName, this.options.ownerId);
+    } catch {
+      // Destroy fencing already prevents future commits; lock release is best effort.
+    }
+    this.markPrimaryLost();
+    await this.manager?.close().catch(() => undefined);
+    this.manager = undefined;
+  }
+
+  private markPrimaryAcquired(): void {
+    if (this.primaryOwned) return;
+    this.primaryOwned = true;
+    this.leaderEpoch += 1;
+  }
+
+  private markPrimaryLost(): void {
+    if (!this.primaryOwned) return;
+    this.primaryOwned = false;
+    this.leaderEpoch += 1;
   }
 
   private recordSuccess(): void {
     this.failureCount = 0;
     this.lastError = undefined;
-    this.backoffUntilMs = 0;
-    this.healthState = PoolHealthState.HEALTHY;
+    this.operatingState = PoolState.HEALTHY;
   }
 
   private recordFailure(error: unknown): void {
     this.failureCount += 1;
     this.lastError = error instanceof Error ? error.message : String(error);
     if (this.failureCount >= this.options.degradedThreshold) {
-      this.healthState = PoolHealthState.DEGRADED;
-      const backoffSeconds = Math.min(
-        24 * 60 * 60,
-        30 * 2 ** (this.failureCount - this.options.degradedThreshold),
-      );
-      this.backoffUntilMs = Date.now() + backoffSeconds * 1000;
+      this.operatingState = PoolState.DEGRADED;
     }
     this.options.logger?.warn?.("pool reconcile failed", {
       poolName: this.options.poolName,
@@ -791,7 +1008,7 @@ export class SandboxPool {
     try {
       return await call();
     } catch (cause) {
-      if (cause instanceof PoolStateStoreUnavailableException) throw cause;
+      if (cause instanceof PoolStateStoreUnavailableException || cause instanceof PoolDestroyedException) throw cause;
       throw new PoolStateStoreUnavailableException(operation, cause);
     }
   }
