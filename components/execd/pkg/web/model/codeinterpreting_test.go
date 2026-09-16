@@ -221,8 +221,10 @@ func TestCommandAndSessionCwdUseTheirOwnEnvironment(t *testing.T) {
 		req.Envs = map[string]string{"ARGV_DIR": missing}
 		require.Error(t, req.Validate())
 	}
+	// Session cwd validation is deferred to the runtime layer, which resolves
+	// against the target session's environment (EXECD_ENVS file values and
+	// variables exported in earlier runs), not the daemon environment. See
+	// Controller.ValidateBashSessionCwd.
 	session := RunInSessionRequest{Command: "pwd", Cwd: "$ARGV_DIR"}
-	require.Error(t, session.Validate())
-	t.Setenv("ARGV_DIR", dir)
 	require.NoError(t, session.Validate())
 }

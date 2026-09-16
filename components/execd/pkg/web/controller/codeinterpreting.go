@@ -54,6 +54,7 @@ type codeExecutionRunner interface {
 	DeleteContext(session string) error
 	CreateBashSession(req *runtime.CreateContextRequest) (string, error)
 	RunInBashSession(ctx context.Context, req *runtime.ExecuteCodeRequest) error
+	ValidateBashSessionCwd(sessionID, cwd string) error
 	SeekBackgroundCommandOutput(session string, cursor int64) ([]byte, int64, error)
 	DeleteBashSession(sessionID string) error
 	Interrupt(sessionID string) error
@@ -335,6 +336,19 @@ func (c *CodeInterpretingController) RunInSession() {
 		return
 	}
 	if err := request.Validate(); err != nil {
+		c.RespondError(
+			http.StatusBadRequest,
+			model.ErrorCodeInvalidRequest,
+			fmt.Sprintf("invalid request. %v", err),
+		)
+		return
+	}
+
+	// The cwd may reference EXECD_ENVS file variables or variables exported in
+	// earlier runs of this session, so it must be validated against the
+	// session's environment. Skip validation when the session is missing and
+	// let RunInBashSession surface the not-found error as before.
+	if err := codeRunner.ValidateBashSessionCwd(sessionID, request.Cwd); err != nil && !errors.Is(err, runtime.ErrContextNotFound) {
 		c.RespondError(
 			http.StatusBadRequest,
 			model.ErrorCodeInvalidRequest,
