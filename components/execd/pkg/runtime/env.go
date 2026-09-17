@@ -177,7 +177,7 @@ func (p *envFileParser) skipLine() {
 
 // indexNonSpace returns the index of the first non-space byte in s, or len(s).
 func indexNonSpace(s string) int {
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		switch s[i] {
 		case ' ', '\t', '\r', '\v', '\f':
 		default:
