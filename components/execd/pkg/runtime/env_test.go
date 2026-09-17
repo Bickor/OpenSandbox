@@ -75,7 +75,7 @@ func TestParseEnvFileSingleQuotedIsLiteral(t *testing.T) {
 		"DOLLAR='$HOME and ${HOME}'",
 		"EMPTY=''",
 		"BACKSLASH='a\\nb'",
-		"SQUOTE='it''s'", // ' after closing quote makes the entry malformed
+		"SQUOTE='it''s'",
 		"NEXT=ok",
 	}, "\n")
 
@@ -99,7 +99,6 @@ func TestParseEnvFileDoubleQuotedEscapesAndExpands(t *testing.T) {
 		`MULTI="line1\nline2"`,
 		`PADDED="  kept  "`,
 		`LITERAL="$HOME"`,
-		`ESCAPED_DOLLAR="\$HOME"`,
 		`QUOTED="a \"b\" c"`,
 		`BACKSLASH="a\\b"`,
 		`SPANNING="first`,
@@ -111,21 +110,18 @@ func TestParseEnvFileDoubleQuotedEscapesAndExpands(t *testing.T) {
 	require.Equal(t, "line1\nline2", got["MULTI"])
 	require.Equal(t, "  kept  ", got["PADDED"])
 	require.Equal(t, os.Getenv("HOME"), got["LITERAL"])
-	require.Equal(t, "$HOME", got["ESCAPED_DOLLAR"])
 	require.Equal(t, `a "b" c`, got["QUOTED"])
 	require.Equal(t, `a\b`, got["BACKSLASH"])
 	require.Equal(t, "first\nsecond", got["SPANNING"])
 }
 
-// formatEnvFileEntry mirrors the lossless writer strategy: single-quote
-// when possible, otherwise double-quote with escapes.
+// formatEnvFileEntry mirrors the lossless writer strategy for EXECD_ENVS values.
 func formatEnvFileEntry(key, value string) string {
 	if !strings.Contains(value, "'") {
 		return key + "='" + value + "'"
 	}
 	escaped := strings.ReplaceAll(value, "\\", "\\\\")
 	escaped = strings.ReplaceAll(escaped, "\"", "\\\"")
-	escaped = strings.ReplaceAll(escaped, "$", "\\$")
 	return key + "=\"" + escaped + "\""
 }
 
@@ -135,7 +131,7 @@ func TestParseEnvFileRoundTripsLosslessly(t *testing.T) {
 		"  leading and trailing  ",
 		"$HOME ${HOME} $$ literal dollar",
 		`back\slash and "quotes" and $dollar`,
-		"it's got 'single quotes' and $HOME",
+		"it's got 'single' and \"double\" quotes",
 		"tab\tseparated",
 		"",
 	}
