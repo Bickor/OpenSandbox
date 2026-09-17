@@ -19,6 +19,7 @@ import {
   PoolEmptyException,
   PoolNotRunningException,
   PoolStateStoreUnavailableException,
+  SandboxReadyTimeoutException,
 } from "./core/exceptions.js";
 import { ReadinessBudget } from "./internal/readiness.js";
 import { PoolTracer, POOL_WARMUP_SPANS } from "./internal/poolTracing.js";
@@ -438,9 +439,7 @@ export class SandboxPool {
             attempt: attempt + 1,
             error: cause,
           });
-          if (this.lifecycleState !== PoolLifecycleState.RUNNING) {
-            throw new PoolNotRunningException(this.options.poolName, this.lifecycleState);
-          }
+          await this.ensureAcquireStillRunning(generation);
           await this.ensurePoolNamespaceActive();
           if (!policyRetries(policy)) break;
           continue;
@@ -455,6 +454,7 @@ export class SandboxPool {
         return sandbox;
       }
 
+      await this.ensureAcquireStillRunning(generation);
       if (!policyCreates(policy)) {
         if (attempted) throw new PoolAcquireFailedException(this.options.poolName, lastError);
         throw new PoolEmptyException(this.options.poolName);
@@ -697,25 +697,33 @@ export class SandboxPool {
       sandbox = await this.tracer.runPhase(POOL_WARMUP_SPANS.create, async () =>
         await this.createSandbox(PooledSandboxCreateReason.WARMUP, signal, true),
       );
-      if (this.options.warmupHealthCheckInitialDelayMillis > 0) {
-        await sleep(this.options.warmupHealthCheckInitialDelayMillis, signal);
+      const warmupReadinessDeadline = performance.now() + this.options.warmupReadyTimeoutSeconds * 1_000;
+      if (!this.options.warmupSkipHealthCheck && this.options.warmupHealthCheckInitialDelayMillis > 0) {
+        await sleep(
+          Math.min(
+            this.options.warmupHealthCheckInitialDelayMillis,
+            this.options.warmupReadyTimeoutSeconds * 1_000,
+          ),
+          signal,
+        );
       }
       const release = await postCreateSemaphore.acquire(signal);
       try {
         if (!this.options.warmupSkipHealthCheck) {
           await this.tracer.runPhase(POOL_WARMUP_SPANS.readiness, async () =>
-            await this.waitUntilHealthy(
+            await this.waitUntilWarmupHealthy(
               sandbox!,
-              this.options.warmupHealthCheck,
-              this.options.warmupReadyTimeoutSeconds,
-              this.options.warmupHealthCheckPollingIntervalMillis,
+              warmupReadinessDeadline,
               signal,
             ),
           );
         }
         if (this.options.warmupSandboxPreparer) {
           await this.tracer.runPhase(POOL_WARMUP_SPANS.prepare, async () =>
-            await this.options.warmupSandboxPreparer!(sandbox!),
+            await runAbortable(
+              () => this.options.warmupSandboxPreparer!(sandbox!),
+              signal,
+            ),
           );
         }
         if (this.options.warmupPostPrepareHealthCheck) {
@@ -843,6 +851,37 @@ export class SandboxPool {
         budget.record(error);
       }
       await budget.pause(pollingIntervalMillis);
+    }
+  }
+
+  private async waitUntilWarmupHealthy(
+    sandbox: Sandbox,
+    deadline: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const remainingMillis = deadline - performance.now();
+    if (remainingMillis > 0) {
+      await this.waitUntilHealthy(
+        sandbox,
+        this.options.warmupHealthCheck,
+        remainingMillis / 1_000,
+        this.options.warmupHealthCheckPollingIntervalMillis,
+        signal,
+      );
+      return;
+    }
+
+    signal?.throwIfAborted();
+    const healthy = await runAbortable(
+      () => this.options.warmupHealthCheck
+        ? this.options.warmupHealthCheck(sandbox)
+        : sandbox.isHealthy(),
+      signal,
+    );
+    if (!healthy) {
+      throw new SandboxReadyTimeoutException({
+        message: `Sandbox warmup readiness timed out after ${this.options.warmupReadyTimeoutSeconds}s`,
+      });
     }
   }
 
@@ -1011,5 +1050,21 @@ export class SandboxPool {
       if (cause instanceof PoolStateStoreUnavailableException || cause instanceof PoolDestroyedException) throw cause;
       throw new PoolStateStoreUnavailableException(operation, cause);
     }
+  }
+}
+
+async function runAbortable<T>(action: () => T | Promise<T>, signal?: AbortSignal): Promise<T> {
+  signal?.throwIfAborted();
+  if (!signal) return await action();
+
+  let rejectOnAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    rejectOnAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", rejectOnAbort, { once: true });
+  });
+  try {
+    return await Promise.race([Promise.resolve().then(action), aborted]);
+  } finally {
+    if (rejectOnAbort) signal.removeEventListener("abort", rejectOnAbort);
   }
 }

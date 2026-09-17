@@ -557,6 +557,43 @@ test("renew failure is terminal and does not consume another idle sandbox", asyn
   await pool.shutdown();
 });
 
+test("an acquire from a retired run cannot consume idle from a restarted run", async () => {
+  const fixture = createPoolFixture();
+  const store = new InMemoryPoolStateStore();
+  const oldCheckStarted = deferred();
+  const oldCheckGate = deferred();
+  const pool = SandboxPool.create({
+    poolName: "retired-acquire-pool",
+    maxIdle: 0,
+    stateStore: store,
+    connectionConfig: fixture.connectionConfig,
+    creationSpec: { image: "ubuntu", adapterFactory: fixture.adapterFactory },
+    acquireHealthCheck: async (sandbox) => {
+      if (sandbox.id === "old") {
+        oldCheckStarted.resolve();
+        await oldCheckGate.promise;
+        return false;
+      }
+      return true;
+    },
+    acquireReadyTimeoutSeconds: 0.02,
+    acquireHealthCheckPollingIntervalMillis: 1,
+  });
+
+  await pool.start();
+  await store.putIdle("retired-acquire-pool", "old");
+  const oldAcquire = pool.acquire({ policy: AcquirePolicy.RETRY_NEXT_IDLE });
+  await oldCheckStarted.promise;
+  await pool.shutdown(false);
+  await pool.start();
+  await store.putIdle("retired-acquire-pool", "new");
+  oldCheckGate.resolve();
+
+  await assert.rejects(oldAcquire, /is not running/);
+  assert.deepEqual((await pool.snapshotIdleEntries()).map((entry) => entry.sandboxId), ["new"]);
+  await pool.shutdown(false);
+});
+
 test("forced shutdown does not wait for a creator that ignores cancellation", async () => {
   const fixture = createPoolFixture();
   let creatorStarted;
@@ -582,6 +619,30 @@ test("forced shutdown does not wait for a creator that ignores cancellation", as
 
   releaseCreator();
   await eventually(async () => fixture.calls.some((call) => call.method === "creator-kill"));
+});
+
+test("forced shutdown aborts a preparer that ignores cancellation and cleans the sandbox", async () => {
+  const fixture = createPoolFixture();
+  const preparerStarted = deferred();
+  const preparerGate = deferred();
+  const pool = SandboxPool.create({
+    poolName: "forced-preparer-pool",
+    maxIdle: 1,
+    connectionConfig: fixture.connectionConfig,
+    creationSpec: { image: "ubuntu", adapterFactory: fixture.adapterFactory },
+    sandboxCreator: fixture.sandboxCreator,
+    warmupSandboxPreparer: async () => {
+      preparerStarted.resolve();
+      await preparerGate.promise;
+    },
+  });
+
+  await pool.start();
+  await preparerStarted.promise;
+  await pool.shutdown(false);
+  await eventually(async () => fixture.calls.some((call) => call.method === "creator-kill"));
+  assert.equal((await pool.snapshot()).inFlightOperations, 0);
+  preparerGate.resolve();
 });
 
 test("acquire disposes a sandbox if forced shutdown retires the pool run", async () => {

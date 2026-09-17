@@ -94,6 +94,7 @@ test("client pool runs staged warmup before publishing idle", async () => {
   const poolName = `js-pool-staged-${Math.random().toString(16).slice(2, 10)}`;
   const marker = `/tmp/${poolName}.ready`;
   const events: string[] = [];
+  let postPrepareCalls = 0;
   const pool = SandboxPool.create({
     poolName,
     maxIdle: 1,
@@ -105,7 +106,8 @@ test("client pool runs staged warmup before publishing idle", async () => {
       resource: { cpu: "1", memory: "2Gi" },
     },
     idleTimeoutSeconds: 5 * 60,
-    warmupReadyTimeoutSeconds: 60,
+    warmupReadyTimeoutSeconds: 1,
+    warmupHealthCheckInitialDelayMillis: 2_000,
     warmupHealthCheck: async (sandbox) => {
       events.push("readiness");
       return await sandbox.isHealthy();
@@ -117,6 +119,8 @@ test("client pool runs staged warmup before publishing idle", async () => {
     },
     warmupPostPrepareHealthCheck: async (sandbox) => {
       events.push("post-prepare-readiness");
+      postPrepareCalls += 1;
+      if (postPrepareCalls === 1) return false;
       const result = await sandbox.commands.run(`test -f ${marker}`);
       return result.error === undefined;
     },
@@ -130,7 +134,12 @@ test("client pool runs staged warmup before publishing idle", async () => {
     const result = await acquired.commands.run(`cat ${marker}`);
     expect(result.error).toBeUndefined();
     expect(result.logs.stdout[0]?.text).toBe("prepared");
-    expect(events).toEqual(["readiness", "prepare", "post-prepare-readiness"]);
+    expect(events).toEqual([
+      "readiness",
+      "prepare",
+      "post-prepare-readiness",
+      "post-prepare-readiness",
+    ]);
   } finally {
     await pool.resize(0).catch(() => undefined);
     await pool.releaseAllIdle().catch(() => undefined);

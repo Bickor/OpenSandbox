@@ -107,6 +107,27 @@ test("warmupConcurrency bounds post-create stages", async () => {
   }
 });
 
+test("warmup initial delay is capped by the readiness deadline with one final attempt", async () => {
+  let healthChecks = 0;
+  const startedAt = Date.now();
+  const pool = SandboxPool.create(poolOptions({
+    warmupSkipHealthCheck: false,
+    warmupReadyTimeoutSeconds: 0.02,
+    warmupHealthCheckInitialDelayMillis: 1_000,
+    sandboxCreator: async () => fakeSandbox("final-attempt"),
+    warmupHealthCheck: async () => { healthChecks += 1; return true; },
+  }));
+
+  try {
+    await pool.start();
+    await eventually(async () => (await pool.snapshot()).idleCount === 1);
+    assert.equal(healthChecks, 1);
+    assert.ok(Date.now() - startedAt < 500);
+  } finally {
+    await pool.shutdown(false);
+  }
+});
+
 test("staged warmup runs readiness, preparer, post-check, renew, and commit in order", async () => {
   const events = [];
   let postAttempts = 0;
