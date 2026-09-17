@@ -381,6 +381,106 @@ helm upgrade opensandbox-controller ../manifests/charts/controller \
   --namespace opensandbox-system
 ```
 
+## fast-sandbox Runtime (Firecracker)
+
+The optional `fast-sandbox` chart deploys the fast-sandbox Firecracker chain
+(`sandbox.fast.io`): the all-in-one control plane (reconcilers + FastPath
+gRPC), the janitor, and the node-side firecracker runtime (UDS management
+API, DART P2P delivery, janitor sidecar, and the node readiness loop that
+installs the Firecracker assets and self-labels the nodes). Only
+Firecracker is covered; boxlite and other non-Firecracker runtimes are out
+of scope, and the upstream central sandbox-proxy is not deployed
+(OpenSandbox reaches fastlets through the ingress gateway's direct route
+resolution).
+
+The CRDs (`sandbox.fast.io`) and the component RBAC ship in the `base` chart
+(gated by `fastSandbox.*` values), so install `base` first.
+
+### 1. Build the companion images from the pinned source
+
+The upstream source is pinned Git-LFS-pointer style in
+[`manifests/third-party/fast-sandbox.commit`](third-party/fast-sandbox.commit)
+(repo + commit). The build script materializes a checkout of exactly that
+commit and builds the six Firecracker-scope images (controller, fastlet,
+fastlet-proxy, janitor, firecracker-runtime,
+sandboxtemplate-builder):
+
+```bash
+# Build all images; --load-kind also pushes them into a kind cluster
+manifests/release/build-fast-sandbox.sh --load-kind <kind-cluster>
+
+# List the image refs that would be built
+manifests/release/build-fast-sandbox.sh --list-images
+```
+
+`REGISTRY` / `TAG` environment variables override the default
+`fast-sandbox/<component>:dev` refs — keep the chart `image.*` values in
+sync when you override them. To publish, `--push` follows the
+`components/*/build.sh` convention: bare `--push` retags and pushes to
+`docker.io/opensandbox` and
+`sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox` (plus
+`$GHCR_REPO/<component>` when `GHCR_REPO` is set), `--push r1[,r2...]`
+pushes to exactly the listed registries, and a `v*` `TAG` additionally
+pushes `:latest`. Images are linux/amd64 only.
+
+### 2. Prepare the cluster
+
+```bash
+# Nodes need bare-metal KVM (/dev/kvm); no manual labeling — the
+# firecracker-runtime readiness loop verifies each host, installs the
+# Firecracker assets, and applies sandbox.fast.io/kvm +
+# fast-sandbox.io/firecracker-node itself.
+
+# Provision the agent registry Secret (artifact-store pull credentials,
+# compiled registry.json)
+kubectl -n opensandbox-system create secret generic fast-sandbox-agent-registry \
+  --from-file=registry.json=<compiled-registry.json>
+```
+
+### 3. Install
+
+```bash
+helm install base manifests/charts/base          # sandbox.fast.io CRDs + RBAC
+helm install fast-sandbox manifests/charts/fast-sandbox
+```
+
+Or through the umbrella chart:
+
+```bash
+helm install opensandbox manifests/charts/opensandbox \
+  --set fast-sandbox.enabled=true
+```
+
+Two key systems apply (do not conflate them):
+
+- The fast-sandbox controller's Ed25519 route keys default to the published
+  development-only test keys (`fast-sandbox.io/development-only: "true"`
+  label). For production, set `routeKeys.existingSecret` or
+  `routeKeys.privateKey` / `routeKeys.publicKey` with
+  `routeKeys.developmentOnly=false`.
+- The OpenSandbox f1.* route-scope ring is HMAC-SHA256 and independent: the
+  server signs with `[ingress.secure_access]` (`server.gateway.secureAccess`
+  in charts/server) and the ingress gateway verifies with the same symmetric
+  ring (`gateway.secureAccess` in charts/ingress-gateway). Configure both
+  with matching key material for production.
+
+Point the OpenSandbox server's
+`[runtime]`/fsb configuration and the ingress gateway's
+`--provider-type=fast-sandbox` at the deployed FastPath endpoint to
+serve sandboxes through this runtime (see
+`scripts/fast-sandbox-env` for a working reference).
+
+### Bumping the pinned fast-sandbox commit
+
+```bash
+# 1. Update the commit line in manifests/third-party/fast-sandbox.commit
+# 2. Re-sync the vendored CRDs (byte-identical to the pinned checkout)
+manifests/release/build-fast-sandbox.sh --no-build --sync-crds   # or: make -C manifests helm-gen-fast-sandbox-crds
+# 3. Rebuild the images and redeploy
+manifests/release/build-fast-sandbox.sh --load-kind <kind-cluster>
+helm upgrade fast-sandbox manifests/charts/fast-sandbox
+```
+
 ## Advanced Configuration
 
 ### Multi-Environment Deployment

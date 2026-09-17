@@ -2,10 +2,17 @@
 
 One-command OpenSandbox ecosystem integration environment driven from the
 OpenSandbox repository: a two-node kind cluster (KVM passthrough) running
-the fast-sandbox Firecracker chain from a `master` checkout, with the
-source-built OpenSandbox **egress** sidecar attached to the default pool
-and the source-built OpenSandbox **server** (fsb runtime) and **ingress
-gateway** wired on top — verified end to end on every `up`.
+the fast-sandbox Firecracker chain from the source pinned in
+`manifests/third-party/fast-sandbox.commit`, with the source-built
+OpenSandbox **egress** sidecar attached to the default pool and the
+source-built OpenSandbox **server** (fsb runtime) and **ingress gateway**
+wired on top — verified end to end on every `up`.
+
+All Kubernetes resources ship from the OpenSandbox Helm charts
+(`manifests/charts`): `base` (CRDs + RBAC), `fast-sandbox` (control plane,
+janitor, node installer, runtime-agent + DART), `server` and
+`ingress-gateway`. The only env-owned manifests left are the kind cluster
+config and the SandboxPool resource.
 
 The last `up` stage creates one sandbox through the server API, reaches
 the in-sandbox execd `/ping` through the signed gateway route, and deletes
@@ -20,10 +27,10 @@ caveats): `fast-sandbox/docs/guides/firecracker-integration-env.md`.
 ## Usage
 
 ```bash
-./scripts/fast-sandbox-env/fast-sandbox-env.sh up        # full stack + end-to-end + pause/resume verify
-./scripts/fast-sandbox-env/fast-sandbox-env.sh status    # component / pool / DART / OpenSandbox health
-./scripts/fast-sandbox-env/fast-sandbox-env.sh pool      # re-apply the pool only
-./scripts/fast-sandbox-env/fast-sandbox-env.sh down      # teardown, host left clean
+./scripts/fast-sandbox-env/integration-env.sh up        # full stack + end-to-end + pause/resume verify
+./scripts/fast-sandbox-env/integration-env.sh status    # component / pool / DART / OpenSandbox health
+./scripts/fast-sandbox-env/integration-env.sh pool      # re-apply the pool only
+./scripts/fast-sandbox-env/integration-env.sh down      # teardown, host left clean
 ```
 
 After `up`, point any OpenSandbox SDK at `http://127.0.0.1:18080` with the
@@ -44,7 +51,8 @@ SDK ──header──> ingress gateway (source-built, --provider-type=fast-sand
 
 - **server / ingress / egress** are built from this repository
   (`server/Dockerfile`, `components/ingress`, `components/egress`) and
-  kind-loaded; manifests live in `manifests/opensandbox/`.
+  kind-loaded; the server and the gateway are installed through
+  `manifests/charts/server` and `manifests/charts/ingress-gateway`.
 - **execd** is baked into the SandboxTemplate golden image. Templates are
   created through the server's `POST /templates` API (server config
   injects `EXECD` as the build's execd image, kernel stays the builder
@@ -71,45 +79,45 @@ SDK ──header──> ingress gateway (source-built, --provider-type=fast-sand
 - **On-demand loading**: the pool has no `warmImages`; the verify
   sandbox's create pulls the golden snapshot set through DART.
   `WARM_IMAGES=1` preheats instead.
-- **fast-sandbox @ master**: env-owned clone at `$WORK/fast-sandbox`,
-  cloned on first `up` and ff-updated afterwards; override the location
-  with `FSB_DIR`, the source with `FSB_GIT_URL` / `FSB_REF`.
+- **fast-sandbox @ pinned commit**: env-owned clone at `$WORK/fast-sandbox`,
+  cloned on first `up` and checked out at the pinned commit afterwards;
+  relocate it with `FSB_DIR`. The source itself has no override — bump the
+  commit in `manifests/third-party/fast-sandbox.commit`.
 
 ## Layout
 
 ```
-fast-sandbox-env.sh          entrypoint: up / down / status / pool
+integration-env.sh          entrypoint: up / down / status / pool
 architecture.svg             how the environment works (topology, pipeline,
                              P2P delivery, egress actions channel)
 manifests/
   cluster/kind-cluster.yaml    two-node kind cluster, KVM/tun/shm mounts,
                                per-node state-root subdirectories
-  node/firecracker-installer.yaml  firecracker + jailer + arch-aware kernel
-                                    onto node hostPath
-  node/dart-service.yaml       headless Service backing DART peer discovery
-  node/runtime-agent.yaml      per-node agent + DART child (P2P data plane);
-                               image rendered from IMG_AGENT
   pool/firecracker-egress-pool.yaml  SandboxPool: egress attached + P2P spread
-  opensandbox/server.yaml      lifecycle server: fsb runtime config,
-                               NodePort 30880 -> host 18080
-  opensandbox/ingress-gateway.yaml   fsb provider + FastPath + shared
-                               signing key, NodePort 30881 -> host 18081
 ```
 
-Canonical fast-sandbox manifests (CRDs, RBAC, control plane, dev route
-keys, runtime-environments) are applied directly from the checkout and
-are intentionally not duplicated here. Small operational manifests that
-define this environment's shape are split by concern above and rendered
-(image tags, signing key, ports) into `$WORK/gen` at apply time.
+Everything else comes from the OpenSandbox Helm charts (`manifests/charts`),
+rendered with `helm template` from the workdir's values (image tags,
+artifact-store endpoint, FastPath endpoint, signing key, NodePorts) and
+applied with plain `kubectl apply` — the cluster keeps no helm state:
+
+| Chart | Provides in this environment |
+|---|---|
+| `base` | `sandbox.fast.io` + `sandbox.opensandbox.io` CRDs, component RBAC, namespaces |
+| `fast-sandbox` | all-in-one control plane (reconcilers + FastPath), janitor, firecracker node installer, runtime-agent + DART |
+| `server` | lifecycle server: fsb runtime config (rendered `configToml`), NodePort |
+| `ingress-gateway` | fsb provider + FastPath + shared signing key, NodePort |
 
 ## Stage order (up)
 
-preflight → sysctl → fast-sandbox checkout → build images (6 fast-sandbox
-images + egress + server + ingress) → XFS StateRoot → kind cluster + node
-labels (host ports 18080/18081) → MinIO → CRDs + control plane →
-credentials → firecracker node assets → runtime-agent + DART (roster
-asserted) → OpenSandbox server + ingress gateway → SandboxTemplate golden
-image **built through the server `POST /templates` API** → SandboxPool
+preflight → sysctl → fast-sandbox checkout (pinned commit) → build images
+(6 fast-sandbox images via `manifests/release/build-fast-sandbox.sh` +
+egress + server + ingress) → XFS StateRoot → kind cluster + node labels
+(host ports 18080/18081) → MinIO → charts rendered + applied: base +
+fast-sandbox (CRDs, RBAC, control plane, installer, agent) → credentials →
+installer/agent roster asserted → charts rendered + applied: server +
+ingress gateway → SandboxTemplate golden image
+**built through the server `POST /templates` API** → SandboxPool
 (fastlet Ready, egress Ready, pool conditions, actions protocol check) →
 end-to-end verify (templateId create → signed gateway route → execd
 `/ping` → delete) → pause/resume round-trip (POST pause → poll
@@ -132,7 +140,8 @@ Every stage logs to `$WORK/logs/`; failures dump component logs to
 | `SERVER_HOST_PORT` / `GATEWAY_HOST_PORT` | `18080` / `18081` | host-side publishes for server / gateway (loopback only) |
 | `SERVER_IMAGE` | `docker.io/opensandbox/server:env` | server image tag (built from `server/`) |
 | `INGRESS_IMAGE` | `docker.io/opensandbox/ingress:env` | ingress image tag (built from `components/ingress`) |
-| `IMAGE_AGENT` | `fast-sandbox/firecracker-runtime-agent:dev` | agent image (rendered into the DaemonSet) |
+| `IMAGE_RUNTIME` | `fast-sandbox/firecracker-runtime:dev` | firecracker runtime image (passed to the fast-sandbox chart) |
+| — | agent-config defaults pinned by the chart | Firecracker asset version/kernel live in the runtime agent config (`runtime.config` chart value), hot-reloadable |
 | `POOL_MIN` / `POOL_MAX` | `2` / `2` | pool capacity (auto `1`/`1` when `KIND_SINGLE=1`) |
 | `WARM_IMAGES` | `0` | `1` = preheat pool instead of on-demand first-sandbox pull |
 | `SBX_IMAGE` / `EXECD` | `alpine:3.19` / `opensandbox/execd:1.1.0` | template build inputs |
