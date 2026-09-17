@@ -78,7 +78,7 @@
   <text x="550" y="392" class="ret" text-anchor="middle">idle_count = N</text>
 
   <!-- gap comment -->
-  <text x="410" y="430" class="note">// admit up to warmup_concurrency (Py/Go) or warmup_create_qps (Kotlin)</text>
+  <text x="410" y="430" class="note">// admit up to warmup_create_qps (Py/Kotlin) or warmup_concurrency (Go)</text>
 
   <!-- loop frame -->
   <rect x="440" y="450" width="890" height="290" fill="#faf5ff" stroke="#6d28d9" stroke-width="1" rx="4" opacity="0.35"/>

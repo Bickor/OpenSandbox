@@ -1,37 +1,42 @@
 ---
 title: SDK Tracing (Pool Warmup)
-description: How to enable OpenTelemetry tracing for the Kotlin SDK pool warmup path, what spans are produced, and how to query and drill down into warmup traces.
+description: How to enable OpenTelemetry tracing for the Python and Kotlin SDK pool warmup path, what spans are produced, and how to query and drill down into warmup traces.
 ---
 
 # SDK Tracing (Pool Warmup)
 
-The Kotlin/Java SDK (`com.alibaba.opensandbox:sandbox`) can emit
+The Python SDK (`opensandbox`) and Kotlin/Java SDK
+(`com.alibaba.opensandbox:sandbox`) can emit
 [OpenTelemetry](https://opentelemetry.io/) traces for the client-side
 `SandboxPool` warmup path. Each warmup task becomes one trace that covers the
 full lifecycle — from the moment the reconcile loop submits the task until the
 warmed sandbox is committed to the idle buffer — with per-phase spans so you
 can find the actual warmup bottleneck.
 
-Tracing is **opt-in** (`enableTracing(true)`) and **best-effort**: without an
-OpenTelemetry SDK + exporter on the application classpath, all span calls are
-no-ops and nothing is exported. Tracing never throws and never affects pool
-behavior.
+Tracing is **opt-in** (`enable_tracing=True` in Python or
+`enableTracing(true)` on the JVM) and **best-effort**: without an OpenTelemetry
+SDK + exporter in the application, all span calls are no-ops and nothing is
+exported. Tracing never affects pool behavior.
 
 ## Requirements
 
 | Component | Minimum version |
 |-----------|-----------------|
+| Python SDK (`opensandbox`) | next release |
 | Kotlin / Java SDK (`com.alibaba.opensandbox:sandbox`) | `1.0.19` |
-
-Only the Kotlin SDK emits these traces today; the other language SDKs do not
-yet support `enableTracing`.
 
 ## Enabling tracing
 
 ### 1. Add an OpenTelemetry SDK + exporter to your application
 
-The SDK depends only on `opentelemetry-api` (no-op by default). To actually
-export traces you bring your own SDK and exporter, for example OTLP over HTTP:
+Both SDKs depend only on the OpenTelemetry API (no-op by default). To actually
+export traces you bring your own SDK and exporter. For Python:
+
+```bash
+pip install opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
+```
+
+For Kotlin/Java:
 
 ```kotlin
 dependencies {
@@ -41,10 +46,11 @@ dependencies {
 }
 ```
 
-### 2. Configure a global `OpenTelemetry` instance
+### 2. Configure the global OpenTelemetry provider
 
-Warmup spans use the global instance (`GlobalOpenTelemetry`). Configure it at
-application startup, e.g. with `OpenTelemetrySdk`:
+Warmup spans use the language's global provider. Configure it at application
+startup. For Python, use `opentelemetry.trace.set_tracer_provider(...)`; for
+Kotlin/Java, configure `GlobalOpenTelemetry`, for example:
 
 ```java
 import io.opentelemetry.sdk.OpenTelemetrySdk;
@@ -85,6 +91,16 @@ sampling keeps client and server spans consistent for the same warmup.
 
 ### 3. Turn tracing on for the pool
 
+Python:
+
+```python
+from opensandbox.config import ConnectionConfig
+
+config = ConnectionConfig(enable_tracing=True)
+```
+
+Kotlin/Java:
+
 ```java
 ConnectionConfig config = ConnectionConfig.builder()
     .enableTracing(true)
@@ -99,8 +115,8 @@ SandboxPool pool = SandboxPool.builder()
     .build();
 ```
 
-That is all. No environment variables are involved; `enableTracing` defaults
-to `false`.
+That is all. No environment variables are involved; tracing defaults to
+`false`.
 
 ## What is traced
 

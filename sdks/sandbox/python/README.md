@@ -119,7 +119,8 @@ pool = SandboxPoolSync(
     state_store=InMemoryPoolStateStore(),  # single-process only
     connection_config=ConnectionConfigSync(domain="api.opensandbox.io"),
     creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
-    reconcile_interval=timedelta(seconds=5),
+    warmup_create_qps=10,
+    warmup_concurrency=128,
 )
 
 pool.start()
