@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,6 +21,9 @@ set -euo pipefail
 
 LICENSE_YEAR=$(date +%Y)
 LICENSE_OWNER="The OpenSandbox Authors"
+# Dual acceptance is intentional during the transition period following donation to AAIF.
+# Newly added files receive The OpenSandbox Authors header, while existing files retain their headers.
+# TODO: Once legacy files across the codebase are migrated, remove the Alibaba Group Holding Ltd. fallback branch.
 LICENSE_MARKER_REGEX="Copyright [0-9]{4} (${LICENSE_OWNER// / }|Alibaba Group Holding Ltd\.)"
 LICENSE_TEXT_TEMPLATE=$(
   cat <<'EOF'
