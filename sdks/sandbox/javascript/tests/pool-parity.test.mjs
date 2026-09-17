@@ -5,6 +5,7 @@ import {
   ConnectionConfig,
   InMemoryPoolStateStore,
   PoolDestroyState,
+  PoolDestroyIncompleteException,
   PoolDestroyedException,
   PoolLifecycleState,
   PoolStateStoreUnavailableException,
@@ -228,6 +229,47 @@ test("SandboxPoolManager drains idle sandboxes and fences the namespace", async 
   }));
   await assert.rejects(pool.start(), PoolDestroyedException);
   assert.equal((await pool.snapshot()).lifecycleState, PoolLifecycleState.STOPPED);
+});
+
+test("SandboxPoolManager bounds an in-flight kill and supports destroy retry", async () => {
+  const store = new InMemoryPoolStateStore();
+  await store.setIdleEntryTtl("timed-destroy", 60);
+  await store.putIdle("timed-destroy", "slow");
+  let killSignal;
+  const adapterFactory = {
+    createLifecycleStack() {
+      return {
+        sandboxes: {
+          deleteSandbox(_id, signal) {
+            killSignal = signal;
+            // A custom adapter may ignore AbortSignal. destroy() must still
+            // return at its own deadline rather than await this forever.
+            return new Promise(() => {});
+          },
+        },
+      };
+    },
+  };
+  const manager = new SandboxPoolManager({
+    stateStore: store,
+    connectionConfig: new ConnectionConfig({ domain: "localhost:8080" }),
+    adapterFactory,
+  });
+
+  const started = Date.now();
+  await assert.rejects(
+    manager.destroy("timed-destroy", { drainTimeoutSeconds: 0.02 }),
+    PoolDestroyIncompleteException,
+  );
+  assert.ok(Date.now() - started < 500);
+  assert.equal(killSignal?.aborted, true);
+  assert.equal(
+    await store.getDestroyState("timed-destroy"),
+    PoolDestroyState.DESTROYING,
+  );
+
+  const retried = await manager.destroy("timed-destroy");
+  assert.equal(retried.state, PoolDestroyState.DESTROYED);
 });
 
 test("in-memory maxIdle remains local to each pool instance", async () => {

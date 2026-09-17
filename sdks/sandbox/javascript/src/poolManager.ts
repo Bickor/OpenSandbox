@@ -121,23 +121,30 @@ export class SandboxPoolManager {
         if (error instanceof PoolDestroyedException) return this.destroyedResult(poolName);
         throw error;
       }
-      const deadline = Date.now() + drainTimeoutSeconds * 1000;
+      const deadline =
+        drainTimeoutSeconds > 0
+          ? Date.now() + drainTimeoutSeconds * 1000
+          : undefined;
       while (true) {
+        this.throwIfDrainDeadlineReached(poolName, deadline);
         const sandboxId = await this.stateStore.tryTakeIdle(poolName);
         if (!sandboxId) break;
         drainedIdleCount += 1;
         try {
-          await manager.killSandbox(sandboxId);
+          await this.killSandboxWithinDeadline(
+            manager,
+            sandboxId,
+            poolName,
+            deadline,
+          );
           killedIdleCount += 1;
         } catch (error) {
+          if (error instanceof PoolDestroyIncompleteException) throw error;
           this.logger?.warn?.("pool destroy failed to kill idle sandbox", {
             poolName,
             sandboxId,
             error,
           });
-        }
-        if (drainTimeoutSeconds > 0 && Date.now() > deadline) {
-          throw new PoolDestroyIncompleteException(poolName);
         }
       }
       try {
@@ -155,6 +162,48 @@ export class SandboxPoolManager {
       };
     } finally {
       await manager.close().catch(() => undefined);
+    }
+  }
+
+  private throwIfDrainDeadlineReached(
+    poolName: string,
+    deadline: number | undefined,
+  ): void {
+    if (deadline !== undefined && Date.now() >= deadline) {
+      throw new PoolDestroyIncompleteException(poolName);
+    }
+  }
+
+  private async killSandboxWithinDeadline(
+    manager: SandboxManager,
+    sandboxId: string,
+    poolName: string,
+    deadline: number | undefined,
+  ): Promise<void> {
+    if (deadline === undefined) {
+      await manager.killSandbox(sandboxId);
+      return;
+    }
+
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) throw new PoolDestroyIncompleteException(poolName);
+
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        const error = new PoolDestroyIncompleteException(poolName);
+        controller.abort(error);
+        reject(error);
+      }, remainingMs);
+    });
+    try {
+      await Promise.race([
+        manager.killSandbox(sandboxId, controller.signal),
+        timeout,
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
     }
   }
 

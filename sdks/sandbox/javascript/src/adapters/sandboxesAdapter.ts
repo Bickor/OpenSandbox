@@ -231,9 +231,10 @@ export class SandboxesAdapter implements Sandboxes {
     return this.mapSandboxInfo(ok);
   }
 
-  async deleteSandbox(sandboxId: SandboxId): Promise<void> {
+  async deleteSandbox(sandboxId: SandboxId, signal?: AbortSignal): Promise<void> {
     const { error, response } = await this.client.DELETE("/sandboxes/{sandboxId}", {
       params: { path: { sandboxId } },
+      signal,
     });
     throwOnOpenApiFetchError({ error, response }, "Delete sandbox failed");
   }

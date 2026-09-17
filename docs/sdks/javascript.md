@@ -143,6 +143,15 @@ without `waitUntilReady()`, may continue running after timeout or cancellation,
 but their late results are ignored. The pool attempts to kill a sandbox that
 fails readiness and does not hand it to a caller or add it to the idle buffer.
 
+`SandboxPoolManager.destroy(poolName)` first writes a shared `DESTROYING` fence,
+then drains and best-effort kills visible idle sandboxes before clearing pool
+state and writing a `DESTROYED` tombstone. `drainTimeoutSeconds` is checked
+before each drain attempt and bounds in-flight sandbox deletion; `0` disables
+that bound. State-store calls remain subject to the store client's own request
+timeout. If drain or persistent-state cleanup fails, the namespace remains
+fenced as `DESTROYING`. Retry `destroy()` with the same pool name to complete
+cleanup.
+
 ## Usage Examples
 
 ### 1. Lifecycle Management

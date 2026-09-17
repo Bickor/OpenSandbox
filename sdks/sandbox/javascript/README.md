@@ -130,6 +130,15 @@ preparation, renewal, and commit stages. Use `warmupSandboxPreparer`,
 for staged warmup. Set `connectionConfig.enableTracing` to emit OpenTelemetry
 `pool.warmup` traces with one child span per stage.
 
+`SandboxPoolManager.destroy(poolName)` writes a shared `DESTROYING` fence,
+drains and best-effort kills visible idle sandboxes, clears persistent pool
+state, and writes a `DESTROYED` tombstone. `drainTimeoutSeconds` is checked
+before each drain attempt and bounds in-flight sandbox deletion; set it to `0`
+to disable that bound. State-store calls remain subject to the store client's
+own request timeout. If drain or persistent-state cleanup cannot finish, the
+namespace remains fenced as `DESTROYING`. Retry `destroy()` with the same pool
+name to finish cleanup.
+
 ## Usage Examples
 
 ### 1. Lifecycle Management

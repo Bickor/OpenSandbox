@@ -112,8 +112,8 @@ export class SandboxManager {
     return this.sandboxes.patchSandboxMetadata(sandboxId, patch);
   }
 
-  killSandbox(sandboxId: SandboxId): Promise<void> {
-    return this.sandboxes.deleteSandbox(sandboxId);
+  killSandbox(sandboxId: SandboxId, signal?: AbortSignal): Promise<void> {
+    return this.sandboxes.deleteSandbox(sandboxId, signal);
   }
 
   pauseSandbox(sandboxId: SandboxId): Promise<void> {

@@ -40,7 +40,7 @@ export interface Sandboxes {
     sandboxId: SandboxId,
     patch: SandboxMetadataPatch,
   ): Promise<SandboxInfo>;
-  deleteSandbox(sandboxId: SandboxId): Promise<void>;
+  deleteSandbox(sandboxId: SandboxId, signal?: AbortSignal): Promise<void>;
 
   pauseSandbox(sandboxId: SandboxId): Promise<void>;
   resumeSandbox(sandboxId: SandboxId): Promise<void>;
