@@ -16,8 +16,8 @@ import { expect, test } from "vitest";
 
 import {
   AcquirePolicy,
+  PoolAcquireFailedException,
   PoolNotRunningException,
-  SandboxReadyTimeoutException,
   type Sandbox,
 } from "@alibaba-group/opensandbox";
 
@@ -124,7 +124,7 @@ test("acquire health-check failure deletes the popped idle and releases counters
     await eventually("idle before health error", async () => (await pool.snapshot()).idleCount === 1);
     await pool.resize(0);
     await expect(pool.acquire({ policy: AcquirePolicy.FAIL_FAST }))
-      .rejects.toBeInstanceOf(SandboxReadyTimeoutException);
+      .rejects.toBeInstanceOf(PoolAcquireFailedException);
     await eventually("failed candidate deletion", async () => (await taggedSandboxIds(poolName)).length === 0);
     const snapshot = await pool.snapshot();
     expect(snapshot.idleCount).toBe(0);

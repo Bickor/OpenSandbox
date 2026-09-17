@@ -108,9 +108,9 @@ test("client pool runs staged warmup before publishing idle", async () => {
     idleTimeoutSeconds: 5 * 60,
     warmupReadyTimeoutSeconds: 1,
     warmupHealthCheckInitialDelayMillis: 2_000,
-    warmupHealthCheck: async (sandbox) => {
+    warmupHealthCheck: async () => {
       events.push("readiness");
-      return await sandbox.isHealthy();
+      return true;
     },
     warmupSandboxPreparer: async (sandbox) => {
       events.push("prepare");

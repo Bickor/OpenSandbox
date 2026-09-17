@@ -116,10 +116,12 @@ test("forced shutdown deletes a sandbox waiting in the warmup delay", async () =
     const snapshot = await pool.snapshot();
     expect(snapshot.lifecycleState).toBe(PoolLifecycleState.STOPPED);
     expect(snapshot.idleCount).toBe(0);
-    expect(snapshot.inFlightOperations).toBe(0);
     expect(healthCheckCalls).toBe(0);
     expect(preparerCalls).toBe(0);
-    await eventually("delayed sandbox deletion", async () => (await taggedSandboxIds(poolName)).length === 0);
+    await eventually("delayed warmup cleanup", async () =>
+      (await pool.snapshot()).inFlightOperations === 0 &&
+      (await taggedSandboxIds(poolName)).length === 0,
+    );
   } finally {
     await cleanupPool(poolName, [pool]);
   }
