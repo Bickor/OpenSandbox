@@ -54,11 +54,15 @@ class ConnectionConfigSync(BaseModel):
         default=timedelta(seconds=30),
         description="Timeout for HTTP requests to the management API",
     )
-    debug: bool = Field(default=False, description="Enable debug logging for HTTP requests")
+    debug: bool = Field(
+        default=False, description="Enable debug logging for HTTP requests"
+    )
     user_agent: str = Field(
         default="OpenSandbox-Python-SDK/0.1.17.dev0", description="User agent string"
     )
-    headers: dict[str, str] = Field(default_factory=dict, description="User defined headers")
+    headers: dict[str, str] = Field(
+        default_factory=dict, description="User defined headers"
+    )
 
     transport: httpx.BaseTransport | None = Field(
         default=None,
@@ -102,6 +106,10 @@ class ConnectionConfigSync(BaseModel):
             "Also honored via OPENSANDBOX_DISABLE_METRICS=1."
         ),
     )
+    enable_tracing: bool = Field(
+        default=False,
+        description="Enable OpenTelemetry tracing for SDK operations.",
+    )
 
     _ENV_API_KEY = "OPEN_SANDBOX_API_KEY"
     _ENV_DOMAIN = "OPEN_SANDBOX_DOMAIN"
@@ -115,24 +123,28 @@ class ConnectionConfigSync(BaseModel):
 
         client_ip.apply_client_ip(self.headers)
 
-    def with_transport_if_missing(self) -> "ConnectionConfigSync":
+    def with_transport_if_missing(
+        self,
+        *,
+        max_connections: int = 100,
+        max_keepalive_connections: int = 20,
+        keepalive_expiry: float = 30.0,
+    ) -> "ConnectionConfigSync":
         if self.transport is not None:
             return self
         ssl_context = httpx.create_ssl_context()
         inner = httpx.HTTPTransport(
             verify=ssl_context,
             limits=httpx.Limits(
-                max_connections=100,
-                max_keepalive_connections=20,
-                keepalive_expiry=30.0,
+                max_connections=max_connections,
+                max_keepalive_connections=max_keepalive_connections,
+                keepalive_expiry=keepalive_expiry,
             ),
         )
         bounded = DeadlineSyncTransport(inner, ssl_context)
         wrapped: httpx.BaseTransport
         if self.retry_policy.wraps_transport():
-            wrapped = RetrySyncTransport(
-                bounded, self.retry_policy, owns_inner=True
-            )
+            wrapped = RetrySyncTransport(bounded, self.retry_policy, owns_inner=True)
         else:
             wrapped = bounded
         config = self.model_copy(update={"transport": wrapped})

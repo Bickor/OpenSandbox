@@ -125,7 +125,8 @@ pool = SandboxPoolSync(
     state_store=InMemoryPoolStateStore(),  # single-process only
     connection_config=ConnectionConfigSync(domain="api.opensandbox.io"),
     creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
-    reconcile_interval=timedelta(seconds=5),
+    warmup_create_qps=10,
+    warmup_concurrency=128,
 )
 
 pool.start()
@@ -474,6 +475,7 @@ The `ConnectionConfig` class manages API server connection settings.
 | `retry_policy`    | Automatic retry policy for non-streaming requests (see [Automatic retries](#_2-automatic-retries)) | Enabled (`RetryPolicy()`) | -                 |
 | `use_server_proxy` | Use sandbox server as proxy for execd/endpoint requests (e.g. when client cannot reach the sandbox directly) | `False` | -                      |
 | `disable_metrics` | Disable SDK create-latency telemetry (see [SDK Telemetry](/guides/sdk-telemetry)) | `False` | `OPENSANDBOX_DISABLE_METRICS` |
+| `enable_tracing` | Enable OpenTelemetry tracing for pool warmup (see [SDK Tracing](/guides/sdk-tracing)) | `False` | - |
 
 ```python
 from datetime import timedelta

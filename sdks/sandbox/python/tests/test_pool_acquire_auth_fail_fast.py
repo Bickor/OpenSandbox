@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import timedelta
 from typing import Any
 
 import pytest
@@ -122,7 +121,6 @@ async def test_async_acquire_401_surfaces_auth_error_and_keeps_idles() -> None:
         state_store=store,
         connection_config=ConnectionConfig(),
         creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
-        reconcile_interval=timedelta(milliseconds=20),
         sandbox_manager_factory=_manager_factory,
         sandbox_factory=_AuthFailingSandbox,  # type: ignore[arg-type]
     )
@@ -167,7 +165,6 @@ def test_sync_acquire_401_surfaces_auth_error_and_keeps_idles() -> None:
         state_store=store,
         connection_config=ConnectionConfigSync(),
         creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
-        reconcile_interval=timedelta(milliseconds=20),
         sandbox_manager_factory=lambda config: manager,  # type: ignore[arg-type,return-value]
         sandbox_factory=_AuthFailingSandbox,  # type: ignore[arg-type]
     )
