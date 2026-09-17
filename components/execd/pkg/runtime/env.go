@@ -25,8 +25,8 @@ import (
 	"github.com/alibaba/opensandbox/execd/pkg/util/pathutil"
 )
 
-// loadExtraEnvFromFile reads key=value lines from EXECD_ENVS (if set).
-// Empty lines and lines starting with '#' are ignored.
+// loadExtraEnvFromFile reads key=value entries from the file named by the
+// EXECD_ENVS variable (if set). See parseEnvFile for the entry syntax.
 func loadExtraEnvFromFile() map[string]string {
 	path := os.Getenv("EXECD_ENVS")
 	if path == "" {
@@ -44,22 +44,215 @@ func loadExtraEnvFromFile() map[string]string {
 		return nil
 	}
 
+	return parseEnvFile(string(data))
+}
+
+// envExpandDollar marks a dollar sign escaped as "\$" inside double-quoted
+// values so os.ExpandEnv leaves it alone. Environment values cannot contain
+// NUL bytes, so a NUL placeholder survives expansion untouched and is
+// restored to '$' afterwards.
+const envExpandDollar = "\x00"
+
+// parseEnvFile parses KEY=VALUE entries from an EXECD_ENVS file body.
+//
+// Blank lines and lines whose first non-whitespace character is '#' are
+// ignored. Values may be unquoted, double-quoted, or single-quoted:
+//
+//	KEY=value     legacy form: leading/trailing whitespace trimmed, then
+//	              $NAME / ${NAME} expanded from the daemon environment
+//	KEY="v a l"   whitespace kept; \n \r \t \\ \" \$ escapes honored;
+//	              $NAME / ${NAME} still expand; may span lines
+//	KEY='v a l'   fully literal: no expansion, no escapes; whitespace and
+//	              newlines kept verbatim; may span lines
+//
+// Single quotes are the lossless form: KEY='<value>' parses back to
+// <value> verbatim. Writers whose value contains a single quote can
+// double-quote and escape instead. Text after a closing quote must be
+// blank; malformed and unterminated entries are skipped with a warning.
+func parseEnvFile(data string) map[string]string {
+	p := &envFileParser{data: data, lineNo: 1}
 	envs := make(map[string]string)
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
+	for p.pos < len(p.data) {
+		if key, value, ok := p.parseEntry(); ok {
+			envs[pathutil.EnvKey(key)] = value
 		}
-		kv := strings.SplitN(line, "=", 2)
-		if len(kv) != 2 {
-			log.Warn("EXECD_ENVS: skip malformed line: %s", line)
-			continue
-		}
-		envs[pathutil.EnvKey(kv[0])] = os.ExpandEnv(kv[1])
+	}
+	return envs
+}
+
+// envFileParser walks an EXECD_ENVS file body tracking line numbers for
+// diagnostics.
+type envFileParser struct {
+	data   string
+	pos    int
+	lineNo int
+}
+
+// parseEntry parses one logical entry. On success it advances past the
+// entry and returns its key and value. On failure (blank line, comment, or
+// malformed entry) it advances past the current physical line and returns
+// ok=false; blank lines and comments fail silently.
+func (p *envFileParser) parseEntry() (key, value string, ok bool) {
+	lineStart := p.pos
+	eol := strings.IndexByte(p.data[lineStart:], '\n')
+	lineEnd := len(p.data)
+	if eol >= 0 {
+		lineEnd = lineStart + eol
+	}
+	line := p.data[lineStart:lineEnd]
+
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+		p.skipLine()
+		return "", "", false
 	}
 
-	return envs
+	eq := strings.IndexByte(line, '=')
+	if eq < 0 || strings.TrimSpace(line[:eq]) == "" {
+		log.Warn("EXECD_ENVS: skip malformed line %d: %s", p.lineNo, trimmed)
+		p.skipLine()
+		return "", "", false
+	}
+	key = strings.TrimSpace(line[:eq])
+
+	valuePart := line[eq+1:]
+	qs := indexNonSpace(valuePart)
+	if qs < len(valuePart) && (valuePart[qs] == '"' || valuePart[qs] == '\'') {
+		return p.parseQuotedEntry(key, valuePart[qs], lineStart+eq+1+qs+1)
+	}
+
+	// Legacy unquoted form: trim, then expand daemon variables.
+	value = os.ExpandEnv(strings.TrimSpace(valuePart))
+	p.skipLine()
+	return key, value, true
+}
+
+// parseQuotedEntry parses a single- or double-quoted value whose content
+// starts at the absolute offset contentStart.
+func (p *envFileParser) parseQuotedEntry(key string, quote byte, contentStart int) (string, string, bool) {
+	var value string
+	var afterQuote int
+	if quote == '\'' {
+		rel := strings.IndexByte(p.data[contentStart:], '\'')
+		if rel < 0 {
+			log.Warn("EXECD_ENVS: skip unterminated single-quoted value for %s at line %d", key, p.lineNo)
+			p.skipLine()
+			return "", "", false
+		}
+		value = p.data[contentStart : contentStart+rel]
+		afterQuote = contentStart + rel + 1
+	} else {
+		i := contentStart
+		closed := false
+		for i < len(p.data) {
+			if p.data[i] == '\\' && i+1 < len(p.data) {
+				i += 2
+				continue
+			}
+			if p.data[i] == '"' {
+				closed = true
+				break
+			}
+			i++
+		}
+		if !closed {
+			log.Warn("EXECD_ENVS: skip unterminated double-quoted value for %s at line %d", key, p.lineNo)
+			p.skipLine()
+			return "", "", false
+		}
+		value = expandDoubleQuoted(decodeDoubleQuoted(p.data[contentStart:i]))
+		afterQuote = i + 1
+	}
+	return p.finishQuotedEntry(key, afterQuote, value)
+}
+
+// finishQuotedEntry verifies nothing but blanks follows the closing quote on
+// its physical line, then advances past that line.
+func (p *envFileParser) finishQuotedEntry(key string, afterQuote int, value string) (string, string, bool) {
+	nlRel := strings.IndexByte(p.data[afterQuote:], '\n')
+	lineEnd := len(p.data)
+	if nlRel >= 0 {
+		lineEnd = afterQuote + nlRel
+	}
+	if tail := strings.TrimSpace(p.data[afterQuote:lineEnd]); tail != "" {
+		log.Warn("EXECD_ENVS: skip entry %s: unexpected text after closing quote at line %d: %s", key, p.lineNo, tail)
+		p.skipLine()
+		return "", "", false
+	}
+	next := lineEnd
+	if nlRel >= 0 {
+		next = lineEnd + 1
+	}
+	p.lineNo += strings.Count(p.data[p.pos:next], "\n")
+	p.pos = next
+	return key, value, true
+}
+
+// skipLine advances past the current physical line.
+func (p *envFileParser) skipLine() {
+	if nl := strings.IndexByte(p.data[p.pos:], '\n'); nl >= 0 {
+		p.pos += nl + 1
+	} else {
+		p.pos = len(p.data)
+	}
+	p.lineNo++
+}
+
+// indexNonSpace returns the index of the first byte in s that is not a
+// space character, or len(s).
+func indexNonSpace(s string) int {
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case ' ', '\t', '\r', '\v', '\f':
+		default:
+			return i
+		}
+	}
+	return len(s)
+}
+
+// decodeDoubleQuoted unescapes the sequences honored inside double-quoted
+// EXECD_ENVS values. Unknown escapes are kept verbatim.
+func decodeDoubleQuoted(s string) string {
+	if !strings.Contains(s, "\\") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			switch s[i+1] {
+			case 'n':
+				b.WriteByte('\n')
+				i++
+				continue
+			case 'r':
+				b.WriteByte('\r')
+				i++
+				continue
+			case 't':
+				b.WriteByte('\t')
+				i++
+				continue
+			case '\\', '"':
+				b.WriteByte(s[i+1])
+				i++
+				continue
+			case '$':
+				b.WriteString(envExpandDollar)
+				i++
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+// expandDoubleQuoted expands $NAME / ${NAME} references from the daemon
+// environment while keeping "\$"-escaped dollars literal.
+func expandDoubleQuoted(s string) string {
+	return strings.ReplaceAll(os.ExpandEnv(s), envExpandDollar, "$")
 }
 
 // mergeEnvs overlays extra into base and returns a merged slice.
