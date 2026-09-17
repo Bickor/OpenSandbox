@@ -40,6 +40,7 @@ from opensandbox.pool import (
     PooledSandboxCreateContext,
     PooledSandboxCreateReason,
 )
+from opensandbox.sync import pool as sync_pool_module
 from opensandbox.sync.pool import SandboxPoolSync
 
 
@@ -529,6 +530,50 @@ def test_graceful_shutdown_waits_for_running_warmup_before_stop() -> None:
         assert pool.snapshot().lifecycle_state.value == "STOPPED"
     finally:
         release_preparer.set()
+        pool.shutdown(False)
+
+
+def test_forced_shutdown_cleans_create_that_finishes_after_warmup_loop_retired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create_started = threading.Event()
+    release_create = threading.Event()
+    manager = FakeManager()
+
+    class SlowSandbox(FakeSandbox):
+        @classmethod
+        def create(cls, *args: Any, **kwargs: Any) -> SlowSandbox:
+            create_started.set()
+            assert release_create.wait(timeout=2)
+            sandbox = cls("late-create")
+            cls.last_created = sandbox
+            return sandbox
+
+    monkeypatch.setattr(
+        sync_pool_module, "_WARMUP_TERMINATION_TIMEOUT_SECONDS", 0.01
+    )
+    pool = SandboxPoolSync(
+        pool_name="late-create-pool",
+        owner_id="owner-1",
+        max_idle=1,
+        warmup_concurrency=1,
+        state_store=InMemoryPoolStateStore(),
+        connection_config=ConnectionConfigSync(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        sandbox_manager_factory=lambda config: manager,  # type: ignore[arg-type,return-value]
+        sandbox_factory=SlowSandbox,  # type: ignore[arg-type]
+    )
+    pool.start()
+    try:
+        assert create_started.wait(timeout=2)
+        pool.shutdown(False)
+        release_create.set()
+
+        _eventually(lambda: manager.killed == ["late-create"])
+        assert SlowSandbox.last_created is not None
+        assert SlowSandbox.last_created.closed
+    finally:
+        release_create.set()
         pool.shutdown(False)
 
 

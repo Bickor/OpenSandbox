@@ -716,9 +716,21 @@ class SandboxPoolSync:
         try:
             loop = asyncio.get_running_loop()
             with warmup_trace.phase(WARMUP_CREATE_SPAN):
-                sandbox = await self._run_stage(
-                    self._build_warmup_sandbox, create_executor
-                )
+                # Keep the underlying create future independently observable. A
+                # forced shutdown can retire the warmup loop before a slow control-
+                # plane create returns; in that case the late sandbox still needs
+                # to be terminated after this coroutine is gone.
+                create_future = create_executor.submit(self._build_warmup_sandbox)
+                try:
+                    created_sandbox = await asyncio.shield(
+                        asyncio.wrap_future(create_future, loop=loop)
+                    )
+                except asyncio.CancelledError:
+                    create_future.add_done_callback(
+                        self._cleanup_cancelled_warmup_create
+                    )
+                    raise
+                sandbox = created_sandbox
             warmup_trace.set_sandbox_id(sandbox.id)
             await self._run_stage(self._ensure_pool_namespace_active)
             readiness_deadline = (
@@ -997,6 +1009,49 @@ class SandboxPoolSync:
         except Exception:
             pass
         finally:
+            try:
+                sandbox.close()
+            except Exception:
+                pass
+
+    def _cleanup_cancelled_warmup_create(
+        self, future: Future[SandboxSync]
+    ) -> None:
+        """Terminate a sandbox whose create completed after forced shutdown.
+
+        This callback runs on the create worker, independently of the retired
+        warmup event loop. It intentionally uses a fresh manager/transport because
+        the pool-owned transport may already be closed by shutdown.
+        """
+        try:
+            sandbox = future.result()
+        except BaseException:
+            return
+
+        manager: SandboxManagerSync | None = None
+        try:
+            base = self._connection_config.model_copy(
+                update={
+                    "transport": None,
+                    "retry_policy": RetryPolicy.disabled(),
+                }
+            )
+            cleanup_config = base.with_transport_if_missing(
+                max_connections=1,
+                max_keepalive_connections=1,
+            )
+            manager = self._sandbox_manager_factory(cleanup_config)
+            manager.kill_sandbox(sandbox.id)
+        except Exception as exc:
+            logger.warning(
+                f"Pool late warmup cleanup failed: pool_name={self._config.pool_name} sandbox_id={sandbox.id} error={exc}"
+            )
+        finally:
+            if manager is not None:
+                try:
+                    manager.close()
+                except Exception:
+                    pass
             try:
                 sandbox.close()
             except Exception:
