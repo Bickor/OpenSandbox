@@ -457,7 +457,16 @@ class SandboxPoolSync:
                     f"Cannot acquire: {reason}; policy is {policy.value}"
                 )
             self._ensure_acquire_run_active(operation_generation)
-            sandbox = self._direct_create(sandbox_timeout, policy=policy)
+            try:
+                sandbox = self._direct_create(sandbox_timeout, policy=policy)
+            except (AssertionError, PoolDestroyedException):
+                raise
+            except Exception as exc:
+                try:
+                    self._ensure_acquire_run_active(operation_generation)
+                except PoolNotRunningException as retired:
+                    raise retired from exc
+                raise
             try:
                 self._ensure_acquire_run_active(operation_generation)
             except PoolNotRunningException:
@@ -1337,7 +1346,19 @@ class SandboxPoolSync:
         return config
 
     def _connection_for_warmup_create(self) -> ConnectionConfigSync:
-        return self._pool_connection_config or self._connection_config
+        if self._pool_transport_owner is None:
+            return self._pool_connection_config or self._connection_config
+        # Staged-warmup sandboxes own short-lived transports. Keeping their
+        # mutually incompatible endpoint origins out of the pool-wide shared
+        # transport prevents lifecycle starvation and connection churn.
+        config = self._connection_config.model_copy(
+            update={
+                "transport": None,
+                "retry_policy": RetryPolicy.disabled(),
+            }
+        )
+        config._owns_transport = True
+        return config
 
     def _open_pool_transport(self) -> None:
         if self._connection_config.transport is not None:
@@ -1349,7 +1370,9 @@ class SandboxPoolSync:
             update={"retry_policy": RetryPolicy.disabled()}
         )
         owner = base.with_transport_if_missing(
-            max_connections=size,
+            # warmup_concurrency maps to retained idle capacity, matching
+            # Kotlin's ConnectionPool; it must not cap active acquire calls.
+            max_connections=None,
             max_keepalive_connections=size,
             keepalive_expiry=300.0,
         )

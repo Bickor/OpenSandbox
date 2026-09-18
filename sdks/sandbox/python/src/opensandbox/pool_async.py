@@ -427,7 +427,20 @@ class SandboxPoolAsync:
                     f"Cannot acquire: {reason}; policy is {policy.value}"
                 )
             await self._ensure_acquire_run_active(operation_generation)
-            sandbox = await self._direct_create(sandbox_timeout, policy=policy)
+            try:
+                sandbox = await self._direct_create(sandbox_timeout, policy=policy)
+            except (AssertionError, PoolDestroyedException):
+                raise
+            except Exception as exc:
+                # shutdown() may close the pool-owned transport after its
+                # graceful drain timeout while a direct create is still in
+                # flight. Do not leak that transport-close error as if it were
+                # an independent service failure once this run is retired.
+                try:
+                    await self._ensure_acquire_run_active(operation_generation)
+                except PoolNotRunningException as retired:
+                    raise retired from exc
+                raise
             try:
                 await self._ensure_acquire_run_active(operation_generation)
             except PoolNotRunningException:
@@ -1214,7 +1227,20 @@ class SandboxPoolAsync:
         return config
 
     def _connection_for_warmup_create(self) -> ConnectionConfig:
-        return self._pool_connection_config or self._connection_config
+        if self._pool_transport_owner is None:
+            return self._pool_connection_config or self._connection_config
+        # Match the Kotlin staged-warmup ownership model: temporary warmup
+        # sandboxes get their own transports, while manager/acquire resources
+        # use the pool-wide shared transport. Thousands of unique endpoint
+        # origins must not compete with lifecycle calls in one global pool.
+        config = self._connection_config.model_copy(
+            update={
+                "transport": None,
+                "retry_policy": RetryPolicy.disabled(),
+            }
+        )
+        config._owns_transport = True
+        return config
 
     def _open_pool_transport(self) -> None:
         if self._connection_config.transport is not None:
@@ -1226,7 +1252,11 @@ class SandboxPoolAsync:
             update={"retry_policy": RetryPolicy.disabled()}
         )
         owner = base.with_transport_if_missing(
-            max_connections=size,
+            # Kotlin's ConnectionPool size limits retained idle connections,
+            # not active request concurrency. Keep active connections
+            # unbounded so foreground acquire is not accidentally serialized
+            # when a consumer pool uses warmup_concurrency=1.
+            max_connections=None,
             max_keepalive_connections=size,
             keepalive_expiry=300.0,
         )

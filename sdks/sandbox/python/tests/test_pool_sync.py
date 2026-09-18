@@ -40,6 +40,7 @@ from opensandbox.pool import (
     PooledSandboxCreateContext,
     PooledSandboxCreateReason,
 )
+from opensandbox.pool_types import PoolLifecycleState
 from opensandbox.sync import pool as sync_pool_module
 from opensandbox.sync.pool import SandboxPoolSync
 
@@ -378,6 +379,23 @@ def test_acquire_direct_create_kills_and_closes_when_renew_fails() -> None:
         pool.shutdown(False)
 
 
+def test_direct_create_failure_after_run_retired_is_pool_not_running() -> None:
+    pool = _create_pool(max_idle=0)
+    pool.start()
+
+    def fail_after_retire(*args: Any, **kwargs: Any) -> FakeSandbox:
+        pool._lifecycle_state = PoolLifecycleState.STOPPED
+        raise RuntimeError("transport closed during shutdown")
+
+    pool._direct_create = fail_after_retire  # type: ignore[method-assign]
+    try:
+        with pytest.raises(PoolNotRunningException) as raised:
+            pool.acquire()
+        assert isinstance(raised.value.__cause__, RuntimeError)
+    finally:
+        pool.shutdown(False)
+
+
 def test_acquire_direct_create_uses_sandbox_creator() -> None:
     contexts: list[PooledSandboxCreateContext] = []
 
@@ -632,9 +650,23 @@ def test_user_managed_transport_is_preserved_for_pool_resources() -> None:
         pool.shutdown(False)
 
 
-def test_pool_owned_transport_is_shared_by_all_pool_resources() -> None:
+def test_default_warmup_owns_transport_while_manager_uses_shared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manager_configs: list[ConnectionConfigSync] = []
     sandbox_configs: list[ConnectionConfigSync] = []
+    transport_limits: dict[str, object] = {}
+    original_with_transport = ConnectionConfigSync.with_transport_if_missing
+
+    def capture_transport_limits(
+        config: ConnectionConfigSync, **kwargs: object
+    ) -> ConnectionConfigSync:
+        transport_limits.update(kwargs)
+        return original_with_transport(config, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        ConnectionConfigSync, "with_transport_if_missing", capture_transport_limits
+    )
 
     class CapturingSandbox(FakeSandbox):
         @classmethod
@@ -660,13 +692,16 @@ def test_pool_owned_transport_is_shared_by_all_pool_resources() -> None:
     try:
         _eventually(lambda: pool.snapshot().idle_count == 1)
         assert manager_configs[0].transport is not None
-        assert (
-            getattr(manager_configs[0].transport, "inner", manager_configs[0].transport)
-            is sandbox_configs[0].transport
-        )
+        assert transport_limits["max_connections"] is None
+        assert transport_limits["max_keepalive_connections"] == 128
+        assert sandbox_configs[0].transport is None
         assert manager_configs[0]._owns_transport
-        assert not sandbox_configs[0]._owns_transport
+        assert sandbox_configs[0]._owns_transport
         assert sandbox_configs[0].retry_policy.max_retries == 0
+        another_warmup_config = pool._connection_for_warmup_create()
+        assert another_warmup_config is not sandbox_configs[0]
+        assert another_warmup_config.transport is None
+        assert another_warmup_config._owns_transport
     finally:
         pool.shutdown(False)
 

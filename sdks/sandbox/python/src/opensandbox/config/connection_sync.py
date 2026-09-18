@@ -126,7 +126,7 @@ class ConnectionConfigSync(BaseModel):
     def with_transport_if_missing(
         self,
         *,
-        max_connections: int = 100,
+        max_connections: int | None = 100,
         max_keepalive_connections: int = 20,
         keepalive_expiry: float = 30.0,
     ) -> "ConnectionConfigSync":
