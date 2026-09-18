@@ -17,43 +17,7 @@ import {
   SandboxApiException,
   SandboxReadyTimeoutException,
 } from "../core/exceptions.js";
-
-interface AbortSubscriptionGroup {
-  readonly listeners: Set<() => void>;
-  readonly dispatch: () => void;
-}
-
-const abortSubscriptionGroups = new WeakMap<AbortSignal, AbortSubscriptionGroup>();
-
-export function subscribeAbort(signal: AbortSignal | undefined, listener: () => void): () => void {
-  if (!signal) return () => undefined;
-  if (signal.aborted) {
-    listener();
-    return () => undefined;
-  }
-  let group = abortSubscriptionGroups.get(signal);
-  if (!group) {
-    const listeners = new Set<() => void>();
-    const dispatch = () => {
-      abortSubscriptionGroups.delete(signal);
-      for (const current of [...listeners]) current();
-      listeners.clear();
-    };
-    group = { listeners, dispatch };
-    abortSubscriptionGroups.set(signal, group);
-    signal.addEventListener("abort", dispatch, { once: true });
-  }
-  group.listeners.add(listener);
-  return () => {
-    const current = abortSubscriptionGroups.get(signal);
-    if (!current) return;
-    current.listeners.delete(listener);
-    if (current.listeners.size === 0) {
-      signal.removeEventListener("abort", current.dispatch);
-      abortSubscriptionGroups.delete(signal);
-    }
-  };
-}
+import { subscribeAbort, type AbortSubscription } from "./abort.js";
 
 export function validatePollingInterval(interval: number): void {
   // setTimeout() runs a negative delay immediately, which would hammer the
@@ -131,7 +95,7 @@ export class ReadinessBudget {
   async pause(interval: number): Promise<void> {
     const duration = Math.min(interval, this.remaining());
     await new Promise<void>((resolve, reject) => {
-      let unsubscribeCaller = () => undefined;
+      let unsubscribeCaller: AbortSubscription = () => undefined;
       const timer = setTimeout(() => { unsubscribeCaller(); resolve(); }, duration);
       const abort = () => { clearTimeout(timer); reject(this.caller?.reason); };
       unsubscribeCaller = subscribeAbort(this.caller, abort);
