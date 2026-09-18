@@ -11,6 +11,10 @@ name: Umbrella Packages
 #             publish of the held bytes (PyPI → npm → NuGet → Maven
 #             Central last, which is irreversible once released).
 #
+# Publish legs are idempotent: a package version already visible on the
+# target registry is skipped with a ::warning:: annotation, so re-runs
+# never collide with registry immutability.
+#
 # Versions come from the release-branch prep commit (--bump-only):
 # package.json / gradle.properties / Directory.Build.props already carry
 # the umbrella version. Python packages derive their version from git
@@ -277,10 +281,15 @@ jobs:
       - name: Publish PyPI packages
         env:
           UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+          VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           publish_one() {
             local name="$1" dir="$2"
+            if pip index versions "$name" 2>/dev/null | grep -qE "(^|[ ,])${VERSION}([ ,]|\$)"; then
+              echo "::warning::${name} ${VERSION} is already on PyPI — skipping publish"
+              return 0
+            fi
             echo "::group::uv publish ${name}"
             uv publish "$dir"/*
             for i in 1 2 3 4 5; do
@@ -302,12 +311,17 @@ jobs:
       - name: Publish npm packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           DIST_TAG="latest"
           [ "${{ inputs.channel }}" = "rc" ] && DIST_TAG="rc"
           publish_one() {
             local tarball="$1" package="$2"
+            if npm view "${package}@${VERSION}" version >/dev/null 2>&1; then
+              echo "::warning::${package} ${VERSION} is already on npm — skipping publish"
+              return 0
+            fi
             echo "::group::npm publish ${package} (dist-tag: ${DIST_TAG})"
             pnpm publish "$tarball" --access public --no-git-checks --tag "$DIST_TAG"
             for i in 1 2 3 4 5; do
@@ -328,10 +342,15 @@ jobs:
       - name: Publish NuGet packages
         env:
           NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+          VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           publish_one() {
             local dir="$1" package="$2"
+            if dotnet package search "$package" --exact-match 2>/dev/null | grep -qE "(^|[ ,])${VERSION}([ ,]|\$)"; then
+              echo "::warning::${package} ${VERSION} is already on NuGet — skipping publish"
+              return 0
+            fi
             echo "::group::nuget push ${package}"
             dotnet nuget push "${dir}/*.nupkg" \
               --api-key "$NUGET_API_KEY" \
@@ -353,11 +372,20 @@ jobs:
       - name: Publish Kotlin/JVM to Maven Central
         working-directory: sdks/sandbox/kotlin
         env:
+          VERSION: ${{ inputs.version }}
           ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.ORG_GRADLE_PROJECT_MAVENCENTRALUSERNAME }}
           ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.ORG_GRADLE_PROJECT_MAVENCENTRALPASSWORD }}
           ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.ORG_GRADLE_PROJECT_SIGNINGINMEMORYKEY }}
           ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.ORG_GRADLE_PROJECT_SIGNINGINMEMORYKEYPASSWORD }}
         run: |
+          set -euo pipefail
+          # idempotent re-runs: the BOM POM is the release marker; Central
+          # releases are irreversible, so never publish over an existing one
+          if curl -fsSI -o /dev/null \
+            "https://repo1.maven.org/maven2/com/alibaba/opensandbox/sandbox-bom/${VERSION}/sandbox-bom-${VERSION}.pom"; then
+            echo "::warning::com.alibaba.opensandbox:sandbox-bom:${VERSION} is already on Maven Central — skipping publish"
+            exit 0
+          fi
           ./gradlew publishAndReleaseToMavenCentral
 
       # ---- rollback ledger summary (best-effort remediation guide) ----
