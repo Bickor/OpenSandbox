@@ -16,6 +16,8 @@ package credentialvault
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +30,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
 	"github.com/alibaba/opensandbox/egress/pkg/log"
@@ -64,6 +68,8 @@ var (
 	}
 )
 
+var activeSnapshotTagFallback atomic.Uint64
+
 type Store struct {
 	mu           sync.RWMutex
 	exists       bool
@@ -71,9 +77,11 @@ type Store struct {
 	generation   uint64 // monotonic internal identity; unlike revision, never resets on delete/create
 	credentials  map[string]record
 	bindings     map[string]Binding
+	activeTag    string
 	mitmGate     *mitmproxy.HealthGate
 	requireToken func() bool
 	sources      *SourceRegistry
+	strictMatch  bool
 }
 
 type record struct {
@@ -220,6 +228,7 @@ func NewStoreWithRegistry(mitmGate *mitmproxy.HealthGate, requireToken func() bo
 		mitmGate:     mitmGate,
 		requireToken: requireToken,
 		sources:      registry,
+		strictMatch:  constants.IsTruthy(os.Getenv(constants.EnvCredentialVaultRequireScopedMatch)),
 	}
 }
 
@@ -243,7 +252,7 @@ func (v *Store) Create(req CreateRequest, pol *policy.NetworkPolicy) (State, err
 		credentials[rec.Name] = rec
 	}
 	for _, b := range req.Bindings {
-		nb, err := normalizeBinding(b)
+		nb, err := v.normalizeBinding(b)
 		if err != nil {
 			return State{}, err
 		}
@@ -261,6 +270,7 @@ func (v *Store) Create(req CreateRequest, pol *policy.NetworkPolicy) (State, err
 	v.generation++
 	v.credentials = credentials
 	v.bindings = bindings
+	v.activeTag = newActiveSnapshotTag()
 	return v.sanitizedLocked(), nil
 }
 
@@ -281,7 +291,7 @@ func (v *Store) Patch(req MutationRequest, pol *policy.NetworkPolicy) (State, er
 	if err := v.applyCredentialMutations(credentials, req.Credentials, nextRevision); err != nil {
 		return State{}, err
 	}
-	if err := applyBindingMutations(bindings, req.Bindings); err != nil {
+	if err := v.applyBindingMutations(bindings, req.Bindings); err != nil {
 		return State{}, err
 	}
 	if err := v.validateCandidate(credentials, bindings, pol); err != nil {
@@ -292,6 +302,7 @@ func (v *Store) Patch(req MutationRequest, pol *policy.NetworkPolicy) (State, er
 	v.generation++
 	v.credentials = credentials
 	v.bindings = bindings
+	v.activeTag = newActiveSnapshotTag()
 	return v.sanitizedLocked(), nil
 }
 
@@ -306,6 +317,7 @@ func (v *Store) Delete() error {
 	v.generation++
 	v.credentials = make(map[string]record)
 	v.bindings = make(map[string]Binding)
+	v.activeTag = ""
 	return nil
 }
 
@@ -349,17 +361,44 @@ func (v *Store) ActiveSnapshot() (ActiveSnapshot, error) {
 }
 
 func (v *Store) ActiveSnapshotWithContext(ctx context.Context) (ActiveSnapshot, error) {
+	snapshot, _, _, err := v.ActiveSnapshotIfChanged(ctx, "")
+	return snapshot, err
+}
+
+// ActiveSnapshotIfChanged atomically compares the caller's opaque snapshot tag
+// with the active vault and renders credentials only when the tag differs.
+// The comparison and rendering share one read lock so a mutation cannot make
+// the returned revision and snapshot disagree.
+func (v *Store) ActiveSnapshotIfChanged(
+	ctx context.Context,
+	knownTag string,
+) (ActiveSnapshot, string, bool, error) {
 	v.mu.RLock()
 	if !v.exists {
 		v.mu.RUnlock()
-		return ActiveSnapshot{}, ErrNotFound
+		return ActiveSnapshot{}, "", false, ErrNotFound
 	}
-	revision := v.revision
+	if knownTag != "" && knownTag == v.activeTag {
+		revision, tag := v.revision, v.activeTag
+		v.mu.RUnlock()
+		return ActiveSnapshot{Revision: revision}, tag, false, nil
+	}
+	revision, generation, tag := v.revision, v.generation, v.activeTag
 	credentials := cloneCredentialRecords(v.credentials)
 	bindings := cloneCredentialBindings(v.bindings)
 	v.mu.RUnlock()
 
-	return renderActiveSnapshot(ctx, revision, credentials, bindings, true)
+	snapshot, err := renderActiveSnapshot(ctx, revision, credentials, bindings, true)
+	if err != nil {
+		return ActiveSnapshot{}, "", false, err
+	}
+	v.mu.RLock()
+	unchanged := v.exists && v.generation == generation && v.activeTag == tag
+	v.mu.RUnlock()
+	if !unchanged {
+		return ActiveSnapshot{}, "", false, fmt.Errorf("credential vault changed while rendering active snapshot")
+	}
+	return snapshot, tag, true, nil
 }
 
 // ResolveBindingWithContext resolves exactly one binding from an active
@@ -453,6 +492,19 @@ func renderActiveSnapshot(ctx context.Context, revision int64, credentials map[s
 		return snapshot.Redactions[i] < snapshot.Redactions[j]
 	})
 	return snapshot, nil
+}
+
+func newActiveSnapshotTag() string {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err == nil {
+		return hex.EncodeToString(value[:])
+	}
+	return fmt.Sprintf(
+		"fallback-%x-%x-%x",
+		os.Getpid(),
+		time.Now().UnixNano(),
+		activeSnapshotTagFallback.Add(1),
+	)
 }
 
 func bindingUsesDynamicSource(binding Binding, credentials map[string]record) bool {
@@ -549,6 +601,29 @@ func normalizeBinding(b Binding) (Binding, error) {
 		return Binding{}, fmt.Errorf("binding %q: %w", b.Name, err)
 	}
 	return b, nil
+}
+
+func (v *Store) normalizeBinding(b Binding) (Binding, error) {
+	methodsExplicit := len(b.Match.Methods) > 0
+	pathsExplicit := len(b.Match.Paths) > 0
+	normalized, err := normalizeBinding(b)
+	if err != nil {
+		return Binding{}, err
+	}
+	if v.strictMatch {
+		if !methodsExplicit {
+			return Binding{}, fmt.Errorf("binding %q: match.methods must be explicit when scoped-match enforcement is enabled", normalized.Name)
+		}
+		if !pathsExplicit {
+			return Binding{}, fmt.Errorf("binding %q: match.paths must be explicit when scoped-match enforcement is enabled", normalized.Name)
+		}
+		for _, path := range normalized.Match.Paths {
+			if path == "/*" {
+				return Binding{}, fmt.Errorf("binding %q: match.paths must not contain /* when scoped-match enforcement is enabled", normalized.Name)
+			}
+		}
+	}
+	return normalized, nil
 }
 
 func normalizeMatch(m *Match) error {
@@ -958,7 +1033,7 @@ func (v *Store) applyCredentialMutations(credentials map[string]record, mutation
 	return nil
 }
 
-func applyBindingMutations(bindings map[string]Binding, mutations *BindingMutationSet) error {
+func (v *Store) applyBindingMutations(bindings map[string]Binding, mutations *BindingMutationSet) error {
 	if mutations == nil {
 		return nil
 	}
@@ -978,7 +1053,7 @@ func applyBindingMutations(bindings map[string]Binding, mutations *BindingMutati
 		delete(bindings, name)
 	}
 	for _, raw := range mutations.Replace {
-		b, err := normalizeBinding(raw)
+		b, err := v.normalizeBinding(raw)
 		if err != nil {
 			return err
 		}
@@ -993,7 +1068,7 @@ func applyBindingMutations(bindings map[string]Binding, mutations *BindingMutati
 	}
 	addSeen := make(map[string]struct{})
 	for _, raw := range mutations.Add {
-		b, err := normalizeBinding(raw)
+		b, err := v.normalizeBinding(raw)
 		if err != nil {
 			return err
 		}

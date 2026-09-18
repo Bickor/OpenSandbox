@@ -9,6 +9,10 @@ Complete demonstration of running Python code using the Code Interpreter SDK.
 
 ## Getting Code Interpreter image
 
+::: info Image Source
+The container image source and environment definitions are maintained in [opensandbox-group/sandbox-images](https://github.com/opensandbox-group/sandbox-images).
+:::
+
 Pull the prebuilt image from a registry:
 
 ```shell
@@ -38,7 +42,7 @@ uv pip install opensandbox opensandbox-code-interpreter
 uv run python examples/code-interpreter/main.py
 ```
 
-The script creates a Sandbox + CodeInterpreter, runs a Python code snippet and prints stdout/result, then terminates the remote instance.
+The script creates a Sandbox + CodeInterpreter, runs a Python code snippet and prints stdout/result, then terminates the remote instance. Cleanup is attempted in a `finally` block even if interpreter setup or code execution raises an exception.
 
 ## Environment variables
 
@@ -112,7 +116,7 @@ spec:
             - name: opensandbox-bin
               mountPath: /opt/opensandbox
         - name: execd-installer
-          image: sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/execd:v1.0.22
+          image: sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/execd:v1.1.0
           command: [ "/bin/sh", "-c" ]
           args:
             - |
@@ -251,3 +255,4 @@ uv run python examples/code-interpreter/main_use_pool.py
 ## References
 
 - [Source code on GitHub](https://github.com/opensandbox-group/OpenSandbox/tree/main/examples/code-interpreter)
+- [Code Interpreter Image Repository](https://github.com/opensandbox-group/sandbox-images)

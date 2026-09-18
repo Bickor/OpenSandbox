@@ -70,6 +70,88 @@ try {
 }
 ```
 
+## Lifecycle Hooks
+
+Set `lifecycle` in `Sandbox.create`. `preStart` completes before the entrypoint starts, while `periodic` hooks run on their schedules after startup.
+
+```ts
+const sandbox = await Sandbox.create({
+  connectionConfig: config,
+  image: "ubuntu:24.04",
+  lifecycle: {
+    preStart: {
+      command: ["sh", "-c", "echo ready > /tmp/prestart.done"],
+      timeoutSeconds: 120,
+    },
+    periodic: [
+      {
+        name: "checkpoint",
+        schedule: "@every 5m",
+        command: ["sh", "-c", "date -u >> /tmp/checkpoints.log"],
+        timeoutSeconds: 120,
+      },
+    ],
+  },
+});
+```
+
+The Server validates `timeoutSeconds`; `preStart` accepts 1–10800 seconds, while `periodic` accepts 1–300 seconds. Both default to 60 seconds when omitted. See [Lifecycle Hooks](/guides/lifecycle-hooks) for timing, failure behavior, and provider limitations.
+
+## Client-Side Sandbox Pool
+
+`SandboxPool` keeps a best-effort idle buffer of clean, ready sandboxes. Acquiring removes a sandbox from the pool permanently; the caller kills it after use instead of returning it to the pool.
+
+```ts
+import {
+  AcquirePolicy,
+  InMemoryPoolStateStore,
+  SandboxPool,
+} from "@alibaba-group/opensandbox";
+
+const pool = SandboxPool.create({
+  poolName: "workers",
+  maxIdle: 2,
+  stateStore: new InMemoryPoolStateStore(),
+  connectionConfig: config,
+  creationSpec: { image: "ubuntu:24.04" },
+});
+
+await pool.start();
+const sandbox = await pool.acquire({
+  sandboxTimeoutSeconds: 3600,
+  policy: AcquirePolicy.DIRECT_CREATE,
+});
+
+try {
+  await sandbox.commands.run("echo ready");
+} finally {
+  await sandbox.kill();
+  await sandbox.close();
+  await pool.shutdown();
+}
+```
+
+The built-in `InMemoryPoolStateStore` is limited to one JavaScript process. To share a pool across processes, provide a distributed `PoolStateStore` whose idle-take, membership, and primary-lock operations are atomic.
+
+`acquireReadyTimeoutSeconds` and `warmupReadyTimeoutSeconds` bound each sandbox's
+health-check phase, including in-flight probes and polling delays. They do not
+bound the entire acquire or warmup operation, such as sandbox creation or
+preparation. Pass an `AbortSignal` to `pool.acquire({ signal })` to cancel an
+in-flight readiness check. SDK health probes receive the cancellation signal.
+Custom health-check callbacks, and `isHealthy()` probes on custom creator objects
+without `waitUntilReady()`, may continue running after timeout or cancellation,
+but their late results are ignored. The pool attempts to kill a sandbox that
+fails readiness and does not hand it to a caller or add it to the idle buffer.
+
+`SandboxPoolManager.destroy(poolName)` first writes a shared `DESTROYING` fence,
+then drains and best-effort kills visible idle sandboxes before clearing pool
+state and writing a `DESTROYED` tombstone. `drainTimeoutSeconds` is checked
+before each drain attempt and bounds in-flight sandbox deletion; `0` disables
+that bound. State-store calls remain subject to the store client's own request
+timeout. If drain or persistent-state cleanup fails, the namespace remains
+fenced as `DESTROYING`. Retry `destroy()` with the same pool name to complete
+cleanup.
+
 ## Usage Examples
 
 ### 1. Lifecycle Management
@@ -103,7 +185,7 @@ const manual = await Sandbox.create({
 
 ### 2. Custom Health Check
 
-Define custom logic to determine whether the sandbox is ready/healthy. This overrides the default ping check used during readiness checks.
+Define custom logic to determine whether the sandbox is ready/healthy. This overrides the default ping check. Checks must not block the event loop and may continue running after timeout.
 
 ```ts
 const sandbox = await Sandbox.create({
@@ -137,6 +219,15 @@ await sandbox.commands.run(
   handlers,
 );
 ```
+
+To execute a native program without shell parsing, pass an argument list. On Linux,
+this example prints literal `$HOME` and keeps `hello world` as one argument:
+
+```ts
+await sandbox.commands.run(["printf", "%s\n", "$HOME", "hello world"]);
+```
+
+Native argv execution requires an updated execd. See [command execution modes](/components/execd#command-execution) for executable lookup and platform behavior.
 
 ### 4. Comprehensive File Operations
 

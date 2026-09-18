@@ -15,32 +15,59 @@
 package web
 
 import (
-	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/alibaba/opensandbox/execd/pkg/activity"
+	"github.com/alibaba/opensandbox/execd/pkg/binding"
+	"github.com/alibaba/opensandbox/execd/pkg/flag"
 	"github.com/alibaba/opensandbox/execd/pkg/log"
 	"github.com/alibaba/opensandbox/execd/pkg/web/controller"
 	"github.com/alibaba/opensandbox/execd/pkg/web/model"
 )
 
-// NewRouter builds a Gin engine with all execd routes.
-func NewRouter(accessToken string, tracker *activity.Tracker, activityConfig controller.ActivityConfig) (*gin.Engine, error) {
-	if tracker == nil {
-		return nil, errors.New("activity tracker is required")
+// Paths that must be reachable before the RuntimeBinding is applied (and
+// without the API access token): liveness, readiness, and the internal
+// runtime-init call.
+//
+// /internal/init is an internal control-plane protocol: it is not part of
+// the public execd API surface and carries no external compatibility
+// guarantee.
+var preInitPaths = map[string]struct{}{
+	"/ping":          {},
+	"/ready":         {},
+	"/internal/init": {},
+}
+
+func NewRouter(accessToken string, activityArgs ...any) *gin.Engine {
+	tracker := activity.NewTracker()
+	activityConfig := controller.DefaultActivityConfig()
+	if len(activityArgs) > 0 {
+		if configuredTracker, ok := activityArgs[0].(*activity.Tracker); ok && configuredTracker != nil {
+			tracker = configuredTracker
+		}
+	}
+	if len(activityArgs) > 1 {
+		if configuredActivity, ok := activityArgs[1].(controller.ActivityConfig); ok {
+			activityConfig = configuredActivity
+		}
 	}
 	if err := activityConfig.Validate(); err != nil {
-		return nil, err
+		panic(err)
 	}
 
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
-	r.Use(logMiddleware(), otelHTTPMetricsMiddleware(), accessTokenMiddleware(accessToken), activityMiddleware(tracker), ProxyMiddleware(tracker))
+	// The runtime-init gate runs before auth: pre-init business APIs answer
+	// a uniform 503 regardless of credentials, and the access-token check
+	// only sees requests that passed the gate.
+	r.Use(logMiddleware(), otelHTTPMetricsMiddleware(), runtimeInitGate(), accessTokenMiddleware(accessToken), activityMiddleware(tracker), ProxyMiddleware(tracker))
 
 	r.GET("/ping", controller.PingHandler)
+	r.POST("/internal/init", withInit(func(c *controller.InitController) { c.Init() }))
+	r.GET("/ready", withInit(func(c *controller.InitController) { c.Ready() }))
 	r.GET("/v1/activity", withActivity(tracker, activityConfig, func(c *controller.ActivityController) { c.Get() }))
 	r.POST("/v1/activity/touch", withActivity(tracker, activityConfig, func(c *controller.ActivityController) { c.Touch() }))
 
@@ -128,7 +155,7 @@ func NewRouter(accessToken string, tracker *activity.Tracker, activityConfig con
 		isolated.GET("/capabilities", withIsolated(func(c *controller.IsolatedSessionController) { c.Capabilities() }))
 	}
 
-	return r, nil
+	return r
 }
 
 func withActivity(tracker *activity.Tracker, config controller.ActivityConfig, fn func(*controller.ActivityController)) gin.HandlerFunc {
@@ -167,18 +194,48 @@ func withIsolated(fn func(*controller.IsolatedSessionController)) gin.HandlerFun
 	}
 }
 
-func accessTokenMiddleware(token string) gin.HandlerFunc {
+func withInit(fn func(*controller.InitController)) gin.HandlerFunc {
 	return func(ctx *gin.Context) {
-		if token == "" {
+		fn(controller.NewInitController(ctx))
+	}
+}
+
+// accessTokenMiddleware guards API entrypoints. Once a RuntimeBinding with
+// a token hash is applied (/internal/init is authoritative), request tokens
+// are verified against the hash; before that, the legacy container-env
+// token applies. /internal/init, /ready, and /ping are always reachable
+// without the token.
+func accessTokenMiddleware(legacyToken string) gin.HandlerFunc {
+	return func(ctx *gin.Context) {
+		if _, preInit := preInitPaths[ctx.FullPath()]; preInit {
+			ctx.Next()
+			return
+		}
+
+		if b := binding.Current(); b != nil && b.HasAccessToken {
+			presented := ctx.GetHeader(model.ApiAccessTokenHeader)
+			if presented == "" || !b.VerifyAccessToken(presented) {
+				abortUnauthorized(ctx)
+				return
+			}
+			ctx.Next()
+			return
+		}
+
+		// TODO(runtime-init): dynamic authentication is undecided. When the
+		// binding carries no token hash (/internal/init omitted
+		// accessTokenHash), auth falls back to the legacy container-env
+		// token below. This is an internal-protocol compatibility fallback:
+		// it must not be relied on long-term, and the control plane should
+		// always deliver a token hash until a credential scheme replaces it.
+		if legacyToken == "" {
 			ctx.Next()
 			return
 		}
 
 		requestedToken := ctx.GetHeader(model.ApiAccessTokenHeader)
-		if requestedToken == "" || requestedToken != token {
-			ctx.AbortWithStatusJSON(http.StatusUnauthorized, map[string]any{
-				"error": "Unauthorized: invalid or missing header " + model.ApiAccessTokenHeader,
-			})
+		if requestedToken == "" || requestedToken != legacyToken {
+			abortUnauthorized(ctx)
 			return
 		}
 
@@ -186,9 +243,40 @@ func accessTokenMiddleware(token string) gin.HandlerFunc {
 	}
 }
 
+func abortUnauthorized(ctx *gin.Context) {
+	ctx.AbortWithStatusJSON(http.StatusUnauthorized, map[string]any{
+		"error": "Unauthorized: invalid or missing header " + model.ApiAccessTokenHeader,
+	})
+}
+
+// runtimeInitGate serves only liveness, readiness, and /internal/init until
+// runtime init completes (runtime-init mode). The gate checks the manager's
+// ready state — not binding presence — because the binding is installed
+// atomically mid-apply: a failed apply (500) keeps the binding but must
+// stay gated since /ready reports 503 too.
+func runtimeInitGate() gin.HandlerFunc {
+	return func(ctx *gin.Context) {
+		if !flag.RuntimeInit {
+			ctx.Next()
+			return
+		}
+		if _, preInit := preInitPaths[ctx.FullPath()]; preInit {
+			ctx.Next()
+			return
+		}
+		if controller.GetRuntimeInitManager().Ready() {
+			ctx.Next()
+			return
+		}
+		ctx.AbortWithStatusJSON(http.StatusServiceUnavailable, map[string]any{
+			"error": "execd is not initialized yet: POST /internal/init must be called first",
+		})
+	}
+}
+
 func logMiddleware() gin.HandlerFunc {
 	return func(ctx *gin.Context) {
-		log.Info("Requested: %v - %v", ctx.Request.Method, ctx.Request.URL.String())
+		log.Info("http: %s %s", ctx.Request.Method, ctx.Request.URL.String())
 		ctx.Next()
 	}
 }

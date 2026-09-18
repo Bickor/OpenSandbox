@@ -37,7 +37,7 @@ func createNftManager(mode string) nftApplier {
 	return nftables.NewManagerWithOptions(parseNftOptions())
 }
 
-// setupNft: apply static policy to nft, then wire allowed DNS answers to AddResolvedIPs (dynamic allow sets).
+// setupNft: apply static policy to nft, then wire allowed DNS answers to AddResolvedDomain (dynamic allow sets).
 // nameserverIPs and always-deny/allow follow the same merge rules as the policy API (MergeAlwaysOverlay + WithExtraAllowIPs).
 func setupNft(ctx context.Context, nftMgr nftApplier, initialPolicy *policy.NetworkPolicy, proxy *dnsproxy.Proxy, nameserverIPs []netip.Addr, alwaysDeny, alwaysAllow []policy.EgressRule) {
 	if nftMgr == nil {
@@ -63,11 +63,43 @@ func setupNft(ctx context.Context, nftMgr nftApplier, initialPolicy *policy.Netw
 	proxy.SetOnResolved(func(domain string, ips []nftables.ResolvedIP) {
 		addCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := nftMgr.AddResolvedIPs(addCtx, ips); err != nil {
-			log.Warnf("[dns] add resolved IPs to nft failed for domain %q: %v", domain, err)
+		if err := nftMgr.AddResolvedDomain(addCtx, domain, ips); err != nil {
+			log.Warnf("[dns] record resolved domain %q failed: %v", domain, err)
 		}
 	})
 	nftMgr.StartConnectionRefresh(ctx)
+	nftMgr.StartDomainRefresh(ctx, proxy.ResolveDomain)
+}
+
+// parseDoHBlocklist parses the comma-separated OPENSANDBOX_EGRESS_DOH_BLOCKLIST
+// value (IP or CIDR entries) into v4/v6 lists. Invalid entries are logged and
+// skipped. Shared by the sidecar and fast-sandbox profiles so both enforce the same
+// DoH-443 semantics.
+func parseDoHBlocklist(raw string) (v4, v6 []string) {
+	for _, p := range strings.Split(raw, ",") {
+		target := strings.TrimSpace(p)
+		if target == "" {
+			continue
+		}
+		if addr, err := netip.ParseAddr(target); err == nil {
+			if addr.Is4() {
+				v4 = append(v4, target)
+			} else if addr.Is6() {
+				v6 = append(v6, target)
+			}
+			continue
+		}
+		if prefix, err := netip.ParsePrefix(target); err == nil {
+			if prefix.Addr().Is4() {
+				v4 = append(v4, target)
+			} else if prefix.Addr().Is6() {
+				v6 = append(v6, target)
+			}
+			continue
+		}
+		log.Warnf("ignoring invalid DoH blocklist entry: %s", target)
+	}
+	return v4, v6
 }
 
 func parseNftOptions() nftables.Options {
@@ -76,30 +108,7 @@ func parseNftOptions() nftables.Options {
 		opts.BlockDoH443 = true
 	}
 	if raw := os.Getenv(constants.EnvDoHBlocklist); strings.TrimSpace(raw) != "" {
-		parts := strings.Split(raw, ",")
-		for _, p := range parts {
-			target := strings.TrimSpace(p)
-			if target == "" {
-				continue
-			}
-			if addr, err := netip.ParseAddr(target); err == nil {
-				if addr.Is4() {
-					opts.DoHBlocklistV4 = append(opts.DoHBlocklistV4, target)
-				} else if addr.Is6() {
-					opts.DoHBlocklistV6 = append(opts.DoHBlocklistV6, target)
-				}
-				continue
-			}
-			if prefix, err := netip.ParsePrefix(target); err == nil {
-				if prefix.Addr().Is4() {
-					opts.DoHBlocklistV4 = append(opts.DoHBlocklistV4, target)
-				} else if prefix.Addr().Is6() {
-					opts.DoHBlocklistV6 = append(opts.DoHBlocklistV6, target)
-				}
-				continue
-			}
-			log.Warnf("ignoring invalid DoH blocklist entry: %s", target)
-		}
+		opts.DoHBlocklistV4, opts.DoHBlocklistV6 = parseDoHBlocklist(raw)
 	}
 	return opts
 }

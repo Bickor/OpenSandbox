@@ -67,14 +67,12 @@ func newPTYTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	prev := codeRunner
 	tracker := activity.NewTracker()
-	controller, err := runtime.NewController("", "", tracker)
-	require.NoError(t, err)
+	controller := runtime.NewController("", "", tracker)
 	codeRunner = controller
 	t.Cleanup(func() { codeRunner = prev })
 	return httptest.NewServer(buildPTYRouter(tracker))
 }
 
-// wsDialPTY dials a WebSocket URL; accepts an optional extra query string.
 func wsDialPTY(t *testing.T, baseURL, path, query string) *websocket.Conn {
 	t.Helper()
 	u := "ws" + strings.TrimPrefix(baseURL+path, "http")
@@ -105,7 +103,6 @@ func wsDialExpectHTTP(t *testing.T, baseURL, path, query string) int {
 	return resp.StatusCode
 }
 
-// ptyCreateSession calls POST /pty and returns the session_id.
 func ptyCreateSession(t *testing.T, srv *httptest.Server) string {
 	t.Helper()
 	resp, err := http.Post(srv.URL+"/pty", "application/json", strings.NewReader(`{}`))
@@ -148,7 +145,6 @@ func ptyReadFrame(conn *websocket.Conn, timeout time.Duration) (model.ServerFram
 	return model.ServerFrame{}, fmt.Errorf("unknown binary frame type 0x%02x", raw[0])
 }
 
-// ptyWaitFrame reads frames until one with the given type is found.
 func ptyWaitFrame(t *testing.T, conn *websocket.Conn, wantType string, timeout time.Duration) model.ServerFrame {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -165,7 +161,6 @@ func ptyWaitFrame(t *testing.T, conn *websocket.Conn, wantType string, timeout t
 	return model.ServerFrame{}
 }
 
-// ptyOutputContains reads frames until stdout/stderr/replay contains substr.
 func ptyOutputContains(t *testing.T, conn *websocket.Conn, substr string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -192,7 +187,58 @@ func ptyWriteStdin(t *testing.T, conn *websocket.Conn, text string) {
 	require.NoError(t, conn.WriteMessage(websocket.BinaryMessage, frame))
 }
 
-// --- Tests ---
+type errorPTYCreateRunner struct {
+	codeExecutionRunner
+	attemptedSessionID string
+}
+
+func (r *errorPTYCreateRunner) CreatePTYSession(id, _, _ string) (runtime.PTYSession, error) {
+	r.attemptedSessionID = id
+	return nil, errors.New("forced PTY creation failure")
+}
+
+func TestCreatePTYSessionReturnsOnlyErrorWhenCreationFails(t *testing.T) {
+	underlying := runtime.NewController("", "")
+	runner := &errorPTYCreateRunner{codeExecutionRunner: underlying}
+	previous := codeRunner
+	codeRunner = runner
+	t.Cleanup(func() { codeRunner = previous })
+
+	req := httptest.NewRequest(http.MethodPost, "/pty", strings.NewReader(`{}`))
+	rec := httptest.NewRecorder()
+	buildPTYRouter(activity.NewTracker()).ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusInternalServerError, rec.Code)
+	require.True(t, json.Valid(rec.Body.Bytes()), "response must contain exactly one JSON value: %q", rec.Body.String())
+
+	var response model.ErrorResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+	require.Equal(t, model.ErrorCodeRuntimeError, response.Code)
+	require.Equal(t, "error creating pty session: forced PTY creation failure", response.Message)
+	require.NotContains(t, rec.Body.String(), "session_id")
+	require.NotEmpty(t, runner.attemptedSessionID)
+	require.Nil(t, underlying.GetPTYSession(runner.attemptedSessionID))
+}
+
+func TestCreatePTYSessionReturns201OnSuccess(t *testing.T) {
+	runner := runtime.NewController("", "")
+	previous := codeRunner
+	codeRunner = runner
+	t.Cleanup(func() { codeRunner = previous })
+
+	req := httptest.NewRequest(http.MethodPost, "/pty", strings.NewReader(`{}`))
+	rec := httptest.NewRecorder()
+	buildPTYRouter(activity.NewTracker()).ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusCreated, rec.Code)
+	require.True(t, json.Valid(rec.Body.Bytes()))
+
+	var response model.CreatePTYSessionResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+	require.NotEmpty(t, response.SessionID)
+	require.NotNil(t, runner.GetPTYSession(response.SessionID))
+	require.NoError(t, runner.DeletePTYSession(response.SessionID))
+}
 
 func TestPTYWS_UnknownSessionReturns404(t *testing.T) {
 	srv := newPTYTestServer(t)
@@ -313,9 +359,24 @@ func TestPTYWS_ViewerClosesAfterReadOnlyViolationLimit(t *testing.T) {
 		require.Equal(t, model.WSErrCodeReadOnly, f.Code)
 	}
 
-	_ = viewer.SetReadDeadline(time.Now().Add(5 * time.Second))
-	_, _, err := viewer.ReadMessage()
-	require.Error(t, err, "viewer should close after repeated read-only violations")
+	// The output pump can send replay after the final READ_ONLY error but
+	// before cancellation closes the socket. Drain it within one deadline;
+	// a timeout or malformed frame must not be mistaken for peer closure.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		frame, err := ptyReadFrame(viewer, remaining)
+		if err != nil {
+			var closeErr *websocket.CloseError
+			require.ErrorAs(t, err, &closeErr, "viewer should close after repeated read-only violations")
+			return
+		}
+		require.Equal(t, "replay", frame.Type, "unexpected frame while waiting for viewer closure")
+	}
+	t.Fatal("viewer did not close after repeated read-only violations")
 }
 
 func TestPTYWS_ViewerFlushesOutputBeforeExit(t *testing.T) {
@@ -456,13 +517,11 @@ func TestPTYWS_ReplayOnReconnect(t *testing.T) {
 
 	id := ptyCreateSession(t, srv)
 
-	// First connection: produce output.
 	conn1 := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "")
 	ptyWaitFrame(t, conn1, "connected", 10*time.Second)
 	ptyWriteStdin(t, conn1, "echo replay_test\n")
 	ptyOutputContains(t, conn1, "replay_test", 8*time.Second)
 
-	// Check offset via REST.
 	resp, err := http.Get(srv.URL + "/pty/" + id)
 	require.NoError(t, err)
 	defer resp.Body.Close()
@@ -470,7 +529,6 @@ func TestPTYWS_ReplayOnReconnect(t *testing.T) {
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&status))
 	require.True(t, status.OutputOffset > 0)
 
-	// Disconnect.
 	_ = conn1.Close()
 	time.Sleep(100 * time.Millisecond)
 
@@ -503,14 +561,12 @@ func TestPTYWS_TakeoverEvictsHolder(t *testing.T) {
 
 	id := ptyCreateSession(t, srv)
 
-	// Holder connects, sets a shell var, and emits a marker.
 	conn1 := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "")
 	ptyWaitFrame(t, conn1, "connected", 10*time.Second)
 	ptyWriteStdin(t, conn1, "TAKEOVER_VAR=alive\n")
 	ptyWriteStdin(t, conn1, "echo holder_marker\n")
 	ptyOutputContains(t, conn1, "holder_marker", 8*time.Second)
 
-	// A new client takes over.
 	conn2 := wsDialPTY(t, srv.URL, "/pty/"+id+"/ws", "takeover=1&since=0")
 
 	// 1. The holder's connection is closed with the takeover close code.

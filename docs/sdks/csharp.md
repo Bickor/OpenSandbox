@@ -64,6 +64,40 @@ catch (SandboxException ex)
 }
 ```
 
+## Lifecycle Hooks
+
+Set `Lifecycle` in `SandboxCreateOptions`. `PreStart` completes before the entrypoint starts, while `Periodic` hooks run on their schedules after startup.
+
+```csharp
+using OpenSandbox.Models;
+
+await using var sandbox = await Sandbox.CreateAsync(new SandboxCreateOptions
+{
+    ConnectionConfig = config,
+    Image = "ubuntu:24.04",
+    Lifecycle = new SandboxLifecycle
+    {
+        PreStart = new LifecycleHook
+        {
+            Command = new[] { "sh", "-c", "echo ready > /tmp/prestart.done" },
+            TimeoutSeconds = 120,
+        },
+        Periodic = new[]
+        {
+            new PeriodicLifecycleHook
+            {
+                Name = "checkpoint",
+                Schedule = "@every 5m",
+                Command = new[] { "sh", "-c", "date -u >> /tmp/checkpoints.log" },
+                TimeoutSeconds = 120,
+            },
+        },
+    },
+});
+```
+
+The Server validates `TimeoutSeconds`; `PreStart` accepts 1–10800 seconds, while `Periodic` accepts 1–300 seconds. Both default to 60 seconds when omitted. See [Lifecycle Hooks](/guides/lifecycle-hooks) for timing, failure behavior, and provider limitations.
+
 ## Usage Examples
 
 ### 1. Lifecycle Management
@@ -149,6 +183,15 @@ await sandbox.Commands.RunAsync(
     handlers: handlers
 );
 ```
+
+To execute a native program without shell parsing, pass an argument list. On Linux,
+this example prints literal `$HOME` and keeps `hello world` as one argument:
+
+```csharp
+await sandbox.Commands.RunAsync(new[] { "printf", "%s\n", "$HOME", "hello world" });
+```
+
+Native argv execution requires an updated execd. See [command execution modes](/components/execd#command-execution) for executable lookup and platform behavior.
 
 For background commands, you can poll status and incremental logs:
 
@@ -434,7 +477,7 @@ guidance, and Git/curl examples.
 - `RunCommandOptions.TimeoutSeconds` controls command execution timeout for command runs.
 - `RunInSessionOptions.TimeoutSeconds` controls command execution timeout for session runs.
 - `SandboxCreateOptions.TimeoutSeconds` controls sandbox server-side TTL.
-- `ReadyTimeoutSeconds` controls how long `CreateAsync` / `ConnectAsync` waits for readiness.
+- `ReadyTimeoutSeconds` controls readiness waits. For `ConnectAsync` / `ResumeAsync`, endpoint discovery and health checks share this timeout. Blocking custom code can delay timeout reporting.
 - The SDK does not automatically retry failed API requests; implement retries in caller code where appropriate.
 
 ### 7. Resource Cleanup

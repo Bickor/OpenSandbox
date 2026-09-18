@@ -103,7 +103,7 @@ func TestCredentialVaultActiveUnixSocketReturnsSnapshot(t *testing.T) {
 		require.NoError(t, os.RemoveAll(tmpDir))
 	})
 	socketPath := filepath.Join(tmpDir, "credential-proxy", "active.sock")
-	_, cleanup, err := credentialvault.StartActiveSocketServer(srv.handleCredentialVaultActive, srv.handleCredentialVaultResolve, socketPath, -1)
+	_, cleanup, err := credentialvault.StartActiveSocketServerRequestAware(srv.handleCredentialVaultActive, socketPath, -1)
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -126,51 +126,47 @@ func TestCredentialVaultActiveUnixSocketReturnsSnapshot(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, http.StatusOK, resp.StatusCode)
+	initialTag := resp.Header.Get("ETag")
+	require.NotEmpty(t, initialTag)
 	require.Contains(t, string(body), "secret-token")
 	require.Contains(t, string(body), "Private-Token")
-}
 
-func TestCredentialVaultResolveUnixSocketAndRejectsStaleRevision(t *testing.T) {
-	store := credentialvault.NewStore(nil, func() bool { return true })
-	pol := testCredentialVaultPolicy(t, `{"defaultAction":"deny","egress":[{"action":"allow","target":"code.example.com"}]}`)
-	_, err := store.Create(testCredentialVaultRequest(), pol)
+	req, err := http.NewRequest(http.MethodGet, "http://credential-proxy/credential-vault/_active", nil)
 	require.NoError(t, err)
-	srv := &policyServer{credentialVault: store}
-
-	tmpDir := t.TempDir()
-	socketPath := filepath.Join(tmpDir, "credential-proxy", "active.sock")
-	_, cleanup, err := credentialvault.StartActiveSocketServer(
-		srv.handleCredentialVaultActive,
-		srv.handleCredentialVaultResolve,
-		socketPath,
-		-1,
-	)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		require.NoError(t, cleanup(ctx))
-	})
-
-	client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-		var dialer net.Dialer
-		return dialer.DialContext(ctx, "unix", socketPath)
-	}}}
-	resolveURL := "http://credential-proxy/credential-vault/_resolve?binding=gitlab-api&revision=1"
-	resp, err := client.Get(resolveURL)
-	require.NoError(t, err)
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	require.NoError(t, resp.Body.Close())
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	require.Contains(t, string(body), "secret-token")
-
-	_, err = store.Patch(credentialvault.MutationRequest{}, pol)
-	require.NoError(t, err)
-	resp, err = client.Get(resolveURL)
+	req.Header.Set("If-None-Match", initialTag)
+	resp, err = client.Do(req)
 	require.NoError(t, err)
 	defer resp.Body.Close()
-	require.Equal(t, http.StatusConflict, resp.StatusCode)
+	require.Equal(t, http.StatusNotModified, resp.StatusCode)
+	require.Equal(t, initialTag, resp.Header.Get("ETag"))
+
+	_, err = store.Patch(credentialvault.MutationRequest{
+		Credentials: &credentialvault.CredentialMutationSet{Replace: []credentialvault.Credential{{
+			Name:   "gitlab-token",
+			Source: json.RawMessage(`{"type":"inline","value":"new-secret-token"}`),
+		}}},
+	}, pol)
+	require.NoError(t, err)
+	req, err = http.NewRequest(http.MethodGet, "http://credential-proxy/credential-vault/_active", nil)
+	require.NoError(t, err)
+	req.Header.Set("If-None-Match", initialTag)
+	resp, err = client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	body, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.NotEqual(t, initialTag, resp.Header.Get("ETag"))
+	require.Contains(t, string(body), "new-secret-token")
+	require.NotContains(t, string(body), `"secret-token"`)
+
+	req, err = http.NewRequest(http.MethodGet, "http://credential-proxy/credential-vault/_active", nil)
+	require.NoError(t, err)
+	req.Header.Set("If-None-Match", "not-quoted")
+	resp, err = client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 }
 
 func TestCredentialVaultActiveBindingBlocksEgressPolicyRemoval(t *testing.T) {

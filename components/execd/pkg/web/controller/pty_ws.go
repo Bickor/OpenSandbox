@@ -119,7 +119,7 @@ func ptySessionWebSocket(ctx *gin.Context, tracker *activity.Tracker) {
 	//    evicting, so a bad or incomplete handshake cannot kill the current holder.
 	conn, err := wsUpgrader.Upgrade(ctx.Writer, ctx.Request, nil)
 	if err != nil {
-		log.Warn("pty ws upgrade failed for session %s: %v", id, err)
+		log.Warn("pty ws: upgrade session=%s: %v", id, err)
 		if locked {
 			session.UnlockWS()
 		}
@@ -140,7 +140,6 @@ func ptySessionWebSocket(ctx *gin.Context, tracker *activity.Tracker) {
 	// defer below), only after all pump goroutines have exited.
 	tracker.Touch()
 
-	// Resolve query parameters.
 	pipeMode := ctx.Query("pty") == "0"
 	since := queryInt64(ctx.Query("since"), 0)
 
@@ -153,7 +152,7 @@ func ptySessionWebSocket(ctx *gin.Context, tracker *activity.Tracker) {
 			startErr = session.StartPTY()
 		}
 		if startErr != nil {
-			log.Warn("pty start failed for session %s: %v", id, startErr)
+			log.Warn("pty ws: start session=%s: %v", id, startErr)
 			writeErrFrame(conn, model.WSErrCodeStartFailed, startErr.Error())
 			_ = conn.Close()
 			session.UnlockWS()
@@ -182,7 +181,6 @@ func ptySessionWebSocket(ctx *gin.Context, tracker *activity.Tracker) {
 		session.ClearEvictHandler(evictGen)
 	}()
 
-	// cancelCh is closed to signal all goroutines to stop.
 	cancelCh := make(chan struct{})
 	cancelOnce := sync.OnceFunc(func() { close(cancelCh) })
 
@@ -245,7 +243,7 @@ func ptySessionWebSocket(ctx *gin.Context, tracker *activity.Tracker) {
 		// No connMu needed — pump goroutines not yet started.
 		_ = conn.SetWriteDeadline(time.Now().Add(wsWriteDeadline))
 		if err2 := writeReplayFrame(conn, snapshotBytes, snapshotOffset); err2 != nil {
-			log.Warn("pty ws send replay for session %s: %v", id, err2)
+			log.Warn("pty ws: send replay session=%s: %v", id, err2)
 			return
 		}
 	}
@@ -261,7 +259,7 @@ func ptySessionWebSocket(ctx *gin.Context, tracker *activity.Tracker) {
 		Mode:      mode,
 		Role:      "holder",
 	}); err2 != nil {
-		log.Warn("pty ws send connected for session %s: %v", id, err2)
+		log.Warn("pty ws: send connected session=%s: %v", id, err2)
 		return
 	}
 
@@ -319,7 +317,7 @@ func ptyViewerWebSocket(ctx *gin.Context, session runtime.PTYSession, id string)
 
 	conn, err := wsUpgrader.Upgrade(ctx.Writer, ctx.Request, nil)
 	if err != nil {
-		log.Warn("pty viewer ws upgrade failed for session %s: %v", id, err)
+		log.Warn("pty viewer ws: upgrade session=%s: %v", id, err)
 		return
 	}
 
@@ -364,7 +362,7 @@ func ptyViewerWebSocket(ctx *gin.Context, session runtime.PTYSession, id string)
 	if len(snapshotBytes) > 0 {
 		_ = conn.SetWriteDeadline(time.Now().Add(wsWriteDeadline))
 		if err2 := writeReplayFrame(conn, snapshotBytes, snapshotOffset); err2 != nil {
-			log.Warn("pty viewer ws send replay for session %s: %v", id, err2)
+			log.Warn("pty viewer ws: send replay session=%s: %v", id, err2)
 			return
 		}
 	}
@@ -379,7 +377,7 @@ func ptyViewerWebSocket(ctx *gin.Context, session runtime.PTYSession, id string)
 		Mode:      mode,
 		Role:      "viewer",
 	}); err2 != nil {
-		log.Warn("pty viewer ws send connected for session %s: %v", id, err2)
+		log.Warn("pty viewer ws: send connected session=%s: %v", id, err2)
 		return
 	}
 
@@ -438,7 +436,7 @@ func ptyViewerStreamPump(
 		writeErr := writeReplayFrame(conn, data, actualOffset)
 		connMu.Unlock()
 		if writeErr != nil {
-			log.Warn("pty viewer ws write output for session %s: %v", id, writeErr)
+			log.Warn("pty viewer ws: write output session=%s: %v", id, writeErr)
 			cancelOnce()
 			return false
 		}
@@ -468,6 +466,8 @@ const ptyViewerReadOnlyViolationLimit = 5
 // ptyViewerClientReadLoop accepts ping frames but rejects every operation that
 // could mutate the session. It closes a connection that repeatedly sends
 // mutating frames to bound server-to-client error traffic.
+//
+//nolint:gocognit // pre-existing complexity on main; not part of OSEP-0018
 func ptyViewerClientReadLoop(
 	conn *websocket.Conn,
 	writeJSON func(any) error,
@@ -508,39 +508,60 @@ func ptyViewerClientReadLoop(
 
 		switch msgType {
 		case websocket.BinaryMessage:
-			if len(data) > 0 && data[0] == model.BinStdin {
-				if !readOnlyError() {
-					return
-				}
+			if !ptyViewerHandleBinaryMessage(data, readOnlyError) {
+				return
 			}
 		case websocket.TextMessage:
-			var frame model.ClientFrame
-			if json.Unmarshal(data, &frame) != nil {
-				continue
-			}
-			switch frame.Type {
-			case "stdin", "signal", "resize":
-				if !readOnlyError() {
-					return
-				}
-			case "ping":
-				if err := writeJSON(model.ServerFrame{Type: "pong"}); err != nil {
-					cancelOnce()
-				}
-			default:
-				if err := writeJSON(model.ServerFrame{
-					Type:  "error",
-					Code:  model.WSErrCodeInvalidFrame,
-					Error: fmt.Sprintf("unknown frame type %q", frame.Type),
-				}); err != nil {
-					cancelOnce()
-				}
+			if !ptyViewerHandleTextMessage(data, writeJSON, readOnlyError, cancelOnce) {
+				return
 			}
 		}
 	}
 }
 
-// ptyPingLoop sends periodic WebSocket pings until cancelCh is closed.
+// ptyViewerHandleBinaryMessage reports stdin payloads on a read-only viewer;
+// returns false when the read loop should exit.
+func ptyViewerHandleBinaryMessage(data []byte, readOnlyError func() bool) bool {
+	if len(data) > 0 && data[0] == model.BinStdin {
+		return readOnlyError()
+	}
+	return true
+}
+
+// ptyViewerHandleTextMessage handles client frames on a read-only viewer;
+// returns false when the read loop should exit.
+func ptyViewerHandleTextMessage(data []byte, writeJSON func(any) error, readOnlyError func() bool, cancelOnce func()) bool {
+	var frame model.ClientFrame
+	if json.Unmarshal(data, &frame) != nil {
+		return true
+	}
+	switch frame.Type {
+	case "stdin", "signal", "resize":
+		return readOnlyError()
+	case "ping":
+		ptyViewerReplyPong(writeJSON, cancelOnce)
+	default:
+		ptyViewerReplyInvalidFrame(writeJSON, cancelOnce, frame.Type)
+	}
+	return true
+}
+
+func ptyViewerReplyPong(writeJSON func(any) error, cancelOnce func()) {
+	if err := writeJSON(model.ServerFrame{Type: "pong"}); err != nil {
+		cancelOnce()
+	}
+}
+
+func ptyViewerReplyInvalidFrame(writeJSON func(any) error, cancelOnce func(), frameType string) {
+	if err := writeJSON(model.ServerFrame{
+		Type:  "error",
+		Code:  model.WSErrCodeInvalidFrame,
+		Error: fmt.Sprintf("unknown frame type %q", frameType),
+	}); err != nil {
+		cancelOnce()
+	}
+}
+
 func ptyPingLoop(conn *websocket.Conn, connMu *sync.Mutex, cancelCh <-chan struct{}, cancelOnce func()) {
 	t := time.NewTicker(wsPingInterval)
 	defer t.Stop()
@@ -569,7 +590,6 @@ func writeReplayFrame(conn *websocket.Conn, data []byte, offset int64) error {
 	return conn.WriteMessage(websocket.BinaryMessage, frame)
 }
 
-// ptyStreamPump reads raw chunks from r and sends them as binary frames over WS.
 func ptyStreamPump(r io.Reader, typeByte byte, name, id string, conn *websocket.Conn, connMu *sync.Mutex, pumpWg *sync.WaitGroup, cancelCh <-chan struct{}, cancelOnce func()) {
 	defer pumpWg.Done()
 	const chunkSize = 32 * 1024
@@ -588,7 +608,7 @@ func ptyStreamPump(r io.Reader, typeByte byte, name, id string, conn *websocket.
 			writeErr := conn.WriteMessage(websocket.BinaryMessage, frame[:1+n])
 			connMu.Unlock()
 			if writeErr != nil {
-				log.Warn("pty ws write %s for session %s: %v", name, id, writeErr)
+				log.Warn("pty ws: write %s session=%s: %v", name, id, writeErr)
 				cancelOnce()
 				return
 			}
@@ -671,7 +691,7 @@ func ptyHandleTextMsg(session runtime.PTYSession, id string, data []byte, writeJ
 	case "resize":
 		if frame.Cols > 0 && frame.Rows > 0 {
 			if resErr := session.ResizePTY(uint16(frame.Cols), uint16(frame.Rows)); resErr != nil {
-				log.Warn("pty resize session %s: %v", id, resErr)
+				log.Warn("pty ws: resize session=%s: %v", id, resErr)
 			} else {
 				tracker.Touch()
 			}
@@ -685,7 +705,6 @@ func ptyHandleTextMsg(session runtime.PTYSession, id string, data []byte, writeJ
 	return false
 }
 
-// ptyClientReadLoop processes incoming WebSocket messages until the connection closes.
 func ptyClientReadLoop(conn *websocket.Conn, session runtime.PTYSession, id string, writeJSON func(any) error, cancelCh <-chan struct{}, cancelOnce func(), tracker *activity.Tracker) {
 	for {
 		select {

@@ -21,16 +21,12 @@ import (
 )
 
 func newTestController(baseURL, token string) *Controller {
-	controller, err := NewController(baseURL, token, activity.NewTracker())
-	if err != nil {
-		panic(err)
-	}
-	return controller
+	return NewController(baseURL, token, activity.NewTracker())
 }
 
-func TestNewControllerRequiresActivityTracker(t *testing.T) {
+func TestNewControllerDefaultsActivityTracker(t *testing.T) {
 	t.Parallel()
-	if _, err := NewController("", "", nil); err == nil {
-		t.Fatal("expected missing activity tracker error")
+	if controller := NewController("", "", nil); controller.activity == nil {
+		t.Fatal("expected default activity tracker")
 	}
 }

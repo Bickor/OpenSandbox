@@ -25,14 +25,46 @@ import (
 )
 
 func StartActiveSocketServer(
+	activeHandler func(http.ResponseWriter),
+	socketPath string,
+	socketGID int,
+) (*http.Server, func(context.Context) error, error) {
+	if activeHandler == nil {
+		return nil, nil, fmt.Errorf("active credential vault handler is required")
+	}
+	return startActiveSocketServer(
+		func(w http.ResponseWriter, _ *http.Request) { activeHandler(w) },
+		nil,
+		socketPath,
+		socketGID,
+	)
+}
+
+// StartActiveSocketServerRequestAware passes the request to active-vault
+// handlers. Sidecar handlers inspect conditional snapshot headers; fast-sandbox
+// handlers additionally dispatch clientIp (source IP -> subject -> snapshot).
+func StartActiveSocketServerRequestAware(
+	activeHandler func(http.ResponseWriter, *http.Request),
+	socketPath string,
+	socketGID int,
+	resolveHandlers ...http.HandlerFunc,
+) (*http.Server, func(context.Context) error, error) {
+	if activeHandler == nil {
+		return nil, nil, fmt.Errorf("active credential vault handler is required")
+	}
+	var resolveHandler http.HandlerFunc
+	if len(resolveHandlers) > 0 {
+		resolveHandler = resolveHandlers[0]
+	}
+	return startActiveSocketServer(activeHandler, resolveHandler, socketPath, socketGID)
+}
+
+func startActiveSocketServer(
 	activeHandler http.HandlerFunc,
 	resolveHandler http.HandlerFunc,
 	socketPath string,
 	socketGID int,
 ) (*http.Server, func(context.Context) error, error) {
-	if activeHandler == nil || resolveHandler == nil {
-		return nil, nil, fmt.Errorf("active and resolve credential vault handlers are required")
-	}
 	if socketPath == "" {
 		return nil, nil, fmt.Errorf("socket path is required")
 	}
@@ -78,7 +110,9 @@ func StartActiveSocketServer(
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /credential-vault/_active", activeHandler)
-	mux.HandleFunc("GET /credential-vault/_resolve", resolveHandler)
+	if resolveHandler != nil {
+		mux.HandleFunc("GET /credential-vault/_resolve", resolveHandler)
+	}
 
 	srv := &http.Server{Handler: mux}
 	errCh := make(chan error, 1)

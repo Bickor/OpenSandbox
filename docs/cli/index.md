@@ -19,19 +19,21 @@ It uses the OpenSandbox Python SDK under the hood and is intended to be the shor
 
 ## Install
 
-Choose one:
+::: code-group
 
-```bash
+```bash [pip]
 pip install opensandbox-cli
 ```
 
-```bash
+```bash [uv]
 uv tool install opensandbox-cli
 ```
 
-```bash
+```bash [pipx]
 pipx install opensandbox-cli
 ```
+
+:::
 
 Confirm the install:
 
@@ -193,6 +195,17 @@ osb command status <sandbox-id> <execution-id> -o json
 osb command logs <sandbox-id> <execution-id> -o json
 ```
 
+By default the payload after `--` is joined into one shell command string, so
+pipelines, redirection, and `$VAR` expansion work as in a terminal. Add `--argv`
+to pass the arguments to the executable as a literal argv list (no shell) when
+values such as `$HOME`, quotes, embedded spaces, or empty strings must reach the
+process unchanged. `--argv` needs a sandbox image whose execd accepts argv
+requests:
+
+```bash
+osb command run <sandbox-id> -o raw --argv -- python3 -c "import sys; print(sys.argv[1:])" "a b" '$HOME' "x'y" ""
+```
+
 Persistent shell session:
 
 ```bash
@@ -213,6 +226,20 @@ osb file info <sandbox-id> /workspace/main.py -o json
 osb file replace <sandbox-id> /workspace/app.py --old old --new new -o json
 osb file chmod <sandbox-id> /workspace/script.sh --mode 755 -o json
 ```
+
+For regular files, `file download` replaces the local destination only after the entire download
+succeeds. If the download fails or you interrupt it, an existing file stays
+unchanged and temporary download files are removed. The destination directory
+must be writable so the CLI can stage the download before replacing the file.
+
+Existing devices (such as `/dev/null`) and named pipes receive the download
+directly. They are not replaced, and bytes already written cannot be rolled back
+if the download fails or is interrupted.
+
+Destinations that refer to standard output, such as `/dev/stdout` and `/dev/fd/1`,
+stream directly even when stdout is redirected to a regular file. These downloads
+omit the success message in all output formats so stdout contains only file bytes;
+errors still go to stderr. A failed or interrupted stream can contain partial data.
 
 ### Manage runtime egress policy
 
@@ -258,18 +285,22 @@ Use `--file -` to read a JSON/YAML payload from stdin. Do not pass plaintext cre
 Use the stable diagnostics commands for API-backed log and event descriptors.
 
 ```bash
-osb diagnostics events <sandbox-id> --scope lifecycle -o raw
 osb diagnostics events <sandbox-id> --scope runtime -o raw
+osb diagnostics events <sandbox-id> --scope all -o raw
 osb diagnostics logs <sandbox-id> --scope container -o raw
-osb diagnostics logs <sandbox-id> --scope lifecycle -o json
+osb diagnostics logs <sandbox-id> --scope all -o json
 osb diagnostics events <sandbox-id> --scope runtime -o json
 osb diagnostics logs <sandbox-id> --scope container -o yaml
 ```
 
-`--scope` is required for stable diagnostics. Common scopes are `lifecycle` and
-`container` for logs, and `lifecycle` and `runtime` for events. Raw output
-prints inline diagnostic text, or the content URL when diagnostics are
-delivered as a temporary URL.
+`--scope` is required for stable diagnostics. The built-in server supports
+`container` and `all` for logs, and `runtime` and `all` for events. It returns
+`DIAGNOSTICS_SCOPE_UNSUPPORTED` for unavailable scopes, including lifecycle events.
+Best-effort scopes may include a `warnings` field when the backend can only
+provide a subset. Raw output prints inline
+diagnostic text, or the content URL when diagnostics are delivered as a
+temporary URL. Older server builds may still return
+`DIAGNOSTICS_NOT_IMPLEMENTED` for scoped diagnostics.
 
 ::: info
 Legacy DevOps diagnostics remain experimental. Prefer `osb diagnostics logs/events` for stable API-backed log and event collection.

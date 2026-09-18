@@ -45,27 +45,24 @@ func TestActivityEndpointDoesNotUpdateActivity(t *testing.T) {
 	}
 }
 
-func TestNewRouterRequiresActivityTracker(t *testing.T) {
-	_, err := NewRouter("", nil, controller.DefaultActivityConfig())
-	if err == nil {
-		t.Fatal("expected missing activity tracker error")
+func TestNewRouterDefaultsActivityTracker(t *testing.T) {
+	if router := NewRouter("", nil, controller.DefaultActivityConfig()); router == nil {
+		t.Fatal("expected router")
 	}
 }
 
 func TestNewRouterRejectsInvalidActivityConfig(t *testing.T) {
-	_, err := NewRouter("", activity.NewTracker(), controller.ActivityConfig{})
-	if err == nil {
-		t.Fatal("expected invalid activity config error")
-	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected invalid activity config panic")
+		}
+	}()
+	NewRouter("", activity.NewTracker(), controller.ActivityConfig{})
 }
 
 func mustNewRouter(t *testing.T, tracker *activity.Tracker, config controller.ActivityConfig) http.Handler {
 	t.Helper()
-	router, err := NewRouter("", tracker, config)
-	if err != nil {
-		t.Fatalf("create router: %v", err)
-	}
-	return router
+	return NewRouter("", tracker, config)
 }
 
 func getActivity(t *testing.T, handler http.Handler) model.ActivityResponse {

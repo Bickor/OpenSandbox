@@ -254,7 +254,7 @@ func (r *IsolatedRunner) RunInIsolatedSessionBackground(
 	}
 
 	go r.watchBackgroundRun(s, run)
-	log.Info("started background run %s in session %s", runID, id)
+	log.Info("isolated session: started background run %s (session=%s)", runID, id)
 	return runID, startedAt, nil
 }
 
@@ -436,6 +436,17 @@ func (r *IsolatedRunner) SeekIsolatedBackgroundOutput(
 		return nil, -1, fmt.Errorf("open background run log: %w", err)
 	}
 	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return nil, -1, fmt.Errorf("stat background run log: %w", err)
+	}
+	if cursor > info.Size() {
+		// Clamp a past-the-end cursor so callers polling at the tail get the
+		// real end offset back instead of an offset that later writes would
+		// silently skip.
+		cursor = info.Size()
+	}
 
 	if _, err := file.Seek(cursor, io.SeekStart); err != nil {
 		return nil, -1, fmt.Errorf("seek background run log: %w", err)

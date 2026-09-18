@@ -102,13 +102,46 @@ public class QuickStart {
 }
 ```
 
+## Strict Health Check
+
+`CodeInterpreter.builder().build()` blocks until the interpreter is strictly ready, then
+throws `SandboxReadyTimeoutException` if `readyTimeout` (default 30s, polled every 200ms)
+expires. An attempt is healthy only when both conditions pass:
+
+- execd answers `GET /ping` on the interpreter's own endpoint.
+- The interpreter runtime (Jupyter kernel gateway) is serving inside the sandbox,
+  verified by probing its listen port (`127.0.0.1:44771`, overridable via `JUPYTER_PORT`)
+  through the execd command API. The port probe cannot be satisfied by short-lived
+  `jupyter kernelspec` setup helpers, and only passes once the server accepts connections.
+
+The runtime check is required because execd serves `/ping` before the sandbox entrypoint
+launches Jupyter. The check applies regardless of the wrapped sandbox's readiness
+settings (`skipHealthCheck(true)`, pool acquire, resume).
+
+```java
+CodeInterpreter interpreter = CodeInterpreter.builder()
+    .fromSandbox(sandbox)
+    .readyTimeout(Duration.ofSeconds(60))               // optional
+    .healthCheckPollingInterval(Duration.ofMillis(200))  // optional
+    .skipHealthCheck(false)                              // pass true to opt out
+    .build();
+
+// Re-run the check on demand:
+assertTrue(interpreter.isHealthy());
+```
+
+::: tip
+`skipHealthCheck(true)` defers readiness to the caller (e.g. pool warmup that manages
+its own health checks); the interpreter may fail on first use.
+:::
+
 ## Runtime Configuration
 
 ### Docker Image
 
 The Code Interpreter SDK relies on a specialized environment. Ensure your sandbox provider has the `opensandbox/code-interpreter` image available.
 
-For detailed information about supported languages and versions, please refer to the [Environment Documentation](https://github.com/opensandbox-group/OpenSandbox/tree/main/sandboxes/code-interpreter).
+For detailed information about supported languages and versions, please refer to the [Environment Documentation](https://github.com/opensandbox-group/sandbox-images).
 
 ### Troubleshooting: `pip: command not found`
 

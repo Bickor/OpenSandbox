@@ -50,8 +50,9 @@ type policyUpdater interface {
 // nftApplier: static allow/deny sets plus dynamic DNS-learned entries; teardown on shutdown.
 type nftApplier interface {
 	ApplyStatic(context.Context, *policy.NetworkPolicy) error
-	AddResolvedIPs(context.Context, []nftables.ResolvedIP) error
+	AddResolvedDomain(context.Context, string, []nftables.ResolvedIP) error
 	StartConnectionRefresh(context.Context)
+	StartDomainRefresh(context.Context, func(context.Context, string) ([]nftables.ResolvedIP, error))
 	RemoveEnforcement(context.Context) error
 }
 
@@ -86,11 +87,7 @@ func startPolicyServer(
 		stopAlwaysReload: make(chan struct{}),
 		mitmGate:         mitmGate,
 	}
-	sourceRegistry := credentialvault.NewSourceRegistry()
-	if err := credentialvault.RegisterExecCredentialProviders(sourceRegistry, credentialvault.DefaultCredentialProviderDir, os.Getenv(constants.EnvCredentialProviderConfig)); err != nil {
-		return nil, fmt.Errorf("credential provider registration: %w", err)
-	}
-	handler.credentialVault = credentialvault.NewStoreWithRegistry(mitmGate, func() bool { return strings.TrimSpace(token) != "" }, sourceRegistry)
+	handler.credentialVault = credentialvault.NewStore(mitmGate, func() bool { return strings.TrimSpace(token) != "" })
 	handler.credentialVaultRequireTLS = constants.IsTruthy(os.Getenv(constants.EnvCredentialVaultRequireTLS))
 	handler.setAlwaysRules(alwaysDeny, alwaysAllow)
 
@@ -115,11 +112,11 @@ func startPolicyServer(
 		if err != nil {
 			return nil, fmt.Errorf("lookup credential proxy user %q: %w", mitmproxy.RunAsUser, err)
 		}
-		activeSrv, cleanupActiveSocket, err = credentialvault.StartActiveSocketServer(
+		activeSrv, cleanupActiveSocket, err = credentialvault.StartActiveSocketServerRequestAware(
 			handler.handleCredentialVaultActive,
-			handler.handleCredentialVaultResolve,
 			socketPath,
 			int(mitmGID),
+			handler.handleCredentialVaultResolve,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("credential vault active socket: %w", err)
@@ -244,7 +241,7 @@ func (s *policyServer) handleCredentialVault(w http.ResponseWriter, r *http.Requ
 func (s *policyServer) handleCredentialVaultSubresource(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/credential-vault/")
 	switch {
-	case path == "_active" || path == "_resolve":
+	case path == "_active":
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", "GET")
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -413,12 +410,7 @@ func (s *policyServer) handleCredentialVaultBinding(w http.ResponseWriter, name 
 }
 
 func (s *policyServer) handleCredentialVaultActive(w http.ResponseWriter, r *http.Request) {
-	snapshot, err := s.credentialVault.ActiveSnapshotWithContext(r.Context())
-	if err != nil {
-		credentialvault.WriteError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, snapshot)
+	handleActiveVaultSnapshot(w, r, s.credentialVault)
 }
 
 func (s *policyServer) handleCredentialVaultResolve(w http.ResponseWriter, r *http.Request) {
@@ -738,6 +730,8 @@ func (s *policyServer) reloadAlwaysRules() (bool, error) {
 	if !changed {
 		return false, nil
 	}
+	allow = withTelemetryAllow(allow)
+	s.setAlwaysRules(deny, allow)
 	s.proxy.UpdateAlwaysRules(deny, allow)
 	return true, nil
 }
