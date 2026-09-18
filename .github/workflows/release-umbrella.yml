@@ -17,6 +17,11 @@ name: Umbrella Release
 # are not published — they ship in-repo at the release tag. The legacy
 # tag-triggered publish-* workflows have been deleted; the umbrella is
 # the only release path.
+#
+# Re-runs are idempotent: release tags are treated as immutable. Images,
+# packages, git tags, and the GitHub Release that already exist for the
+# target version are detected and skipped with a ::warning:: annotation
+# instead of being rebuilt, re-published, or overwritten.
 
 permissions:
   contents: write
@@ -79,8 +84,11 @@ jobs:
           echo "release_branch=$branch" >> "$GITHUB_OUTPUT"
           echo "resolved: version=$version channel=$channel branch=$branch"
 
+  # the approval gate must not trigger once the scan already failed; the
+  # scan is skipped on scheduled dry-runs, which must still reach preflight
   preflight:
-    needs: resolve
+    needs: [resolve, scan]
+    if: ${{ !cancelled() && (needs.scan.result == 'success' || needs.scan.result == 'skipped') }}
     uses: ./.github/workflows/release-preflight.yml
     with:
       require_approval: ${{ !inputs.dry_run }}
@@ -104,6 +112,8 @@ jobs:
   build-images:
     name: Build and stage ${{ matrix.component }} image
     needs: [resolve, preflight, scan]
+    # tolerate the scheduled-run scan skip, but never run after a failure
+    if: ${{ !cancelled() && (needs.scan.result == 'success' || needs.scan.result == 'skipped') }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -160,7 +170,42 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Install crane
+        if: inputs.dry_run == false
+        uses: imjasonh/setup-crane@v0.3
+
+      # idempotent re-runs: if the component is already released to every
+      # target registry, skip the build and reuse the existing digest (the
+      # staged digest is not needed because promote will skip it too).
+      # Skipped on dry runs so weekly rehearsals always rehearse the build.
+      - name: Check if release images already exist
+        id: already_released
+        if: inputs.dry_run == false
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          COMPONENT: ${{ matrix.component }}
+        run: |
+          set -euo pipefail
+          registries=(
+            "docker.io/opensandbox"
+            "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/opensandbox"
+            "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox"
+          )
+          missing=0
+          for reg in "${registries[@]}"; do
+            if crane manifest "${reg}/${COMPONENT}:release-${VERSION}" >/dev/null 2>&1; then
+              echo "found ${reg}/${COMPONENT}:release-${VERSION}"
+            else
+              missing=1
+            fi
+          done
+          if [[ "$missing" -eq 0 ]]; then
+            echo "::warning::${COMPONENT}:release-${VERSION} already exists in all target registries — skipping build"
+          fi
+          echo "released=$([[ "$missing" -eq 0 ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
       - name: Free disk space
+        if: steps.already_released.outputs.released != 'true'
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache
           sudo apt-get clean
@@ -168,6 +213,7 @@ jobs:
 
       - name: Build and push staging image
         id: build
+        if: steps.already_released.outputs.released != 'true'
         env:
           COMPONENT: ${{ matrix.component }}
           STAGING_TAG: staging-${{ github.sha }}-${{ github.run_id }}
@@ -194,10 +240,21 @@ jobs:
           echo "staging_tag=$STAGING_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Record digest in manifest
+        if: steps.already_released.outputs.released != 'true'
         run: |
           printf '{"%s": "%s"}\n' \
             "${{ matrix.component }}" \
             "${{ steps.build.outputs.digest }}" > "digest-${{ matrix.component }}.json"
+
+      - name: Record existing release digest
+        if: steps.already_released.outputs.released == 'true'
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          COMPONENT: ${{ matrix.component }}
+        run: |
+          set -euo pipefail
+          digest="$(crane digest "docker.io/opensandbox/${COMPONENT}:release-${VERSION}")"
+          printf '{"%s": "%s"}\n' "$COMPONENT" "$digest" > "digest-${COMPONENT}.json"
 
       - name: Upload digest manifest
         uses: actions/upload-artifact@v4
@@ -209,6 +266,7 @@ jobs:
   build-fast-sandbox:
     name: Build and stage fast-sandbox images
     needs: [resolve, preflight, scan]
+    if: ${{ !cancelled() && (needs.scan.result == 'success' || needs.scan.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -237,7 +295,42 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_PASSWORD }}
 
+      - name: Install crane
+        if: inputs.dry_run == false
+        uses: imjasonh/setup-crane@v0.3
+
+      # idempotent re-runs, same rule as build-images: only skip when every
+      # fast-sandbox image is already released to every target registry
+      - name: Check if release images already exist
+        id: already_released
+        if: inputs.dry_run == false
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          images=(fsb-controller fsb-fastlet fsb-fastlet-proxy fsb-janitor fsb-firecracker-runtime fsb-sandboxtemplate-builder)
+          registries=(
+            "docker.io/opensandbox"
+            "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/opensandbox"
+            "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox"
+          )
+          missing=0
+          for img in "${images[@]}"; do
+            for reg in "${registries[@]}"; do
+              if crane manifest "${reg}/${img}:release-${VERSION}" >/dev/null 2>&1; then
+                echo "found ${reg}/${img}:release-${VERSION}"
+              else
+                missing=1
+              fi
+            done
+          done
+          if [[ "$missing" -eq 0 ]]; then
+            echo "::warning::all fast-sandbox release-${VERSION} images already exist in all target registries — skipping build"
+          fi
+          echo "released=$([[ "$missing" -eq 0 ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
       - name: Build and push staging images
+        if: steps.already_released.outputs.released != 'true'
         env:
           STAGING_TAG: staging-${{ github.sha }}-${{ github.run_id }}
         run: |
@@ -249,12 +342,26 @@ jobs:
           TAG="$STAGING_TAG" ./manifests/release/build-fast-sandbox.sh --push
 
       - name: Record digests in manifest
+        if: steps.already_released.outputs.released != 'true'
         env:
           STAGING_TAG: staging-${{ github.sha }}-${{ github.run_id }}
         run: |
           jq -n '{}' > digest-fast-sandbox.json
           for img in fsb-controller fsb-fastlet fsb-fastlet-proxy fsb-janitor fsb-firecracker-runtime fsb-sandboxtemplate-builder; do
             d="$(docker buildx imagetools inspect "docker.io/opensandbox/${img}:${STAGING_TAG}" --format '{{.Manifest.Digest}}')"
+            jq --arg k "${img}" --arg v "${d}" '. + {($k): $v}' digest-fast-sandbox.json > tmp.json && mv tmp.json digest-fast-sandbox.json
+          done
+          cat digest-fast-sandbox.json
+
+      - name: Record existing release digests
+        if: steps.already_released.outputs.released == 'true'
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          jq -n '{}' > digest-fast-sandbox.json
+          for img in fsb-controller fsb-fastlet fsb-fastlet-proxy fsb-janitor fsb-firecracker-runtime fsb-sandboxtemplate-builder; do
+            d="$(crane digest "docker.io/opensandbox/${img}:release-${VERSION}")"
             jq --arg k "${img}" --arg v "${d}" '. + {($k): $v}' digest-fast-sandbox.json > tmp.json && mv tmp.json digest-fast-sandbox.json
           done
           cat digest-fast-sandbox.json
@@ -269,6 +376,7 @@ jobs:
   packages:
     name: SDK / CLI / server packages (hold${{ inputs.dry_run == false && vars.UMBRELLA_PUBLISH_ENABLED == 'true' && ' + publish' || '' }})
     needs: [resolve, preflight, scan]
+    if: ${{ !cancelled() && (needs.scan.result == 'success' || needs.scan.result == 'skipped') }}
     # the called workflow's publish leg attests held bytes — grant it
     # id-token/attestations here or the workflow fails validation
     permissions:
@@ -459,6 +567,11 @@ jobs:
           )
           for comp in "${components[@]}"; do
             for reg in "${registries[@]}"; do
+              # release tags are immutable: never re-tag over an existing one
+              if crane manifest "${reg}/${comp}:release-${VERSION}" >/dev/null 2>&1; then
+                echo "::warning::${reg}/${comp}:release-${VERSION} already exists — skipping promotion"
+                continue
+              fi
               crane tag "${reg}/${comp}:${STAGING_TAG}" "release-${VERSION}"
               echo "promoted ${reg}/${comp}:${STAGING_TAG} -> release-${VERSION}"
             done
@@ -467,6 +580,10 @@ jobs:
           fs_images=(fsb-controller fsb-fastlet fsb-fastlet-proxy fsb-janitor fsb-firecracker-runtime fsb-sandboxtemplate-builder)
           for img in "${fs_images[@]}"; do
             for reg in "${registries[@]}"; do
+              if crane manifest "${reg}/${img}:release-${VERSION}" >/dev/null 2>&1; then
+                echo "::warning::${reg}/${img}:release-${VERSION} already exists — skipping promotion"
+                continue
+              fi
               crane tag "${reg}/${img}:${STAGING_TAG}" "release-${VERSION}"
               echo "promoted ${reg}/${img}:${STAGING_TAG} -> release-${VERSION}"
             done
@@ -494,13 +611,28 @@ jobs:
           set -euo pipefail
           git config user.name "opensandbox-release-bot"
           git config user.email "opensandbox-release-bot@users.noreply.github.com"
-          git tag -a "release-${VERSION}" -m "release: OpenSandbox ${VERSION}" -m "Umbrella release built from ${GITHUB_SHA}."
+          # idempotent re-runs: only mint and push tags that are missing on
+          # origin; a locally-created tag from an earlier failed push is
+          # reused instead of re-created
+          new_tags=()
+          if git ls-remote --exit-code origin "refs/tags/release-${VERSION}" >/dev/null 2>&1; then
+            echo "::warning::tag release-${VERSION} already exists on origin — skipping"
+          else
+            git tag -a "release-${VERSION}" -m "release: OpenSandbox ${VERSION}" -m "Umbrella release built from ${GITHUB_SHA}." || true
+            new_tags+=("release-${VERSION}")
+          fi
           # rc releases ship no SDK artifacts, so no companion tag either
           if [ "$CHANNEL" = "stable" ]; then
-            git tag -a "sdks/sandbox/go/v${VERSION}" -m "release: OpenSandbox Go SDK ${VERSION}" -m "Companion tag for the umbrella release-${VERSION} (same commit)."
-            git push origin "release-${VERSION}" "sdks/sandbox/go/v${VERSION}"
-          else
-            git push origin "release-${VERSION}"
+            go_tag="sdks/sandbox/go/v${VERSION}"
+            if git ls-remote --exit-code origin "refs/tags/${go_tag}" >/dev/null 2>&1; then
+              echo "::warning::tag ${go_tag} already exists on origin — skipping"
+            else
+              git tag -a "$go_tag" -m "release: OpenSandbox Go SDK ${VERSION}" -m "Companion tag for the umbrella release-${VERSION} (same commit)." || true
+              new_tags+=("$go_tag")
+            fi
+          fi
+          if [ "${#new_tags[@]}" -gt 0 ]; then
+            git push origin "${new_tags[@]}"
           fi
 
       - name: Create GitHub Release
@@ -509,6 +641,10 @@ jobs:
           VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           set -euo pipefail
+          if gh release view "release-${VERSION}" >/dev/null 2>&1; then
+            echo "::warning::GitHub Release release-${VERSION} already exists — skipping"
+            exit 0
+          fi
           PRERELEASE=""
           [ "${{ needs.resolve.outputs.channel }}" = "rc" ] && PRERELEASE="--prerelease"
           gh release create "release-${VERSION}" \
