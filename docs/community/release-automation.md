@@ -67,7 +67,7 @@ environment. The workflow then runs:
 | preflight | commit reachability + notes presence (`docs/releases/<version>.md`) |
 | scan | version-consistency scan (release-blocking) |
 | build | 13 images pushed to staging tags; all packages built and held |
-| BOM | digests pinned into `docs/releases/<version>.yaml`, committed as `C_bom` |
+| BOM | digests pinned into `docs/releases/<version>.yaml`, pushed to a `release/<version>` branch; the workflow opens a PR to the release branch, a code owner approves it (required by the `main` ruleset), and the workflow merges it (`C_bom`) |
 | publish | images promoted `staging → release-X.Y.Z` (same digest); packages published in verify-then-continue order (PyPI → npm → NuGet → Maven Central last) |
 | tag | `release-X.Y.Z` + `sdks/sandbox/go/vX.Y.Z` minted on `C_bom`, GitHub Release created with the notes and BOM |
 
@@ -79,12 +79,17 @@ between release windows.
 
 `dry_run=true` exercises everything except publishing: images are built
 **locally** (single-arch, `--load` — no registry push, no credentials
-needed), packages are built and held as workflow artifacts, the BOM is
-committed to the release branch with local image IDs standing in for
-registry digests, and no git tags are minted. To rehearse a release in
-a fork, prepare the release branch (bump + notes) and dispatch the
-workflow with `dry_run=true` — the `UMBRELLA_PUBLISH_ENABLED` variable
-does not need to exist there.
+needed), packages are built and held as workflow artifacts, the BOM
+lands on the release branch through the BOM PR (one code-owner
+approval, as on any change to a protected branch) with local image
+IDs standing in for registry digests, and no git tags are minted. To
+rehearse a release in a fork, prepare the release branch (bump + notes)
+and dispatch the workflow with `dry_run=true` — the
+`UMBRELLA_PUBLISH_ENABLED` variable does not need to exist there. The
+fork must enable **Allow GitHub Actions to create and approve pull
+requests** (Settings → Actions → General → Workflow permissions);
+`pull-requests: write` in the workflow alone cannot override that
+setting being off.
 
 ## Release Artifacts
 
