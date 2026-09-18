@@ -75,6 +75,36 @@ test("warmup admission uses fixed one-second QPS batches and does not wait for c
   }
 });
 
+test("warmup create concurrency uses Kotlin-compatible 1.5x QPS headroom", async () => {
+  const createGate = deferred();
+  let started = 0;
+  let active = 0;
+  let maxActive = 0;
+  const pool = SandboxPool.create(poolOptions({
+    maxIdle: 20,
+    warmupCreateQps: 10,
+    sandboxCreator: async () => {
+      started += 1;
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await createGate.promise;
+      active -= 1;
+      return fakeSandbox(`create-${started}`);
+    },
+  }));
+
+  try {
+    await pool.start();
+    await eventually(() => started === 15, 1_500);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(maxActive, 15);
+    assert.equal(started, 15);
+  } finally {
+    createGate.resolve();
+    await pool.shutdown(false);
+  }
+});
+
 test("warmupConcurrency bounds post-create stages", async () => {
   const healthGate = deferred();
   let nextId = 0;
@@ -104,6 +134,35 @@ test("warmupConcurrency bounds post-create stages", async () => {
     assert.equal(maxActive, 2);
   } finally {
     healthGate.resolve();
+    await pool.shutdown(false);
+  }
+});
+
+test("warmupConcurrency permit is released between readiness polling attempts", async () => {
+  let nextId = 0;
+  const attempts = new Map();
+  const checkOrder = [];
+  const pool = SandboxPool.create(poolOptions({
+    maxIdle: 2,
+    warmupCreateQps: 2,
+    warmupConcurrency: 1,
+    warmupSkipHealthCheck: false,
+    warmupHealthCheckPollingIntervalMillis: 100,
+    sandboxCreator: async () => fakeSandbox(`polling-${++nextId}`),
+    warmupHealthCheck: async (sandbox) => {
+      checkOrder.push(sandbox.id);
+      const attempt = (attempts.get(sandbox.id) ?? 0) + 1;
+      attempts.set(sandbox.id, attempt);
+      return attempt >= 2;
+    },
+  }));
+
+  try {
+    await pool.start();
+    await eventually(() => checkOrder.length >= 2);
+    assert.notEqual(checkOrder[0], checkOrder[1]);
+    await eventually(async () => (await pool.snapshot()).idleCount === 2);
+  } finally {
     await pool.shutdown(false);
   }
 });

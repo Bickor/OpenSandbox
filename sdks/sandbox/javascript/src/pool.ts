@@ -21,7 +21,7 @@ import {
   PoolStateStoreUnavailableException,
   SandboxReadyTimeoutException,
 } from "./core/exceptions.js";
-import { ReadinessBudget } from "./internal/readiness.js";
+import { ReadinessBudget, subscribeAbort } from "./internal/readiness.js";
 import { PoolTracer, POOL_WARMUP_SPANS } from "./internal/poolTracing.js";
 import { InMemoryPoolStateStore } from "./poolStore.js";
 import {
@@ -45,6 +45,7 @@ import { SandboxManager } from "./manager.js";
 const DEFAULT_IDLE_TIMEOUT_SECONDS = 24 * 60 * 60;
 const DEFAULT_READY_TIMEOUT_SECONDS = 30;
 const DEFAULT_POLLING_INTERVAL_MILLIS = 200;
+const CREATE_CONCURRENCY_HEADROOM = 1.5;
 
 interface ResolvedPoolOptions {
   poolName: string;
@@ -77,9 +78,23 @@ interface ResolvedPoolOptions {
   logger?: SandboxPoolOptions["logger"];
 }
 
+interface AsyncSemaphoreWaiter {
+  readonly ready: () => void;
+  readonly reject: (reason?: unknown) => void;
+  readonly signal?: AbortSignal;
+}
+
+interface AsyncSemaphoreLease {
+  release?: () => void;
+}
+
 class AsyncSemaphore {
   private active = 0;
-  private readonly waiters: (() => void)[] = [];
+  private readonly waiters: AsyncSemaphoreWaiter[] = [];
+  private readonly abortGroups = new Map<AbortSignal, {
+    readonly waiters: Set<AsyncSemaphoreWaiter>;
+    readonly onAbort: () => void;
+  }>();
 
   constructor(private readonly limit: number) {}
 
@@ -90,25 +105,54 @@ class AsyncSemaphore {
       return () => this.release();
     }
     await new Promise<void>((resolve, reject) => {
-      const onAbort = () => {
-        const index = this.waiters.indexOf(onReady);
-        if (index >= 0) this.waiters.splice(index, 1);
-        reject(signal?.reason);
+      const waiter = {
+        ready: () => {
+          this.detachWaiter(waiter);
+          this.active += 1;
+          resolve();
+        },
+        reject,
+        signal,
       };
-      const onReady = () => {
-        signal?.removeEventListener("abort", onAbort);
-        this.active += 1;
-        resolve();
-      };
-      this.waiters.push(onReady);
-      signal?.addEventListener("abort", onAbort, { once: true });
+      this.waiters.push(waiter);
+      if (signal) {
+        let group = this.abortGroups.get(signal);
+        if (!group) {
+          const waiters = new Set<AsyncSemaphoreWaiter>();
+          const onAbort = () => {
+            for (const abortedWaiter of waiters) {
+              const index = this.waiters.indexOf(abortedWaiter);
+              if (index >= 0) this.waiters.splice(index, 1);
+              abortedWaiter.reject(signal.reason);
+            }
+            waiters.clear();
+            this.abortGroups.delete(signal);
+          };
+          group = { waiters, onAbort };
+          this.abortGroups.set(signal, group);
+          signal.addEventListener("abort", onAbort, { once: true });
+        }
+        group.waiters.add(waiter);
+      }
     });
     return () => this.release();
   }
 
+  private detachWaiter(waiter: AsyncSemaphoreWaiter): void {
+    const signal = waiter.signal;
+    if (!signal) return;
+    const group = this.abortGroups.get(signal);
+    if (!group) return;
+    group.waiters.delete(waiter);
+    if (group.waiters.size === 0) {
+      signal.removeEventListener("abort", group.onAbort);
+      this.abortGroups.delete(signal);
+    }
+  }
+
   private release(): void {
     this.active -= 1;
-    this.waiters.shift()?.();
+    this.waiters.shift()?.ready();
   }
 }
 
@@ -193,6 +237,7 @@ export class SandboxPool {
   private leaderEpoch = 0;
   private primaryOwned = false;
   private readonly warmupTasks = new Map<Promise<void>, number>();
+  private createSemaphore: AsyncSemaphore;
   private postCreateSemaphore: AsyncSemaphore;
   private readonly tracer: PoolTracer;
 
@@ -289,6 +334,7 @@ export class SandboxPool {
       warmupSkipHealthCheck: options.warmupSkipHealthCheck ?? false,
       logger: options.logger,
     };
+    this.createSemaphore = new AsyncSemaphore(Math.ceil(this.options.warmupCreateQps * CREATE_CONCURRENCY_HEADROOM));
     this.postCreateSemaphore = new AsyncSemaphore(warmupConcurrency);
     this.tracer = PoolTracer.from(this.options.connectionConfig);
   }
@@ -340,6 +386,9 @@ export class SandboxPool {
 
     this.abortController = new AbortController();
     this.runGeneration += 1;
+    this.createSemaphore = new AsyncSemaphore(
+      Math.ceil(this.options.warmupCreateQps * CREATE_CONCURRENCY_HEADROOM),
+    );
     this.postCreateSemaphore = new AsyncSemaphore(this.options.warmupConcurrency);
     try {
       this.manager ??= this.createManager();
@@ -665,6 +714,11 @@ export class SandboxPool {
     const signal = this.abortController?.signal;
     const postCreateSemaphore = this.postCreateSemaphore;
     for (let index = 0; index < createCount; index += 1) {
+      const taskAbortController = new AbortController();
+      const unsubscribeAbort = subscribeAbort(
+        signal,
+        () => taskAbortController.abort(signal?.reason),
+      );
       const task = this.tracer.runWarmup(
         {
           "pool.name": poolName,
@@ -672,14 +726,22 @@ export class SandboxPool {
           "pool.run.generation": generation,
           "pool.leader.epoch": this.leaderEpoch,
         },
-        () => this.createIdleSandbox(generation, leaderEpoch, postCreateSemaphore, signal),
+        () => this.createIdleSandbox(
+          generation,
+          leaderEpoch,
+          postCreateSemaphore,
+          taskAbortController.signal,
+        ),
       )
         .then(() => this.recordSuccess())
         .catch((error: unknown) => {
           this.recordFailure(error);
           this.options.logger?.warn?.("pool warmup sandbox creation failed", { poolName, error });
         })
-        .finally(() => this.warmupTasks.delete(task));
+        .finally(() => {
+          unsubscribeAbort();
+          this.warmupTasks.delete(task);
+        });
       this.warmupTasks.set(task, generation);
     }
   }
@@ -694,9 +756,14 @@ export class SandboxPool {
     let sandbox: Sandbox | undefined;
     let committed = false;
     try {
-      sandbox = await this.tracer.runPhase(POOL_WARMUP_SPANS.create, async () =>
-        await this.createSandbox(PooledSandboxCreateReason.WARMUP, signal, true),
-      );
+      const releaseCreate = await this.createSemaphore.acquire(signal);
+      try {
+        sandbox = await this.tracer.runPhase(POOL_WARMUP_SPANS.create, async () =>
+          await this.createSandbox(PooledSandboxCreateReason.WARMUP, signal, true),
+        );
+      } finally {
+        releaseCreate();
+      }
       const warmupReadinessDeadline = performance.now() + this.options.warmupReadyTimeoutSeconds * 1_000;
       if (!this.options.warmupSkipHealthCheck && this.options.warmupHealthCheckInitialDelayMillis > 0) {
         await sleep(
@@ -707,16 +774,20 @@ export class SandboxPool {
           signal,
         );
       }
-      const release = await postCreateSemaphore.acquire(signal);
+      const lease: AsyncSemaphoreLease = {};
       try {
         if (!this.options.warmupSkipHealthCheck) {
           await this.tracer.runPhase(POOL_WARMUP_SPANS.readiness, async () =>
             await this.waitUntilWarmupHealthy(
               sandbox!,
               warmupReadinessDeadline,
+              postCreateSemaphore,
+              lease,
               signal,
             ),
           );
+        } else {
+          lease.release = await postCreateSemaphore.acquire(signal);
         }
         if (this.options.warmupSandboxPreparer) {
           await this.tracer.runPhase(POOL_WARMUP_SPANS.prepare, async () =>
@@ -728,11 +799,13 @@ export class SandboxPool {
         }
         if (this.options.warmupPostPrepareHealthCheck) {
           await this.tracer.runPhase(POOL_WARMUP_SPANS.postPrepareReadiness, async () =>
-            await this.waitUntilHealthy(
+            await this.waitUntilHealthyWithSemaphore(
               sandbox!,
-              this.options.warmupPostPrepareHealthCheck,
+              this.options.warmupPostPrepareHealthCheck!,
               this.options.warmupPostPrepareHealthCheckTimeoutSeconds,
               this.options.warmupHealthCheckPollingIntervalMillis,
+              postCreateSemaphore,
+              lease,
               signal,
             ),
           );
@@ -740,36 +813,37 @@ export class SandboxPool {
         await this.tracer.runPhase(POOL_WARMUP_SPANS.renew, async () =>
           await sandbox!.renew(this.options.idleTimeoutSeconds),
         );
-      } finally {
-        release();
-      }
-      const didCommit = await this.tracer.runPhase(POOL_WARMUP_SPANS.commit, async () => {
-        const stillPrimary = await this.options.stateStore.renewPrimaryLock(
-          this.options.poolName,
-          this.options.ownerId,
-          this.options.primaryLockTtlSeconds,
-        );
-        const mayCommit =
-          generation === this.runGeneration &&
-          leaderEpoch === this.leaderEpoch &&
-          this.primaryOwned &&
-          (this.lifecycleState === PoolLifecycleState.RUNNING ||
-            (this.lifecycleState === PoolLifecycleState.DRAINING && this.allowWarmupCommitWhileDraining));
-        if (!stillPrimary || !mayCommit) return false;
-        await this.options.stateStore.putIdle(this.options.poolName, String(sandbox!.id));
-        return true;
-      });
-      if (!didCommit) {
-        await this.killAndClose(sandbox);
-        return;
-      }
-      committed = true;
-      await sandbox.close().catch((error: unknown) => {
-        this.options.logger?.warn?.("failed to close pooled sandbox client", {
-          sandboxId: String(sandbox!.id),
-          error,
+        const didCommit = await this.tracer.runPhase(POOL_WARMUP_SPANS.commit, async () => {
+          const stillPrimary = await this.options.stateStore.renewPrimaryLock(
+            this.options.poolName,
+            this.options.ownerId,
+            this.options.primaryLockTtlSeconds,
+          );
+          const mayCommit =
+            generation === this.runGeneration &&
+            leaderEpoch === this.leaderEpoch &&
+            this.primaryOwned &&
+            (this.lifecycleState === PoolLifecycleState.RUNNING ||
+              (this.lifecycleState === PoolLifecycleState.DRAINING && this.allowWarmupCommitWhileDraining));
+          if (!stillPrimary || !mayCommit) return false;
+          await this.options.stateStore.putIdle(this.options.poolName, String(sandbox!.id));
+          return true;
         });
-      });
+        if (!didCommit) {
+          await this.killAndClose(sandbox);
+          return;
+        }
+        committed = true;
+        await sandbox.close().catch((error: unknown) => {
+          this.options.logger?.warn?.("failed to close pooled sandbox client", {
+            sandboxId: String(sandbox!.id),
+            error,
+          });
+        });
+      } finally {
+        lease.release?.();
+        lease.release = undefined;
+      }
     } catch (cause) {
       if (sandbox && !committed) await this.killAndClose(sandbox);
       throw cause;
@@ -854,30 +928,64 @@ export class SandboxPool {
     }
   }
 
+  private async waitUntilHealthyWithSemaphore(
+    sandbox: Sandbox,
+    healthCheck: PoolHealthCheck,
+    timeoutSeconds: number,
+    pollingIntervalMillis: number,
+    semaphore: AsyncSemaphore,
+    lease: AsyncSemaphoreLease,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const budget = new ReadinessBudget(timeoutSeconds, signal);
+    budget.healthContext(`domain=${this.options.connectionConfig.domain}, useServerProxy=${this.options.connectionConfig.useServerProxy}`);
+    while (true) {
+      let healthy = false;
+      try {
+        lease.release ??= await semaphore.acquire(signal);
+        budget.attempt();
+        healthy = await budget.run(async () => await healthCheck(sandbox));
+        if (healthy) return;
+        budget.record("Health check returned false continuously.");
+      } catch (error) {
+        budget.remaining();
+        budget.record(error);
+      } finally {
+        if (!healthy) {
+          lease.release?.();
+          lease.release = undefined;
+        }
+      }
+      await budget.pause(pollingIntervalMillis);
+    }
+  }
+
   private async waitUntilWarmupHealthy(
     sandbox: Sandbox,
     deadline: number,
+    semaphore: AsyncSemaphore,
+    lease: AsyncSemaphoreLease,
     signal?: AbortSignal,
   ): Promise<void> {
     const remainingMillis = deadline - performance.now();
     if (remainingMillis > 0) {
-      await this.waitUntilHealthy(
+      await this.waitUntilHealthyWithSemaphore(
         sandbox,
-        this.options.warmupHealthCheck,
+        this.options.warmupHealthCheck ?? ((current) => current.isHealthy()),
         remainingMillis / 1_000,
         this.options.warmupHealthCheckPollingIntervalMillis,
+        semaphore,
+        lease,
         signal,
       );
       return;
     }
 
     signal?.throwIfAborted();
-    const healthy = await runAbortable(
-      () => this.options.warmupHealthCheck
-        ? this.options.warmupHealthCheck(sandbox)
-        : sandbox.isHealthy(),
-      signal,
-    );
+    lease.release ??= await semaphore.acquire(signal);
+    const healthy = await runAbortable(() => this.options.warmupHealthCheck
+      ? this.options.warmupHealthCheck(sandbox)
+      : sandbox.isHealthy(), signal);
     if (!healthy) {
       throw new SandboxReadyTimeoutException({
         message: `Sandbox warmup readiness timed out after ${this.options.warmupReadyTimeoutSeconds}s`,

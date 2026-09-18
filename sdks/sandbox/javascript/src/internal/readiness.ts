@@ -18,6 +18,43 @@ import {
   SandboxReadyTimeoutException,
 } from "../core/exceptions.js";
 
+interface AbortSubscriptionGroup {
+  readonly listeners: Set<() => void>;
+  readonly dispatch: () => void;
+}
+
+const abortSubscriptionGroups = new WeakMap<AbortSignal, AbortSubscriptionGroup>();
+
+export function subscribeAbort(signal: AbortSignal | undefined, listener: () => void): () => void {
+  if (!signal) return () => undefined;
+  if (signal.aborted) {
+    listener();
+    return () => undefined;
+  }
+  let group = abortSubscriptionGroups.get(signal);
+  if (!group) {
+    const listeners = new Set<() => void>();
+    const dispatch = () => {
+      abortSubscriptionGroups.delete(signal);
+      for (const current of [...listeners]) current();
+      listeners.clear();
+    };
+    group = { listeners, dispatch };
+    abortSubscriptionGroups.set(signal, group);
+    signal.addEventListener("abort", dispatch, { once: true });
+  }
+  group.listeners.add(listener);
+  return () => {
+    const current = abortSubscriptionGroups.get(signal);
+    if (!current) return;
+    current.listeners.delete(listener);
+    if (current.listeners.size === 0) {
+      signal.removeEventListener("abort", current.dispatch);
+      abortSubscriptionGroups.delete(signal);
+    }
+  };
+}
+
 export function validatePollingInterval(interval: number): void {
   // setTimeout() runs a negative delay immediately, which would hammer the
   // endpoint until the deadline. The Python SDK rejects the same values.
@@ -67,7 +104,7 @@ export class ReadinessBudget {
     const remaining = this.remaining();
     const controller = new AbortController();
     const onAbort = () => controller.abort(this.caller?.reason);
-    this.caller?.addEventListener("abort", onAbort, { once: true });
+    const unsubscribeCaller = subscribeAbort(this.caller, onAbort);
     const timer = setTimeout(() => {
       this.timedOut = true;
       controller.abort(this.timeout());
@@ -86,7 +123,7 @@ export class ReadinessBudget {
       throw error;
     } finally {
       clearTimeout(timer);
-      this.caller?.removeEventListener("abort", onAbort);
+      unsubscribeCaller();
       if (rejectAbort) controller.signal.removeEventListener("abort", rejectAbort);
     }
   }
@@ -94,9 +131,10 @@ export class ReadinessBudget {
   async pause(interval: number): Promise<void> {
     const duration = Math.min(interval, this.remaining());
     await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => { this.caller?.removeEventListener("abort", abort); resolve(); }, duration);
+      let unsubscribeCaller = () => undefined;
+      const timer = setTimeout(() => { unsubscribeCaller(); resolve(); }, duration);
       const abort = () => { clearTimeout(timer); reject(this.caller?.reason); };
-      this.caller?.addEventListener("abort", abort, { once: true });
+      unsubscribeCaller = subscribeAbort(this.caller, abort);
     });
     this.remaining();
   }
