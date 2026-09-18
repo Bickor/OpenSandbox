@@ -112,23 +112,23 @@ jobs:
             local version=""
             case "$component" in
               execd)
-                version="$(grep -m1 -oE 'execd:v[0-9][^"[:space:]]*' kubernetes/charts/opensandbox-server/values.yaml | cut -d: -f2)"
+                version="$(grep -m1 'execd_image[[:space:]]*=' manifests/charts/server/values.yaml | sed -E 's/.*:([^:"]+)".*/\1/')"
                 ;;
               egress)
-                version="$(grep -m1 -oE 'egress:v[0-9][^"[:space:]]*' kubernetes/charts/opensandbox-server/values.yaml | cut -d: -f2)"
+                version="$(grep -m1 'opensandbox/egress:' manifests/charts/server/values.yaml | sed -E 's/.*:([^:"]+)".*/\1/')"
                 ;;
               ingress)
-                version="$(awk '/^[[:space:]]+gateway:/{in_gateway=1} in_gateway && /^[[:space:]]+tag: /{gsub(/"/, "", $2); print $2; exit}' kubernetes/charts/opensandbox-server/values.yaml)"
+                version="$(awk '/^gateway:/{in_gateway=1} in_gateway && /^[[:space:]]+tag: /{gsub(/"/, "", $2); print $2; exit}' manifests/charts/ingress-gateway/values.yaml)"
                 ;;
               server)
-                version="$(awk '/^server:/{in_server=1} in_server && /^[[:space:]]+image:/{in_image=1; next} in_image && /^[[:space:]]+tag: /{gsub(/"/, "", $2); print $2; exit}' kubernetes/charts/opensandbox-server/values.yaml)"
+                version="$(awk '/^server:/{in_server=1} in_server && /^[[:space:]]+image:/{in_image=1; next} in_image && /^[[:space:]]+tag: /{gsub(/"/, "", $2); print $2; exit}' manifests/charts/server/values.yaml)"
                 ;;
               controller|task-executor)
-                version="$(awk -F'"' '/^appVersion:/{print $2; exit}' kubernetes/charts/opensandbox-controller/Chart.yaml)"
+                version="$(awk -F'"' '/^appVersion:/{print $2; exit}' manifests/charts/controller/Chart.yaml)"
                 version="v${version#v}"
                 ;;
               image-committer|image-committer-azure)
-                version="$(grep -m1 -oE 'image-committer:v[0-9][^"[:space:]]*' kubernetes/charts/opensandbox-controller/values.yaml | cut -d: -f2)"
+                version="$(grep -m1 'imageCommitterImage:' manifests/charts/controller/values.yaml | sed -E 's/.*:([^:"]+)".*/\1/')"
                 ;;
               *)
                 echo "unknown component: $component" >&2
