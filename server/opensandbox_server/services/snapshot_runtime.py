@@ -37,6 +37,14 @@ class SnapshotRuntimeStatus:
     # Backend marker persisted into restore_config on READY (e.g. "fsb") so
     # create-time routing can send restores to the owning backend.
     backend: Optional[str] = None
+    format: Optional[str] = None
+    source_node_name: Optional[str] = None
+    snapshot_name: Optional[str] = None
+    runtime_version: Optional[str] = None
+    runtime_class_name: Optional[str] = None
+    restore_plan_secret_name: Optional[str] = None
+    restore_plan_owner_name: Optional[str] = None
+    restore_plan_owner_uid: Optional[str] = None
 
 
 class SnapshotRuntimePreflightError(RuntimeError):
@@ -63,6 +71,7 @@ class SnapshotRuntime(Protocol):
         sandbox_id: str,
         *,
         namespace: str | None = None,
+        format: str | None = None,
     ) -> None:
         """Validate source-specific compatibility before persisting a snapshot."""
 
@@ -72,6 +81,7 @@ class SnapshotRuntime(Protocol):
         sandbox_id: str,
         *,
         namespace: str | None = None,
+        format: str | None = None,
     ) -> Optional[SnapshotRuntimeStatus]:
         """
         Create a snapshot for a sandbox and return the final runtime status.
@@ -126,6 +136,7 @@ class NoopSnapshotRuntime:
         sandbox_id: str,
         *,
         namespace: str | None = None,
+        format: str | None = None,
     ) -> None:
         raise SnapshotRuntimeUnsupportedError(
             self.create_snapshot_unsupported_message()
@@ -137,6 +148,7 @@ class NoopSnapshotRuntime:
         sandbox_id: str,
         *,
         namespace: str | None = None,
+        format: str | None = None,
     ) -> Optional[SnapshotRuntimeStatus]:
         raise NotImplementedError(self.create_snapshot_unsupported_message())
 

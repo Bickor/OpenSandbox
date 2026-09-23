@@ -55,6 +55,12 @@ public class SandboxCreateOptions
     public string? SnapshotId { get; set; }
 
     /// <summary>
+    /// Gets or sets whether to send a minimal full-state restore request.
+    /// Use for formats such as kata-vmstate-v1.
+    /// </summary>
+    public bool FullStateRestore { get; set; }
+
+    /// <summary>
     /// Gets or sets the entrypoint command for the sandbox.
     /// Defaults to ["tail", "-f", "/dev/null"].
     /// </summary>

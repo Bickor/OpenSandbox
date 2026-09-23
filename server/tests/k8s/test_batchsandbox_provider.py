@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
+import json
 import pytest
+from copy import deepcopy
 from types import SimpleNamespace
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
@@ -41,7 +44,11 @@ from opensandbox_server.services.constants import (
     OPENSANDBOX_RUNTIME_VOLUME_NAME,
     SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY,
 )
-from opensandbox_server.services.k8s.batchsandbox_provider import BatchSandboxProvider
+from opensandbox_server.services.k8s.batchsandbox_provider import (
+    BatchSandboxProvider,
+    KATA_RESTORE_RUNTIME_CLASS,
+    KATA_SNAPSHOT_ANNOTATION,
+)
 from opensandbox_server.services.k8s.workload_provider import EgressWorkloadSettings
 from opensandbox_server.services.constants import OPENSANDBOX_EGRESS_TOKEN
 from opensandbox_server.services.k8s.image_pull_secret_helper import IMAGE_AUTH_SECRET_PREFIX
@@ -50,6 +57,55 @@ from opensandbox_server.services.k8s.status_helpers import (
     _is_pool_capacity_exhausted_status,
 )
 from opensandbox_server.services.k8s.volume_helper import apply_volumes_to_pod_spec
+from opensandbox_server.services.snapshot_models import SnapshotRestoreConfig
+
+
+KATA_RESTORE_PLAN_OWNER_NAME = "osb-snap-kata"
+KATA_RESTORE_PLAN_OWNER_UID = "snapshot-uid"
+KATA_RESTORE_PLAN_SECRET_NAME = "kata-restore-plan"
+
+
+def _kata_restore_config() -> SnapshotRestoreConfig:
+    return SnapshotRestoreConfig(
+        format="kata-vmstate-v1",
+        restore_plan_secret_name=KATA_RESTORE_PLAN_SECRET_NAME,
+        restore_plan_owner_name=KATA_RESTORE_PLAN_OWNER_NAME,
+        restore_plan_owner_uid=KATA_RESTORE_PLAN_OWNER_UID,
+        source_node_name="node-a",
+        snapshot_name="kata-snapshot-a",
+        runtime_version="3.8.0",
+        runtime_class_name="kata-vm-isolation-v2",
+    )
+
+
+def _kata_restore_plan_secret(
+    pod_template: dict,
+    *,
+    owner_name: str = KATA_RESTORE_PLAN_OWNER_NAME,
+    owner_uid: str = KATA_RESTORE_PLAN_OWNER_UID,
+    immutable: bool = True,
+) -> dict:
+    return {
+        "metadata": {
+            "name": KATA_RESTORE_PLAN_SECRET_NAME,
+            "ownerReferences": [
+                {
+                    "apiVersion": "sandbox.opensandbox.io/v1alpha1",
+                    "kind": "SandboxSnapshot",
+                    "name": owner_name,
+                    "uid": owner_uid,
+                    "controller": True,
+                }
+            ],
+        },
+        "type": "Opaque",
+        "immutable": immutable,
+        "data": {
+            "pod-template.json": base64.b64encode(
+                json.dumps(pod_template).encode()
+            ).decode()
+        },
+    }
 
 
 def _app_config_with_template(template_file_path: str) -> AppConfig:
@@ -175,6 +231,180 @@ class TestBatchSandboxProvider:
         assert "containers" in body["spec"]["template"]["spec"]
         assert "volumes" in body["spec"]["template"]["spec"]
 
+    def test_create_workload_from_kata_snapshot_sanitizes_exact_manifest(
+        self,
+        mock_k8s_client,
+    ):
+        provider = BatchSandboxProvider(mock_k8s_client)
+        mock_k8s_client.read_runtime_class.return_value = {"handler": "kata-v2"}
+        mock_k8s_client.read_node.return_value = {
+            "metadata": {"name": "node-a"},
+            "spec": {"unschedulable": False},
+            "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+        }
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "new-sandbox", "uid": "new-uid"}
+        }
+        pod_template = {
+            "metadata": {
+                "labels": {
+                    "opensandbox.io/id": "old-sandbox",
+                    "opensandbox.io/snapshot-id": "old-snapshot",
+                    "batch-sandbox.sandbox.opensandbox.io/name": "old-sandbox",
+                    "batch-sandbox.sandbox.opensandbox.io/pod-index": "0",
+                    "sandbox.opensandbox.io/pool-name": "old-pool",
+                    "sandbox.opensandbox.io/pool-revision": "old-revision",
+                    "opensandbox.io/source-sandbox-id": "old-sandbox",
+                    "opensandbox.io/snapshot-scope": "public",
+                    "keep": "value",
+                },
+                "annotations": {
+                    KATA_SNAPSHOT_ANNOTATION: "old-kata-snapshot",
+                    "keep": "annotation",
+                },
+            },
+            "spec": {
+                "runtimeClassName": "source-kata",
+                "nodeName": "old-node",
+                "containers": [{"name": "sandbox", "image": "captured-image"}],
+            },
+        }
+        original = deepcopy(pod_template)
+        mock_k8s_client.read_secret.return_value = _kata_restore_plan_secret(
+            pod_template
+        )
+        restore_config = _kata_restore_config()
+        expires_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        result = provider.create_workload_from_kata_snapshot(
+            sandbox_id="new-sandbox",
+            namespace="test-ns",
+            restore_config=restore_config,
+            labels={
+                "opensandbox.io/id": "new-sandbox",
+                "opensandbox.io/snapshot-id": "public-snapshot-id",
+                "team": "kata",
+            },
+            annotations={"opensandbox.io/secure-access-token": "new-token"},
+            expires_at=expires_at,
+        )
+
+        assert pod_template == original
+        mock_k8s_client.read_secret.assert_called_once_with(
+            "test-ns", KATA_RESTORE_PLAN_SECRET_NAME
+        )
+        assert result == {
+            "name": "new-sandbox",
+            "uid": "new-uid",
+            "apiVersion": "sandbox.opensandbox.io/v1alpha1",
+            "kind": "BatchSandbox",
+        }
+        assert mock_k8s_client.create_custom_object.call_args.kwargs["body"] == {
+            "apiVersion": "sandbox.opensandbox.io/v1alpha1",
+            "kind": "BatchSandbox",
+            "metadata": {
+                "name": "new-sandbox",
+                "namespace": "test-ns",
+                "labels": {
+                    "opensandbox.io/id": "new-sandbox",
+                    "opensandbox.io/snapshot-id": "public-snapshot-id",
+                    "team": "kata",
+                },
+                "annotations": {
+                    "keep": "annotation",
+                    KATA_SNAPSHOT_ANNOTATION: "kata-snapshot-a",
+                    "opensandbox.io/secure-access-token": "new-token",
+                },
+            },
+            "spec": {
+                "replicas": 0,
+                "expireTime": "2026-01-01T00:00:00+00:00",
+                "template": {
+                    "metadata": {
+                        "labels": {
+                            "keep": "value",
+                            "opensandbox.io/id": "new-sandbox",
+                            "opensandbox.io/snapshot-id": "public-snapshot-id",
+                            "team": "kata",
+                        },
+                        "annotations": {
+                            "keep": "annotation",
+                            KATA_SNAPSHOT_ANNOTATION: "kata-snapshot-a",
+                            "opensandbox.io/secure-access-token": "new-token",
+                        },
+                    },
+                    "spec": {
+                        "runtimeClassName": KATA_RESTORE_RUNTIME_CLASS,
+                        "nodeName": "node-a",
+                        "containers": [
+                            {"name": "sandbox", "image": "captured-image"}
+                        ],
+                    },
+                },
+            },
+        }
+
+    def test_create_workload_from_kata_snapshot_rejects_invalid_secret_owner(
+        self,
+        mock_k8s_client,
+    ):
+        provider = BatchSandboxProvider(mock_k8s_client)
+        mock_k8s_client.read_secret.return_value = _kata_restore_plan_secret(
+            {"metadata": {}, "spec": {"containers": []}},
+            owner_uid="other-snapshot-uid",
+        )
+
+        with pytest.raises(ValueError, match="ownership is invalid"):
+            provider.create_workload_from_kata_snapshot(
+                sandbox_id="new-sandbox",
+                namespace="test-ns",
+                restore_config=_kata_restore_config(),
+                labels={"opensandbox.io/id": "new-sandbox"},
+                annotations=None,
+                expires_at=None,
+            )
+
+        mock_k8s_client.create_custom_object.assert_not_called()
+
+    def test_create_workload_from_kata_snapshot_rejects_mutable_secret(
+        self,
+        mock_k8s_client,
+    ):
+        provider = BatchSandboxProvider(mock_k8s_client)
+        mock_k8s_client.read_secret.return_value = _kata_restore_plan_secret(
+            {"metadata": {}, "spec": {"containers": []}},
+            immutable=False,
+        )
+
+        with pytest.raises(ValueError, match="not immutable and opaque"):
+            provider.create_workload_from_kata_snapshot(
+                sandbox_id="new-sandbox",
+                namespace="test-ns",
+                restore_config=_kata_restore_config(),
+                labels={"opensandbox.io/id": "new-sandbox"},
+                annotations=None,
+                expires_at=None,
+            )
+
+        mock_k8s_client.create_custom_object.assert_not_called()
+
+    def test_activate_kata_snapshot_workload_scales_reserved_workload(
+        self,
+        mock_k8s_client,
+    ):
+        provider = BatchSandboxProvider(mock_k8s_client)
+
+        provider.activate_kata_snapshot_workload("new-sandbox", "test-ns")
+
+        mock_k8s_client.patch_custom_object.assert_called_once_with(
+            group="sandbox.opensandbox.io",
+            version="v1alpha1",
+            namespace="test-ns",
+            plural="batchsandboxes",
+            name="new-sandbox",
+            body={"spec": {"replicas": 1}},
+        )
+
     def test_create_workload_injects_platform_node_selector(self, mock_k8s_client):
         provider = BatchSandboxProvider(mock_k8s_client)
         mock_k8s_client.create_custom_object.return_value = {
@@ -198,6 +428,37 @@ class TestBatchSandboxProvider:
         node_selector = body["spec"]["template"]["spec"]["nodeSelector"]
         assert node_selector["kubernetes.io/os"] == "linux"
         assert node_selector["kubernetes.io/arch"] == "arm64"
+
+    def test_create_workload_from_kata_snapshot_rejects_unready_source_node(
+        self,
+        mock_k8s_client,
+    ):
+        provider = BatchSandboxProvider(mock_k8s_client)
+        mock_k8s_client.read_runtime_class.return_value = {"handler": "kata-v2"}
+        mock_k8s_client.read_node.return_value = {
+            "metadata": {"name": "node-a"},
+            "spec": {"unschedulable": False},
+            "status": {"conditions": [{"type": "Ready", "status": "False"}]},
+        }
+        mock_k8s_client.read_secret.return_value = _kata_restore_plan_secret(
+            {
+                "metadata": {},
+                "spec": {"runtimeClassName": "source-kata", "containers": []},
+            }
+        )
+        restore_config = _kata_restore_config()
+
+        with pytest.raises(ValueError, match="Ready"):
+            provider.create_workload_from_kata_snapshot(
+                sandbox_id="new-sandbox",
+                namespace="test-ns",
+                restore_config=restore_config,
+                labels={"opensandbox.io/id": "new-sandbox"},
+                annotations=None,
+                expires_at=None,
+            )
+
+        mock_k8s_client.create_custom_object.assert_not_called()
 
     def test_create_workload_windows_profile_uses_windows_runtime_shape(self, mock_k8s_client):
         provider = BatchSandboxProvider(mock_k8s_client)

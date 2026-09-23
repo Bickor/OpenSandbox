@@ -58,6 +58,21 @@ const (
 
 	// labelSandboxSnapshotName is the label key for sandbox snapshot name
 	labelSandboxSnapshotName = "sandbox.opensandbox.io/sandbox-snapshot-name"
+
+	kataRuntimeClassName                  = "kata-vm-isolation-v2"
+	kataRuntimeHandler                    = "kata-v2"
+	kataSnapshotAnnotation                = "io.katacontainers.snapshot-name"
+	kataUnsupportedSecureAccessAnnotation = "opensandbox.io/secure-access-token"
+	kataUnsupportedEgressAuthAnnotation   = "opensandbox.io/egress-auth-token"
+	defaultHostKataCtlPath                = "/opt/aks-sandbox-demo/kata-v2/bin/kata-ctl"
+	kataHostRootMountPath                 = "/host"
+	kataHostRootVolumeName                = "host-root"
+	kataCleanupJobNameSuffix              = "-kata-cleanup"
+	kataRestorePlanSecretKey              = "pod-template.json"
+	kataRestorePlanSecretSuffix           = "-restore-plan"
+	labelSandboxIdentity                  = "opensandbox.io/id"
+	labelSandboxSnapshotID                = "opensandbox.io/snapshot-id"
+	labelSourceSandboxIdentity            = "opensandbox.io/source-sandbox-id"
 )
 
 // SandboxSnapshotReconciler reconciles a SandboxSnapshot object.
@@ -93,6 +108,12 @@ type SandboxSnapshotReconciler struct {
 
 	// SnapshotRegistryInsecure controls whether image-committer uses insecure registry mode.
 	SnapshotRegistryInsecure bool
+
+	// KataVMStateEnabled gates the trusted node-local Kata VM snapshot backend.
+	KataVMStateEnabled bool
+
+	// HostKataCtlPath is the absolute kata-ctl path inside the host root.
+	HostKataCtlPath string
 }
 
 // +kubebuilder:rbac:groups=sandbox.opensandbox.io,resources=sandboxsnapshots,verbs=get;list;watch;create;update;patch;delete
@@ -102,8 +123,10 @@ type SandboxSnapshotReconciler struct {
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
-// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=core,resources=events,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get;list;watch
 
 func (r *SandboxSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, retErr error) {
 	log := logf.FromContext(ctx)

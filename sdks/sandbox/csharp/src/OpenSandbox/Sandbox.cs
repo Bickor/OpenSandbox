@@ -174,11 +174,16 @@ public sealed class Sandbox : IAsyncDisposable
         {
             throw new InvalidArgumentException("Exactly one of Image or SnapshotId must be specified.");
         }
-        if (!string.IsNullOrWhiteSpace(options.SnapshotId) && options.Entrypoint is not null)
+        if (!options.FullStateRestore &&
+            !string.IsNullOrWhiteSpace(options.SnapshotId) &&
+            options.Entrypoint is not null)
         {
             throw new InvalidArgumentException("Entrypoint must be omitted when SnapshotId is provided.");
         }
-        ValidateHostPaths(options.Volumes);
+        if (!options.FullStateRestore)
+        {
+            ValidateHostPaths(options.Volumes);
+        }
         var startupSource = options.Image ?? options.SnapshotId;
 
         var request = new CreateSandboxRequest
@@ -213,6 +218,20 @@ public sealed class Sandbox : IAsyncDisposable
             Volumes = options.Volumes,
             Extensions = options.Extensions?.ToDictionary(kv => kv.Key, kv => (object)kv.Value)
         };
+        if (options.FullStateRestore)
+        {
+            if (string.IsNullOrWhiteSpace(options.SnapshotId))
+            {
+                throw new InvalidArgumentException("FullStateRestore requires SnapshotId.");
+            }
+            request = new CreateSandboxRequest
+            {
+                FullStateRestore = true,
+                SnapshotId = options.SnapshotId,
+                Timeout = options.ManualCleanup ? null : options.TimeoutSeconds ?? Constants.DefaultTimeoutSeconds,
+                Metadata = options.Metadata
+            };
+        }
 
         return await LaunchAsync(
             request,

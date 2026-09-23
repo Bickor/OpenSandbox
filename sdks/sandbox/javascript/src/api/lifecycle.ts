@@ -165,8 +165,10 @@ export interface paths {
          *     required.
          *
          *     When `image` is provided, `entrypoint` is required. When `snapshotId` is
-         *     provided, `entrypoint` is optional. If omitted, the server defaults the
-         *     sandbox entrypoint to `["tail", "-f", "/dev/null"]`.
+         *     provided for an image-backed snapshot, `entrypoint` is optional. If omitted,
+         *     the server defaults the sandbox entrypoint to `["tail", "-f", "/dev/null"]`.
+         *     Kata VM-state restores accept only `snapshotId`, `timeout`, and `metadata`;
+         *     their captured Pod template supplies the workload shape.
          *
          *     ## Authentication
          *
@@ -1001,7 +1003,9 @@ export interface components {
             /**
              * @description Entry process specification for the sandbox. For image-created sandboxes,
              *     this is copied from the creation request. For snapshot-created sandboxes,
-             *     this is restored from the snapshot.
+             *     this is restored from the snapshot. Full VM-state restores return
+             *     an empty array because the captured process continues without
+             *     starting a new entrypoint.
              */
             entrypoint: string[];
         };
@@ -1009,6 +1013,12 @@ export interface components {
         CreateSnapshotRequest: {
             /** @description Optional human-readable snapshot name. */
             name?: string;
+            /**
+             * @description Requested snapshot representation. If omitted, the current runtime
+             *     and controller auto-selection behavior is preserved.
+             * @enum {string}
+             */
+            format?: "rootfs-v1" | "qemu-v1" | "kata-vmstate-v1";
         };
         /** @description Persistent point-in-time capture of a sandbox. */
         Snapshot: {
@@ -1018,6 +1028,13 @@ export interface components {
             sandboxId: string;
             /** @description Optional human-readable snapshot name */
             name?: string;
+            /**
+             * @description Snapshot representation format. Known values include `rootfs-v1`,
+             *     `qemu-v1`, and `kata-vmstate-v1`. Clients should tolerate future values.
+             */
+            format?: string;
+            /** @description Restore placement and durability constraints. */
+            restoreConstraints?: components["schemas"]["SnapshotRestoreConstraints"];
             /** @description Current snapshot lifecycle status and detailed state information */
             status: components["schemas"]["SnapshotStatus"];
             /**
@@ -1025,6 +1042,17 @@ export interface components {
              * @description Snapshot creation timestamp
              */
             createdAt: string;
+        };
+        SnapshotRestoreConstraints: {
+            /**
+             * @description Restore placement requirement.
+             * @enum {string}
+             */
+            placement: "same-node";
+            /** @description Node on which this snapshot can be restored. */
+            sourceNode: string;
+            /** @description Whether restore is independent of the source node. */
+            durable: boolean;
         };
         /**
          * @description Snapshot lifecycle state.
@@ -1292,11 +1320,14 @@ export interface components {
          *     or a pre-configured pool (via `extensions.poolRef`).
          *
          *     **Standard mode**: Exactly one of `image` or `snapshotId` must be provided,
-         *     and `resourceLimits` is required.
+         *     and `resourceLimits` is required for image-backed creates. Snapshot restores
+         *     may omit it; the restore plan determines whether resources are captured.
          *
          *     When `image` is provided, `entrypoint` is required. When `snapshotId` is
-         *     provided, `entrypoint` is optional. If omitted, the server defaults the
-         *     sandbox entrypoint to `["tail", "-f", "/dev/null"]`.
+         *     provided for an image-backed snapshot, `entrypoint` is optional. If omitted,
+         *     the server defaults the sandbox entrypoint to `["tail", "-f", "/dev/null"]`.
+         *     A `kata-vmstate-v1` snapshot restore accepts only `snapshotId`, `timeout`,
+         *     and `metadata` and does not inject an image or default entrypoint.
          *
          *     **Pool mode**: When `extensions.poolRef` is set, the sandbox is created from
          *     a pre-configured on-demand Pool. In this case `image` and `resourceLimits`
@@ -1351,7 +1382,8 @@ export interface components {
             timeout?: number | null;
             /**
              * @description Runtime resource constraints (hard caps) for the sandbox instance.
-             *     Required when `extensions.poolRef` is not set.
+             *     Required for image-backed creates when `extensions.poolRef` is not set.
+             *     Optional for snapshot restores.
              *     Optional when using pool mode (resource limits are defined by the Pool CRD template).
              *     SDK clients should provide sensible defaults (e.g., cpu: "500m", memory: "512Mi").
              */

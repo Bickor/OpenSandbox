@@ -31,6 +31,7 @@ from opensandbox.models.sandboxes import (
     SandboxInfo,
     SandboxRenewResponse,
     SnapshotFilter,
+    SnapshotFormat,
     SnapshotInfo,
 )
 from opensandbox.models.templates import (
@@ -251,10 +252,15 @@ class SandboxManagerSync:
         logger.info(f"Resuming sandbox: {sandbox_id}")
         self._sandbox_service.resume_sandbox(sandbox_id)
 
-    def create_snapshot(self, sandbox_id: str, name: str | None = None) -> SnapshotInfo:
+    def create_snapshot(
+        self,
+        sandbox_id: str,
+        name: str | None = None,
+        format: SnapshotFormat | None = None,
+    ) -> SnapshotInfo:
         """Create a snapshot from a sandbox (blocking)."""
         return self._sandbox_service.create_snapshot(
-            sandbox_id, CreateSnapshotRequest(name=name)
+            sandbox_id, CreateSnapshotRequest(name=name, format=format)
         )
 
     def get_snapshot(self, snapshot_id: str) -> SnapshotInfo:

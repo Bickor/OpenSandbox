@@ -31,6 +31,7 @@ import (
 	snapshotcontract "github.com/alibaba/OpenSandbox/sandbox-k8s/internal/snapshot"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/pkg/imagecommitter"
 	imagecommittercli "github.com/alibaba/OpenSandbox/sandbox-k8s/pkg/imagecommitter/cli"
+	"github.com/alibaba/OpenSandbox/sandbox-k8s/pkg/imagecommitter/katavmstate"
 )
 
 var terminationMessagePath = "/dev/termination-log"
@@ -44,6 +45,15 @@ var commandCombinedOutput = func(name string, args ...string) ([]byte, error) {
 
 func main() {
 	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "kata-vmstate" {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if err := katavmstate.Run(ctx, args, terminationMessagePath, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	// QEMU-specific subcommands use the nerdctl-based path, which requires
 	// HostPID access and runs qemu-checkpoint-helper inside the container.

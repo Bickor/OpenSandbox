@@ -58,8 +58,31 @@ internal sealed class SandboxesAdapter : ISandboxes
         CreateSandboxRequest request,
         CancellationToken cancellationToken = default)
     {
-        var response = await _client.PostAsync<JsonElement>("/sandboxes", request, cancellationToken).ConfigureAwait(false);
+        object body = request;
+        if (request.FullStateRestore)
+        {
+            body = new FullStateRestoreRequest
+            {
+                SnapshotId = request.SnapshotId!,
+                Timeout = request.Timeout,
+                Metadata = request.Metadata ?? new Dictionary<string, string>()
+            };
+        }
+        var response = await _client.PostAsync<JsonElement>("/sandboxes", body, cancellationToken).ConfigureAwait(false);
         return ParseCreateSandboxResponse(response);
+    }
+
+    private sealed class FullStateRestoreRequest
+    {
+        [System.Text.Json.Serialization.JsonPropertyName("snapshotId")]
+        public required string SnapshotId { get; init; }
+
+        [System.Text.Json.Serialization.JsonPropertyName("timeout")]
+        [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.Never)]
+        public int? Timeout { get; init; }
+
+        [System.Text.Json.Serialization.JsonPropertyName("metadata")]
+        public required IReadOnlyDictionary<string, string> Metadata { get; init; }
     }
 
     public async Task<SandboxInfo> GetSandboxAsync(
@@ -491,6 +514,20 @@ internal sealed class SandboxesAdapter : ISandboxes
             SandboxId = element.GetProperty("sandboxId").GetString() ?? throw new SandboxApiException("Missing sandboxId in response"),
             Name = element.TryGetProperty("name", out var name) && name.ValueKind != JsonValueKind.Null
                 ? name.GetString()
+                : null,
+            Format = element.TryGetProperty("format", out var format) && format.ValueKind != JsonValueKind.Null
+                ? format.GetString()
+                : null,
+            RestoreConstraints = element.TryGetProperty("restoreConstraints", out var restoreConstraints) &&
+                restoreConstraints.ValueKind == JsonValueKind.Object
+                ? new SnapshotRestoreConstraints
+                {
+                    Placement = restoreConstraints.GetProperty("placement").GetString() ??
+                        throw new SandboxApiException("Missing restoreConstraints.placement in response"),
+                    SourceNode = restoreConstraints.GetProperty("sourceNode").GetString() ??
+                        throw new SandboxApiException("Missing restoreConstraints.sourceNode in response"),
+                    Durable = restoreConstraints.GetProperty("durable").GetBoolean()
+                }
                 : null,
             Status = new SnapshotStatus
             {

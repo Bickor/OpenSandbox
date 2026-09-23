@@ -93,6 +93,8 @@ spec:
         {{- if .Values.controller.snapshot.resumePullSecret }}
         - --resume-pull-secret={{ .Values.controller.snapshot.resumePullSecret }}
         {{- end }}
+        - --kata-vmstate-enabled={{ .Values.controller.snapshot.kataVMState.enabled | default false }}
+        - --host-kata-ctl-path={{ .Values.controller.snapshot.kataVMState.hostKataCtlPath | quote }}
         ports:
         - name: health
           containerPort: 8081

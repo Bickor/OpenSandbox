@@ -77,6 +77,12 @@ controller:
     imageCommitterPullSecret: ""
     # -- Secret name injected into resumed sandboxes for pulling snapshot images.
     resumePullSecret: ""
+    # -- Trusted same-node Kata VM state snapshot configuration.
+    kataVMState:
+      # -- Enable the additive kata-vmstate-v1 public snapshot backend.
+      enabled: false
+      # -- Absolute kata-ctl path on Kata worker nodes.
+      hostKataCtlPath: /opt/aks-sandbox-demo/kata-v2/bin/kata-ctl
 
   # -- Enable leader election for controller manager
   leaderElection:

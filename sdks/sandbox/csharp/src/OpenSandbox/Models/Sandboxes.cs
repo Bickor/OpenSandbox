@@ -833,6 +833,9 @@ public class SandboxMetadataPatch : Dictionary<string, string?>
 /// </summary>
 public class CreateSandboxRequest
 {
+    [JsonIgnore]
+    internal bool FullStateRestore { get; set; }
+
     /// <summary>
     /// Gets or sets the container image specification.
     /// </summary>
@@ -1074,6 +1077,21 @@ public class SnapshotStatus
 }
 
 /// <summary>
+/// Restore placement and durability constraints for a snapshot.
+/// </summary>
+public class SnapshotRestoreConstraints
+{
+    [JsonPropertyName("placement")]
+    public required string Placement { get; set; }
+
+    [JsonPropertyName("sourceNode")]
+    public required string SourceNode { get; set; }
+
+    [JsonPropertyName("durable")]
+    public bool Durable { get; set; }
+}
+
+/// <summary>
 /// Information about a snapshot.
 /// </summary>
 public class SnapshotInfo
@@ -1086,6 +1104,15 @@ public class SnapshotInfo
 
     [JsonPropertyName("name")]
     public string? Name { get; set; }
+
+    /// <summary>
+    /// Gets or sets the snapshot representation format. Future values are preserved.
+    /// </summary>
+    [JsonPropertyName("format")]
+    public string? Format { get; set; }
+
+    [JsonPropertyName("restoreConstraints")]
+    public SnapshotRestoreConstraints? RestoreConstraints { get; set; }
 
     [JsonPropertyName("status")]
     public required SnapshotStatus Status { get; set; }
@@ -1101,6 +1128,19 @@ public class CreateSnapshotRequest
 {
     [JsonPropertyName("name")]
     public string? Name { get; set; }
+
+    [JsonPropertyName("format")]
+    public string? Format { get; set; }
+}
+
+/// <summary>
+/// Documented snapshot formats accepted when creating a snapshot.
+/// </summary>
+public static class SnapshotFormats
+{
+    public const string RootfsV1 = "rootfs-v1";
+    public const string QemuV1 = "qemu-v1";
+    public const string KataVmstateV1 = "kata-vmstate-v1";
 }
 
 /// <summary>

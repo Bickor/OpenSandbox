@@ -257,6 +257,52 @@ test("Sandbox.create restores from snapshot with explicit entrypoint", async () 
   assert.deepEqual(recordedRequests[0].entrypoint, ["python", "app.py"]);
 });
 
+test("Sandbox.create sends only full-state restore fields", async () => {
+  const { adapterFactory, recordedRequests } = createAdapterFactory();
+
+  await Sandbox.create({
+    adapterFactory,
+    connectionConfig: { domain: "http://127.0.0.1:8080" },
+    snapshotId: "snap-vmstate",
+    fullStateRestore: true,
+    timeoutSeconds: 45,
+    metadata: { workload: "vmstate" },
+    entrypoint: ["ignored"],
+    env: { IGNORED: "true" },
+    resource: { cpu: "8" },
+    resourceRequests: { cpu: "4" },
+    secureAccess: true,
+    extensions: { ignored: "true" },
+    lifecycle: { preStart: { command: ["ignored"] } },
+    skipHealthCheck: true,
+  });
+
+  assert.deepEqual(recordedRequests[0], {
+    snapshotId: "snap-vmstate",
+    timeout: 45,
+    metadata: { workload: "vmstate" },
+  });
+});
+
+test("Sandbox.create sends explicit null timeout for full-state manual cleanup", async () => {
+  const { adapterFactory, recordedRequests } = createAdapterFactory();
+
+  await Sandbox.create({
+    adapterFactory,
+    connectionConfig: { domain: "http://127.0.0.1:8080" },
+    snapshotId: "snap-vmstate",
+    fullStateRestore: true,
+    timeoutSeconds: null,
+    skipHealthCheck: true,
+  });
+
+  assert.deepEqual(recordedRequests[0], {
+    snapshotId: "snap-vmstate",
+    timeout: null,
+    metadata: {},
+  });
+});
+
 test("Sandbox.create requires exactly one startup source", async () => {
   const { adapterFactory } = createAdapterFactory();
 

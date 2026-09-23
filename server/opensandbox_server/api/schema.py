@@ -20,7 +20,7 @@ for request/response validation and serialization.
 """
 
 from datetime import datetime
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, PrivateAttr, RootModel, model_validator
 
@@ -457,6 +457,7 @@ class CreateSandboxRequest(BaseModel):
     # Internal routing hint: set by snapshot restore resolution to the backend
     # that produced the snapshot (e.g. "fsb"); never serialized on the wire.
     _resolved_snapshot_backend: Optional[str] = PrivateAttr(default=None)
+    _snapshot_restore_config: Any = PrivateAttr(default=None)
 
     image: Optional[ImageSpec] = Field(
         None,
@@ -575,6 +576,17 @@ class CreateSandboxRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_source_and_entrypoint(self) -> "CreateSandboxRequest":
+        has_snapshot = bool((self.snapshot_id or "").strip())
+        supplied_image = self.image is not None and bool(self.image.uri.strip())
+        has_pool_ref = bool((self.extensions or {}).get("poolRef", "").strip())
+
+        if has_snapshot and supplied_image:
+            raise ValueError("Exactly one of image or snapshotId must be provided.")
+        if has_snapshot and self.template_id is not None and self.template_id.strip():
+            raise ValueError("templateId cannot be combined with snapshotId.")
+        if has_snapshot and has_pool_ref:
+            raise ValueError("snapshotId cannot be used together with poolRef.")
+
         if self.env and OPENSANDBOX_LIFECYCLE in self.env:
             raise ValueError(
                 f"Environment variable '{OPENSANDBOX_LIFECYCLE}' is reserved. "
@@ -611,7 +623,6 @@ class CreateSandboxRequest(BaseModel):
 
         # When poolRef is set, image/snapshotId/entrypoint/resourceLimits are
         # all defined in the Pool CRD and not required from the caller.
-        has_pool_ref = bool((self.extensions or {}).get("poolRef", "").strip())
         if has_pool_ref:
             if self.lifecycle is not None:
                 raise ValueError("lifecycle cannot be used together with poolRef.")
@@ -628,22 +639,21 @@ class CreateSandboxRequest(BaseModel):
             if self.network_policy is None:
                 raise ValueError("credentialProxy.enabled requires networkPolicy.")
 
-        has_image = self.image is not None and bool(self.image.uri.strip())
-        has_snapshot = bool((self.snapshot_id or "").strip())
+        has_image = supplied_image and not has_snapshot
 
-        if has_image == has_snapshot:
+        if not has_image and not has_snapshot:
             raise ValueError("Exactly one of image or snapshotId must be provided.")
 
-        if has_image and not self.entrypoint:
+        if has_image and not has_snapshot and not self.entrypoint:
             raise ValueError("Entrypoint is required when image is provided.")
 
-        if self.image is not None and not has_image:
+        if self.image is not None and not supplied_image:
             self.image = None
 
         if self.snapshot_id is not None and not has_snapshot:
             self.snapshot_id = None
 
-        if self.resource_limits is None:
+        if self.resource_limits is None and not has_snapshot:
             raise ValueError("resourceLimits is required when poolRef is not provided.")
 
         return self
@@ -655,6 +665,11 @@ class CreateSandboxRequest(BaseModel):
     def resolved_snapshot_backend(self) -> Optional[str]:
         """Backend that produced the snapshot being restored, if resolved."""
         return self._resolved_snapshot_backend
+
+    @property
+    def snapshot_restore_config(self) -> Any:
+        """Private restore plan resolved from snapshot persistence."""
+        return self._snapshot_restore_config
 
 
 class CreateSandboxResponse(BaseModel):
@@ -788,6 +803,31 @@ class CreateSnapshotRequest(BaseModel):
         min_length=1,
         description="Optional human-readable snapshot name",
     )
+    format: Optional[Literal["rootfs-v1", "qemu-v1", "kata-vmstate-v1"]] = Field(
+        None,
+        description=(
+            "Requested snapshot format. When omitted, runtime/controller auto selection is preserved."
+        ),
+    )
+
+
+class SnapshotRestoreConstraints(BaseModel):
+    placement: Literal["same-node"] = Field(
+        ...,
+        description="Restore placement requirement.",
+    )
+    source_node: str = Field(
+        ...,
+        alias="sourceNode",
+        description="Node on which this snapshot can be restored.",
+    )
+    durable: bool = Field(
+        ...,
+        description="Whether the snapshot remains restorable independently of the source node.",
+    )
+
+    class Config:
+        populate_by_name = True
 
 
 class Snapshot(BaseModel):
@@ -803,6 +843,15 @@ class Snapshot(BaseModel):
     name: Optional[str] = Field(
         None,
         description="Optional human-readable snapshot name",
+    )
+    format: Optional[str] = Field(
+        None,
+        description="Snapshot representation format. Clients should tolerate future values.",
+    )
+    restore_constraints: Optional[SnapshotRestoreConstraints] = Field(
+        None,
+        alias="restoreConstraints",
+        description="Restore placement and durability constraints.",
     )
     status: SnapshotStatus = Field(
         ...,

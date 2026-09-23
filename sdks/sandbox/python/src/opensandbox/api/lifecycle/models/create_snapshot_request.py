@@ -21,6 +21,7 @@ from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 
+from ..models.create_snapshot_request_format import CreateSnapshotRequestFormat
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="CreateSnapshotRequest")
@@ -32,18 +33,28 @@ class CreateSnapshotRequest:
 
     Attributes:
         name (str | Unset): Optional human-readable snapshot name.
+        format_ (CreateSnapshotRequestFormat | Unset): Requested snapshot representation. If omitted, the current
+            runtime
+            and controller auto-selection behavior is preserved.
     """
 
     name: str | Unset = UNSET
+    format_: CreateSnapshotRequestFormat | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         name = self.name
+
+        format_: str | Unset = UNSET
+        if not isinstance(self.format_, Unset):
+            format_ = self.format_.value
 
         field_dict: dict[str, Any] = {}
 
         field_dict.update({})
         if name is not UNSET:
             field_dict["name"] = name
+        if format_ is not UNSET:
+            field_dict["format"] = format_
 
         return field_dict
 
@@ -52,8 +63,16 @@ class CreateSnapshotRequest:
         d = dict(src_dict)
         name = d.pop("name", UNSET)
 
+        _format_ = d.pop("format", UNSET)
+        format_: CreateSnapshotRequestFormat | Unset
+        if isinstance(_format_, Unset):
+            format_ = UNSET
+        else:
+            format_ = CreateSnapshotRequestFormat(_format_)
+
         create_snapshot_request = cls(
             name=name,
+            format_=format_,
         )
 
         return create_snapshot_request

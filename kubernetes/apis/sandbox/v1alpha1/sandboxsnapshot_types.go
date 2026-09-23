@@ -41,13 +41,13 @@ const (
 )
 
 // SandboxSnapshotFormat identifies the persisted snapshot representation.
-// Existing snapshots without this field are interpreted as rootfs-v1.
-// +kubebuilder:validation:Enum=rootfs-v1;qemu-v1
+// +kubebuilder:validation:Enum=rootfs-v1;qemu-v1;kata-vmstate-v1
 type SandboxSnapshotFormat string
 
 const (
-	SandboxSnapshotFormatRootfsV1 SandboxSnapshotFormat = "rootfs-v1"
-	SandboxSnapshotFormatQEMUV1   SandboxSnapshotFormat = "qemu-v1"
+	SandboxSnapshotFormatRootfsV1      SandboxSnapshotFormat = "rootfs-v1"
+	SandboxSnapshotFormatQEMUV1        SandboxSnapshotFormat = "qemu-v1"
+	SandboxSnapshotFormatKataVMStateV1 SandboxSnapshotFormat = "kata-vmstate-v1"
 )
 
 // ContainerSnapshot records the snapshot result for a single container.
@@ -108,6 +108,20 @@ type VirtualMachineSnapshot struct {
 	Compatibility QEMUCompatibility `json:"compatibility"`
 }
 
+// KataVMStateSnapshot records a node-local Kata Containers VM snapshot and the
+// workload template required to restore it.
+type KataVMStateSnapshot struct {
+	// SnapshotName is the opaque directory name below the Kata snapshot root.
+	SnapshotName string `json:"snapshotName"`
+	// RuntimeVersion is read from kata-snapshot.json after snapshot creation.
+	// +optional
+	RuntimeVersion string `json:"runtimeVersion,omitempty"`
+	// RestorePlanSecretName identifies the controller-owned Secret containing
+	// the captured PodTemplate. The template may contain credentials and must
+	// not be exposed through the viewer-readable SandboxSnapshot status.
+	RestorePlanSecretName string `json:"restorePlanSecretName"`
+}
+
 // SandboxSnapshotCondition represents a condition of a SandboxSnapshot.
 type SandboxSnapshotCondition struct {
 	// Type is the condition type.
@@ -136,6 +150,11 @@ type SandboxSnapshotSpec struct {
 	// Controller uses this to find BatchSandbox -> find Pod -> dispatch commit Job.
 	// +kubebuilder:validation:Required
 	SandboxName string `json:"sandboxName"`
+
+	// Format explicitly selects a snapshot backend. When empty, QEMU workload
+	// annotations select qemu-v1 and all other workloads retain rootfs-v1.
+	// +optional
+	Format SandboxSnapshotFormat `json:"format,omitempty"`
 }
 
 // SandboxSnapshotStatus defines the observed state of SandboxSnapshot.
@@ -156,6 +175,11 @@ type SandboxSnapshotStatus struct {
 	// VirtualMachine contains the QEMU VM state artifact for qemu-v1 snapshots.
 	// +optional
 	VirtualMachine *VirtualMachineSnapshot `json:"virtualMachine,omitempty"`
+
+	// KataVMState contains the node-local Kata artifact and restore template for
+	// kata-vmstate-v1 snapshots.
+	// +optional
+	KataVMState *KataVMStateSnapshot `json:"kataVMState,omitempty"`
 
 	// Conditions records the readiness or failure of the snapshot.
 	// +optional

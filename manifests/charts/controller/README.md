@@ -83,12 +83,15 @@ The following table lists the configurable parameters of the chart and their def
 | controller.readinessProbe | object | `{"enabled":true,"failureThreshold":3,"httpGet":{"path":"/readyz","port":8081},"initialDelaySeconds":5,"periodSeconds":10,"successThreshold":1,"timeoutSeconds":1}` | Readiness probe configuration |
 | controller.replicaCount | int | `1` | Number of controller replicas |
 | controller.resources | object | `{"limits":{"cpu":"500m","memory":"128Mi"},"requests":{"cpu":"10m","memory":"64Mi"}}` | Resource requests and limits for the controller |
-| controller.snapshot | object | `{"commitJobTimeout":"10m","containerdSocketPath":"","imageCommitterImage":"sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/image-committer:release-1.1.0-rc.1","imageCommitterPodTemplate":{},"imageCommitterPullSecret":"","registry":"","registryInsecure":false,"resumePullSecret":"","snapshotPushSecret":""}` | Pause/Resume snapshot configuration |
+| controller.snapshot | object | `{"commitJobTimeout":"10m","containerdSocketPath":"","imageCommitterImage":"sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/image-committer:release-1.1.0-rc.1","imageCommitterPodTemplate":{},"imageCommitterPullSecret":"","kataVMState":{"enabled":false,"hostKataCtlPath":"/opt/aks-sandbox-demo/kata-v2/bin/kata-ctl"},"registry":"","registryInsecure":false,"resumePullSecret":"","snapshotPushSecret":""}` | Pause/Resume snapshot configuration |
 | controller.snapshot.commitJobTimeout | string | `"10m"` | Timeout duration for commit jobs |
 | controller.snapshot.containerdSocketPath | string | `""` | Containerd socket path of host. Defaults to empty so the controller uses its built-in default (/var/run/containerd/containerd.sock) without passing the `--containerd-socket-path` flag. |
 | controller.snapshot.imageCommitterImage | string | `"sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/image-committer:release-1.1.0-rc.1"` | Image used for commit operations. DockerHub: opensandbox/image-committer:release-1.1.0-rc.1 |
 | controller.snapshot.imageCommitterPodTemplate | object | `{}` | PodTemplateSpec overlay for image-committer commit Job Pods. |
 | controller.snapshot.imageCommitterPullSecret | string | `""` | Secret name for pulling the image-committer image in commit Jobs. Required when imageCommitterImage is stored in a private registry. |
+| controller.snapshot.kataVMState | object | `{"enabled":false,"hostKataCtlPath":"/opt/aks-sandbox-demo/kata-v2/bin/kata-ctl"}` | Trusted same-node Kata VM state snapshot configuration. |
+| controller.snapshot.kataVMState.enabled | bool | `false` | Enable the additive kata-vmstate-v1 public snapshot backend. |
+| controller.snapshot.kataVMState.hostKataCtlPath | string | `"/opt/aks-sandbox-demo/kata-v2/bin/kata-ctl"` | Absolute kata-ctl path on Kata worker nodes. |
 | controller.snapshot.registry | string | `""` | OCI registry prefix used for snapshot images. |
 | controller.snapshot.registryInsecure | bool | `false` | Use insecure registry mode when pushing snapshot images. |
 | controller.snapshot.resumePullSecret | string | `""` | Secret name injected into resumed sandboxes for pulling snapshot images. |
@@ -159,7 +162,7 @@ controller:
     imageCommitterPodTemplate:
       metadata:
         labels:
-          identity.example/use: "true"
+          azure.workload.identity/use: "true"
       spec:
         serviceAccountName: snapshot-committer
         containers:
@@ -174,6 +177,9 @@ controller:
     snapshotPushSecret: registry-snapshot-push-secret
     imageCommitterPullSecret: registry-image-committer-pull-secret
     resumePullSecret: registry-pull-secret
+    kataVMState:
+      enabled: false
+      hostKataCtlPath: /opt/aks-sandbox-demo/kata-v2/bin/kata-ctl
 ```
 
 These values render directly to the controller flags:
@@ -186,6 +192,15 @@ These values render directly to the controller flags:
 - `--snapshot-push-secret`
 - `--image-committer-pull-secret`
 - `--resume-pull-secret`
+- `--kata-vmstate-enabled`
+- `--host-kata-ctl-path`
+
+`kata-vmstate-v1` is disabled by default. When enabled, it is accepted only for
+public snapshots of Pods using RuntimeClass `kata-vm-isolation-v2` whose handler
+is `kata-v2`. The image-committer Job is privileged, pinned to the source node,
+mounts the host root at `/host`, and stores artifacts below the fixed host path
+`/var/lib/kata/snapshots`. The configured `hostKataCtlPath` must be an absolute
+path inside that host root.
 
 ### Node Affinity
 

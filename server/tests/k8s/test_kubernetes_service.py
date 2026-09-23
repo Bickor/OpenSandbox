@@ -16,7 +16,7 @@ import pytest
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from typing import cast
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi import HTTPException
 
 from opensandbox_server.services.k8s.kubernetes_service import KubernetesSandboxService
@@ -31,12 +31,14 @@ from opensandbox_server.services.constants import (
     SandboxErrorCodes,
 )
 from opensandbox_server.api.schema import (
+    CreateSandboxRequest,
     CredentialProxyConfig,
     ImageAuth,
     ListSandboxesRequest,
     NetworkPolicy,
     PlatformSpec,
 )
+from opensandbox_server.services.snapshot_models import SnapshotRestoreConfig
 from opensandbox_server.config import (
     EGRESS_MODE_DNS,
     EGRESS_MODE_DNS_NFT,
@@ -90,6 +92,105 @@ class TestKubernetesSandboxServiceInit:
             assert exc_info.value.detail["code"] == SandboxErrorCodes.K8S_INITIALIZATION_ERROR
 
 class TestKubernetesSandboxServiceCreate:
+
+    @staticmethod
+    def _kata_restore_config() -> SnapshotRestoreConfig:
+        return SnapshotRestoreConfig(
+            backend="kata-vmstate-v1",
+            format="kata-vmstate-v1",
+            restore_plan_secret_name="kata-restore-plan",
+            restore_plan_owner_name="osb-snap-kata",
+            restore_plan_owner_uid="snapshot-uid",
+            source_node_name="node-a",
+            snapshot_name="kata-snapshot-a",
+            runtime_version="3.8.0",
+            runtime_class_name="kata-vm-isolation-v2",
+        )
+
+    @pytest.mark.asyncio
+    async def test_create_sandbox_branches_to_kata_restore_provider(
+        self,
+        k8s_service,
+        mock_workload,
+    ):
+        request = CreateSandboxRequest(snapshotId="snap-kata", timeout=600)
+        request._snapshot_restore_config = self._kata_restore_config()
+        events = []
+        k8s_service.workload_provider.create_workload_from_kata_snapshot = MagicMock(
+            side_effect=lambda **kwargs: events.append("reserve")
+            or {"name": "new-sandbox", "uid": "new-uid"}
+        )
+        k8s_service.workload_provider.activate_kata_snapshot_workload = MagicMock(
+            side_effect=lambda *args: events.append("activate")
+        )
+        k8s_service.workload_provider.get_workload.return_value = mock_workload
+        k8s_service.workload_provider.get_status.return_value = {
+            "state": "Running",
+            "reason": "",
+            "message": "running",
+            "last_transition_at": datetime.now(timezone.utc),
+        }
+
+        with patch(
+            "opensandbox_server.services.k8s.kubernetes_service.verify_snapshot_restore_ready",
+            new=AsyncMock(side_effect=lambda request: events.append("verify")),
+        ) as verify:
+            await k8s_service.create_sandbox(request)
+
+        k8s_service.workload_provider.create_workload_from_kata_snapshot.assert_called_once()
+        call = k8s_service.workload_provider.create_workload_from_kata_snapshot.call_args
+        assert call.kwargs["annotations"] is None
+        verify.assert_awaited_once_with(request)
+        k8s_service.workload_provider.activate_kata_snapshot_workload.assert_called_once()
+        assert events == ["reserve", "verify", "activate"]
+        k8s_service.workload_provider.create_workload.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_sandbox_rolls_back_failed_kata_restore(
+        self,
+        k8s_service,
+    ):
+        request = CreateSandboxRequest(snapshotId="snap-kata")
+        request._snapshot_restore_config = self._kata_restore_config()
+        k8s_service.workload_provider.create_workload_from_kata_snapshot = MagicMock(
+            side_effect=RuntimeError("create failed")
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await k8s_service.create_sandbox(request)
+
+        assert exc_info.value.status_code == 500
+        k8s_service.workload_provider.delete_workload.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_create_sandbox_rolls_back_zero_replica_reservation_when_snapshot_changes(
+        self,
+        k8s_service,
+    ):
+        request = CreateSandboxRequest(snapshotId="snap-kata")
+        request._snapshot_restore_config = self._kata_restore_config()
+        k8s_service.workload_provider.create_workload_from_kata_snapshot = MagicMock(
+            return_value={"name": "new-sandbox", "uid": "new-uid"}
+        )
+        k8s_service.workload_provider.activate_kata_snapshot_workload = MagicMock()
+        revalidation_error = HTTPException(
+            status_code=409,
+            detail={
+                "code": "SNAPSHOT::NOT_READY",
+                "message": "Snapshot snap-kata is no longer ready for restore.",
+            },
+        )
+
+        with patch(
+            "opensandbox_server.services.k8s.kubernetes_service.verify_snapshot_restore_ready",
+            new=AsyncMock(side_effect=revalidation_error),
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await k8s_service.create_sandbox(request)
+
+        assert exc_info.value.status_code == 409
+        k8s_service.workload_provider.activate_kata_snapshot_workload.assert_not_called()
+        k8s_service.workload_provider.delete_workload.assert_called_once()
 
     def test_credential_proxy_requires_dns_nft_mode(
         self, k8s_service, create_sandbox_request

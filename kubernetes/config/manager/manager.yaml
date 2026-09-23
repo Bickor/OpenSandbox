@@ -69,6 +69,8 @@ spec:
           - --resume-pull-secret=registry-pull-secret
           - --image-committer-image=image-committer:dev
           - --image-committer-pod-template-file=
+          - --kata-vmstate-enabled=false
+          - --host-kata-ctl-path=/opt/aks-sandbox-demo/kata-v2/bin/kata-ctl
           - --commit-job-timeout=2m
           - --image-committer-pull-secret=
         image: controller:dev

@@ -144,6 +144,11 @@ export interface SandboxCreateOptions {
    * Mutually exclusive with `image`.
    */
   snapshotId?: string;
+  /**
+   * Send a minimal full-state restore request containing only snapshotId,
+   * timeout, and metadata. Required for formats such as kata-vmstate-v1.
+   */
+  fullStateRestore?: boolean;
 
   /**
    * Entrypoint command for the sandbox (defaults to tail -f /dev/null).
@@ -498,7 +503,7 @@ export class Sandbox {
     }
 
     // Validate volumes before allocating transport resources.
-    if (opts.volumes) {
+    if (!opts.fullStateRestore && opts.volumes) {
       for (const vol of opts.volumes) {
         const backendsSpecified = [vol.host, vol.pvc, vol.ossfs].filter((b) => b != null).length;
         if (backendsSpecified === 0) {
@@ -550,7 +555,7 @@ export class Sandbox {
       );
     }
 
-    const req: CreateSandboxRequest = {
+    let req: CreateSandboxRequest = {
       image: opts.image == null ? undefined : toImageSpec(opts.image),
       snapshotId: opts.snapshotId,
       entrypoint: opts.entrypoint ?? DEFAULT_ENTRYPOINT,
@@ -573,6 +578,16 @@ export class Sandbox {
     };
     if (timeoutSeconds !== null) {
       req.timeout = timeoutSeconds;
+    }
+    if (opts.fullStateRestore) {
+      if (!opts.snapshotId) {
+        throw new Error("fullStateRestore requires snapshotId");
+      }
+      req = {
+        snapshotId: opts.snapshotId,
+        timeout: timeoutSeconds,
+        metadata: opts.metadata ?? {},
+      };
     }
 
     let sandboxId: SandboxId | undefined;

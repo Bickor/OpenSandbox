@@ -72,10 +72,13 @@ The following table lists the configurable parameters of the chart and their def
 | ingress-gateway.enabled | bool | `false` | Whether the ingress gateway is enabled. |
 | opensandbox-controller.controller.logLevel | string | `"info"` | Controller log level (debug, info, error). |
 | opensandbox-controller.controller.replicaCount | int | `1` | Number of controller replicas. |
-| opensandbox-controller.controller.snapshot | object | `{"commitJobTimeout":"10m","imageCommitterImage":"sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/image-committer:release-1.1.0-rc.1","imageCommitterPodTemplate":{},"registry":"","registryInsecure":false,"resumePullSecret":"","snapshotPushSecret":""}` | Pause/Resume snapshot configuration. |
+| opensandbox-controller.controller.snapshot | object | `{"commitJobTimeout":"10m","imageCommitterImage":"sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/image-committer:release-1.1.0-rc.1","imageCommitterPodTemplate":{},"kataVMState":{"enabled":false,"hostKataCtlPath":"/opt/aks-sandbox-demo/kata-v2/bin/kata-ctl"},"registry":"","registryInsecure":false,"resumePullSecret":"","snapshotPushSecret":""}` | Pause/Resume snapshot configuration. |
 | opensandbox-controller.controller.snapshot.commitJobTimeout | string | `"10m"` | Timeout duration for commit jobs. |
 | opensandbox-controller.controller.snapshot.imageCommitterImage | string | `"sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/image-committer:release-1.1.0-rc.1"` | Image used for commit operations. |
 | opensandbox-controller.controller.snapshot.imageCommitterPodTemplate | object | `{}` | PodTemplateSpec overlay for image-committer commit Job Pods. |
+| opensandbox-controller.controller.snapshot.kataVMState | object | `{"enabled":false,"hostKataCtlPath":"/opt/aks-sandbox-demo/kata-v2/bin/kata-ctl"}` | Trusted same-node Kata VM state snapshot configuration. |
+| opensandbox-controller.controller.snapshot.kataVMState.enabled | bool | `false` | Enable the additive kata-vmstate-v1 public snapshot backend. |
+| opensandbox-controller.controller.snapshot.kataVMState.hostKataCtlPath | string | `"/opt/aks-sandbox-demo/kata-v2/bin/kata-ctl"` | Absolute kata-ctl path on Kata worker nodes. |
 | opensandbox-controller.controller.snapshot.registry | string | `""` | OCI registry prefix used for snapshot images. |
 | opensandbox-controller.controller.snapshot.registryInsecure | bool | `false` | Use insecure registry mode when pushing snapshot images. |
 | opensandbox-controller.controller.snapshot.resumePullSecret | string | `""` | Secret name injected into resumed sandboxes for pulling snapshot images. |
@@ -100,7 +103,7 @@ opensandbox-controller:
       imageCommitterPodTemplate:
         metadata:
           labels:
-            identity.example/use: "true"
+            azure.workload.identity/use: "true"
         spec:
           serviceAccountName: snapshot-committer
           containers:
@@ -110,6 +113,9 @@ opensandbox-controller:
                   cpu: 100m
                   memory: 128Mi
       resumePullSecret: registry-pull-secret
+      kataVMState:
+        enabled: false
+        hostKataCtlPath: /opt/aks-sandbox-demo/kata-v2/bin/kata-ctl
 
 opensandbox-server:
   server:

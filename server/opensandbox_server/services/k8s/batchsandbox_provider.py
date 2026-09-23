@@ -18,7 +18,9 @@ BatchSandbox-based workload provider implementation.
 
 import logging
 import json
+import base64
 import shlex
+from copy import deepcopy
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
@@ -27,7 +29,11 @@ from opensandbox_server.config import (
     INGRESS_MODE_GATEWAY,
 )
 from opensandbox_server.extensions.keys import BOOTSTRAP_EXECD_ISOLATION_KEY
-from opensandbox_server.services.constants import OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT
+from opensandbox_server.services.constants import (
+    OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT,
+    SANDBOX_ID_LABEL,
+    SANDBOX_SNAPSHOT_ID_LABEL,
+)
 from opensandbox_server.services.helpers import format_ingress_endpoint
 from opensandbox_server.api.schema import Endpoint, ImageSpec, PlatformSpec, Volume
 from opensandbox_server.services.k8s.image_pull_secret_helper import (
@@ -61,8 +67,26 @@ from opensandbox_server.services.k8s.workload_provider import (
     WorkloadProvider,
 )
 from opensandbox_server.services.runtime_resolver import SecureRuntimeResolver
+from opensandbox_server.services.snapshot_models import SnapshotRestoreConfig
 
 logger = logging.getLogger(__name__)
+
+KATA_RESTORE_RUNTIME_CLASS = "kata-vm-isolation-v2"
+KATA_SNAPSHOT_ANNOTATION = "io.katacontainers.snapshot-name"
+KATA_RESTORE_PLAN_SECRET_KEY = "pod-template.json"
+_CAPTURED_IDENTITY_LABELS = frozenset(
+    {
+        SANDBOX_ID_LABEL,
+        SANDBOX_SNAPSHOT_ID_LABEL,
+        "batch-sandbox.sandbox.opensandbox.io/name",
+        "batch-sandbox.sandbox.opensandbox.io/pod-index",
+        "sandbox.opensandbox.io/pool-name",
+        "sandbox.opensandbox.io/pool-revision",
+        "sandbox.opensandbox.io/sandbox-snapshot-name",
+        "opensandbox.io/source-sandbox-id",
+        "opensandbox.io/snapshot-scope",
+    }
+)
 
 
 _PUBLIC_STATE_BY_PHASE = {
@@ -126,6 +150,196 @@ class BatchSandboxProvider(WorkloadProvider):
 
     def supports_image_auth(self) -> bool:
         return True
+
+    def create_workload_from_kata_snapshot(
+        self,
+        *,
+        sandbox_id: str,
+        namespace: str,
+        restore_config: SnapshotRestoreConfig,
+        labels: Dict[str, str],
+        annotations: Optional[Dict[str, str]],
+        expires_at: Optional[datetime],
+    ) -> Dict[str, Any]:
+        """Create a BatchSandbox directly from a captured Kata PodTemplate."""
+        if not restore_config.is_complete_kata_plan():
+            raise ValueError("Kata snapshot restore plan is incomplete.")
+        pod_template = self._load_kata_restore_plan(namespace, restore_config)
+        assert restore_config.source_node_name is not None
+        assert restore_config.snapshot_name is not None
+
+        runtime_class = self.k8s_client.read_runtime_class(KATA_RESTORE_RUNTIME_CLASS)
+        handler = (
+            runtime_class.get("handler")
+            if isinstance(runtime_class, dict)
+            else getattr(runtime_class, "handler", None)
+        )
+        if handler != "kata-v2":
+            raise ValueError(
+                f"RuntimeClass {KATA_RESTORE_RUNTIME_CLASS!r} must use handler 'kata-v2'."
+            )
+
+        node = self.k8s_client.read_node(restore_config.source_node_name)
+        self._ensure_kata_restore_node_ready(node, restore_config.source_node_name)
+
+        pod_template = deepcopy(pod_template)
+        metadata = pod_template.setdefault("metadata", {})
+        if not isinstance(metadata, dict):
+            raise ValueError("Captured Kata PodTemplate metadata must be an object.")
+        captured_labels = metadata.get("labels")
+        sanitized_labels = dict(captured_labels) if isinstance(captured_labels, dict) else {}
+        for key in _CAPTURED_IDENTITY_LABELS:
+            sanitized_labels.pop(key, None)
+        sanitized_labels.update(labels)
+        metadata["labels"] = sanitized_labels
+
+        captured_annotations = metadata.get("annotations")
+        template_annotations = (
+            dict(captured_annotations) if isinstance(captured_annotations, dict) else {}
+        )
+        template_annotations.pop(KATA_SNAPSHOT_ANNOTATION, None)
+        template_annotations[KATA_SNAPSHOT_ANNOTATION] = restore_config.snapshot_name
+        if annotations:
+            template_annotations.update(annotations)
+        metadata["annotations"] = template_annotations
+
+        pod_spec = pod_template.get("spec")
+        if not isinstance(pod_spec, dict):
+            raise ValueError("Captured Kata PodTemplate spec must be an object.")
+        pod_spec["runtimeClassName"] = KATA_RESTORE_RUNTIME_CLASS
+        pod_spec["nodeName"] = restore_config.source_node_name
+
+        # Reserve the snapshot with a labeled zero-replica BatchSandbox. The
+        # service revalidates the catalog before activating it, closing the
+        # create/delete race without starting a Pod from deleting artifacts.
+        spec: Dict[str, Any] = {"replicas": 0, "template": pod_template}
+        if expires_at is not None:
+            spec["expireTime"] = expires_at.isoformat()
+        manifest = {
+            "apiVersion": f"{self.group}/{self.version}",
+            "kind": "BatchSandbox",
+            "metadata": {
+                "name": sandbox_id,
+                "namespace": namespace,
+                "labels": labels,
+                "annotations": template_annotations,
+            },
+            "spec": spec,
+        }
+        created = self.k8s_client.create_custom_object(
+            group=self.group,
+            version=self.version,
+            namespace=namespace,
+            plural=self.plural,
+            body=manifest,
+        )
+        return {
+            "name": created["metadata"]["name"],
+            "uid": created["metadata"]["uid"],
+            "apiVersion": f"{self.group}/{self.version}",
+            "kind": "BatchSandbox",
+        }
+
+    def activate_kata_snapshot_workload(self, sandbox_id: str, namespace: str) -> None:
+        self.k8s_client.patch_custom_object(
+            group=self.group,
+            version=self.version,
+            namespace=namespace,
+            plural=self.plural,
+            name=sandbox_id,
+            body={"spec": {"replicas": 1}},
+        )
+
+    def _load_kata_restore_plan(
+        self,
+        namespace: str,
+        restore_config: SnapshotRestoreConfig,
+    ) -> Dict[str, Any]:
+        assert restore_config.restore_plan_secret_name is not None
+        assert restore_config.restore_plan_owner_name is not None
+        assert restore_config.restore_plan_owner_uid is not None
+        secret = self.k8s_client.read_secret(
+            namespace,
+            restore_config.restore_plan_secret_name,
+        )
+        if secret is None:
+            raise ValueError("Kata snapshot restore plan Secret was not found.")
+        metadata = secret.get("metadata", {}) if isinstance(secret, dict) else getattr(secret, "metadata", None)
+        secret_type = secret.get("type") if isinstance(secret, dict) else getattr(secret, "type", None)
+        immutable = secret.get("immutable") if isinstance(secret, dict) else getattr(secret, "immutable", None)
+        data = secret.get("data", {}) if isinstance(secret, dict) else getattr(secret, "data", None)
+        owners = metadata.get("ownerReferences", []) if isinstance(metadata, dict) else getattr(metadata, "owner_references", [])
+        if secret_type != "Opaque" or immutable is not True or not isinstance(data, dict):
+            raise ValueError("Kata snapshot restore plan Secret is not immutable and opaque.")
+        owner_matches = any(
+            (
+                owner.get("apiVersion") == "sandbox.opensandbox.io/v1alpha1"
+                and owner.get("kind") == "SandboxSnapshot"
+                and owner.get("name") == restore_config.restore_plan_owner_name
+                and owner.get("uid") == restore_config.restore_plan_owner_uid
+                and owner.get("controller") is True
+            )
+            if isinstance(owner, dict)
+            else (
+                getattr(owner, "api_version", None) == "sandbox.opensandbox.io/v1alpha1"
+                and getattr(owner, "kind", None) == "SandboxSnapshot"
+                and getattr(owner, "name", None) == restore_config.restore_plan_owner_name
+                and str(getattr(owner, "uid", "")) == restore_config.restore_plan_owner_uid
+                and getattr(owner, "controller", None) is True
+            )
+            for owner in (owners or [])
+        )
+        if not owner_matches:
+            raise ValueError("Kata snapshot restore plan Secret ownership is invalid.")
+        encoded = data.get(KATA_RESTORE_PLAN_SECRET_KEY)
+        if not isinstance(encoded, str):
+            raise ValueError("Kata snapshot restore plan Secret data is missing.")
+        try:
+            template = json.loads(base64.b64decode(encoded, validate=True))
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("Kata snapshot restore plan Secret data is invalid.") from exc
+        if not isinstance(template, dict):
+            raise ValueError("Kata snapshot restore plan must be an object.")
+        return template
+
+    @staticmethod
+    def _ensure_kata_restore_node_ready(node: Any, node_name: str) -> None:
+        if node is None:
+            raise ValueError(f"Kata snapshot source node {node_name!r} was not found.")
+        metadata = node.get("metadata", {}) if isinstance(node, dict) else getattr(node, "metadata", None)
+        deletion_timestamp = (
+            metadata.get("deletionTimestamp")
+            if isinstance(metadata, dict)
+            else getattr(metadata, "deletion_timestamp", None)
+        )
+        spec = node.get("spec", {}) if isinstance(node, dict) else getattr(node, "spec", None)
+        unschedulable = (
+            spec.get("unschedulable", False)
+            if isinstance(spec, dict)
+            else getattr(spec, "unschedulable", False)
+        )
+        node_status = node.get("status", {}) if isinstance(node, dict) else getattr(node, "status", None)
+        conditions = (
+            node_status.get("conditions", [])
+            if isinstance(node_status, dict)
+            else getattr(node_status, "conditions", [])
+        ) or []
+        ready = any(
+            (
+                condition.get("type") == "Ready"
+                and condition.get("status") == "True"
+            )
+            if isinstance(condition, dict)
+            else (
+                getattr(condition, "type", None) == "Ready"
+                and getattr(condition, "status", None) == "True"
+            )
+            for condition in conditions
+        )
+        if deletion_timestamp or unschedulable or not ready:
+            raise ValueError(
+                f"Kata snapshot source node {node_name!r} must exist, be Ready, and be schedulable."
+            )
 
     def create_workload(
         self,

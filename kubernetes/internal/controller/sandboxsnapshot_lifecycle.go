@@ -15,6 +15,7 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -26,9 +27,11 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	nodev1 "k8s.io/api/node/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -44,8 +47,7 @@ import (
 // handlePending resolves the source Pod and creates the commit Job.
 func (r *SandboxSnapshotReconciler) handlePending(ctx context.Context, snapshot *sandboxv1alpha1.SandboxSnapshot) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
-
-	if r.SnapshotRegistry == "" {
+	if snapshot.Spec.Format == "" && r.SnapshotRegistry == "" {
 		msg := "snapshot-registry not configured in controller manager"
 		log.Error(nil, msg)
 		_ = r.updateSnapshotStatus(ctx, snapshot, sandboxv1alpha1.SandboxSnapshotPhaseFailed, "RegistryNotConfigured", msg)
@@ -75,40 +77,76 @@ func (r *SandboxSnapshotReconciler) handlePending(ctx context.Context, snapshot 
 		_ = r.updateSnapshotStatus(ctx, snapshot, sandboxv1alpha1.SandboxSnapshotPhaseFailed, "InvalidCheckpointContract", msg)
 		return ctrl.Result{}, nil
 	}
-	snapshotFormat := sandboxv1alpha1.SandboxSnapshotFormatRootfsV1
-	if workloadContract.Provider == snapshotcontract.ProviderQEMU {
-		snapshotFormat = sandboxv1alpha1.SandboxSnapshotFormatQEMUV1
+	snapshotFormat, err := r.resolveSnapshotFormat(ctx, snapshot, pod, workloadContract)
+	if err != nil {
+		msg := fmt.Sprintf("incompatible snapshot format: %v", err)
+		_ = r.updateSnapshotStatus(ctx, snapshot, sandboxv1alpha1.SandboxSnapshotPhaseFailed, "IncompatibleSnapshotFormat", msg)
+		return ctrl.Result{}, nil
+	}
+	if snapshotFormat != sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1 && r.SnapshotRegistry == "" {
+		msg := "snapshot-registry not configured in controller manager"
+		log.Error(nil, msg)
+		_ = r.updateSnapshotStatus(ctx, snapshot, sandboxv1alpha1.SandboxSnapshotPhaseFailed, "RegistryNotConfigured", msg)
+		return ctrl.Result{}, nil
 	}
 
 	sourcePodName := pod.Name
 	sourceNodeName := pod.Spec.NodeName
-
-	sourceContainers := pod.Spec.Containers
-	if bs.Spec.Template != nil {
-		sourceContainers = bs.Spec.Template.Spec.Containers
-	}
-
-	var containers []sandboxv1alpha1.ContainerSnapshot
-	for _, c := range sourceContainers {
-		imageURI := r.snapshotImageURI(snapshot, bs, c.Name)
-		containers = append(containers, sandboxv1alpha1.ContainerSnapshot{
-			ContainerName: c.Name,
-			ImageURI:      imageURI,
-		})
-	}
-	if len(containers) == 0 {
-		msg := fmt.Sprintf("no containers found in BatchSandbox %s template", bs.Name)
-		_ = r.updateSnapshotStatus(ctx, snapshot, sandboxv1alpha1.SandboxSnapshotPhaseFailed, "NoContainers", msg)
+	if sourceNodeName == "" {
+		msg := "source pod is not assigned to a node"
+		_ = r.updateSnapshotStatus(ctx, snapshot, sandboxv1alpha1.SandboxSnapshotPhaseFailed, "SourceNodeNotFound", msg)
 		return ctrl.Result{}, nil
 	}
 
-	if err := r.persistResolvedData(ctx, snapshot, sourcePodName, sourceNodeName, snapshotFormat, containers); err != nil {
+	var containers []sandboxv1alpha1.ContainerSnapshot
+	var kataVMState *sandboxv1alpha1.KataVMStateSnapshot
+	if snapshotFormat == sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1 {
+		snapshotName, err := kataSnapshotName(snapshot.UID)
+		if err != nil {
+			_ = r.updateSnapshotStatus(ctx, snapshot, sandboxv1alpha1.SandboxSnapshotPhaseFailed, "InvalidSnapshotIdentity", err.Error())
+			return ctrl.Result{}, nil
+		}
+		podTemplate, err := kataPodTemplate(pod)
+		if err != nil {
+			_ = r.updateSnapshotStatus(ctx, snapshot, sandboxv1alpha1.SandboxSnapshotPhaseFailed, "CapturePodTemplateFailed", err.Error())
+			return ctrl.Result{}, nil
+		}
+		restorePlanSecretName, err := r.ensureKataRestorePlanSecret(ctx, snapshot, snapshotName, podTemplate.Raw)
+		if err != nil {
+			_ = r.updateSnapshotStatus(ctx, snapshot, sandboxv1alpha1.SandboxSnapshotPhaseFailed, "PersistRestorePlanFailed", err.Error())
+			return ctrl.Result{}, nil
+		}
+		kataVMState = &sandboxv1alpha1.KataVMStateSnapshot{
+			SnapshotName:          snapshotName,
+			RestorePlanSecretName: restorePlanSecretName,
+		}
+	} else {
+		sourceContainers := pod.Spec.Containers
+		if bs.Spec.Template != nil {
+			sourceContainers = bs.Spec.Template.Spec.Containers
+		}
+		for _, c := range sourceContainers {
+			imageURI := r.snapshotImageURI(snapshot, bs, c.Name)
+			containers = append(containers, sandboxv1alpha1.ContainerSnapshot{
+				ContainerName: c.Name,
+				ImageURI:      imageURI,
+			})
+		}
+		if len(containers) == 0 {
+			msg := fmt.Sprintf("no containers found in BatchSandbox %s template", bs.Name)
+			_ = r.updateSnapshotStatus(ctx, snapshot, sandboxv1alpha1.SandboxSnapshotPhaseFailed, "NoContainers", msg)
+			return ctrl.Result{}, nil
+		}
+	}
+
+	if err := r.persistResolvedData(ctx, snapshot, sourcePodName, sourceNodeName, snapshotFormat, containers, kataVMState); err != nil {
 		return ctrl.Result{}, err
 	}
 	snapshot.Status.SourcePodName = sourcePodName
 	snapshot.Status.SourceNodeName = sourceNodeName
 	snapshot.Status.Format = snapshotFormat
 	snapshot.Status.Containers = containers
+	snapshot.Status.KataVMState = kataVMState
 
 	job, err := r.buildCommitJob(snapshot, string(pod.UID), workloadContract)
 	if err != nil {
@@ -168,8 +206,10 @@ func (r *SandboxSnapshotReconciler) handleCommitting(ctx context.Context, snapsh
 			message = failedCond.Message
 		}
 		log.Info("Commit job failed", "job", jobName, "message", message)
-		if err := r.ensureUnpauseJob(ctx, snapshot, imageCommitterEnvValue(job, "SOURCE_POD_UID")); err != nil {
-			log.Error(err, "Failed to create best-effort unpause job")
+		if snapshot.Status.Format != sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1 {
+			if err := r.ensureUnpauseJob(ctx, snapshot, imageCommitterEnvValue(job, "SOURCE_POD_UID")); err != nil {
+				log.Error(err, "Failed to create best-effort unpause job")
+			}
 		}
 		r.Recorder.Eventf(snapshot, corev1.EventTypeWarning, "JobFailed", "Commit job failed")
 		_ = r.updateSnapshotStatus(ctx, snapshot, sandboxv1alpha1.SandboxSnapshotPhaseFailed, "CommitJobFailed", message)
@@ -192,6 +232,19 @@ func findJobCondition(conditions []batchv1.JobCondition, conditionType batchv1.J
 // handleDeletion cleans up the commit job and removes the finalizer.
 func (r *SandboxSnapshotReconciler) handleDeletion(ctx context.Context, snapshot *sandboxv1alpha1.SandboxSnapshot) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
+	if snapshot.Status.Format == sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1 {
+		if snapshot.Status.KataVMState == nil {
+			return ctrl.Result{}, fmt.Errorf("cannot delete kata-vmstate-v1 snapshot without kataVMState status")
+		}
+		stopped, result, err := r.ensureKataCommitJobStopped(ctx, snapshot)
+		if err != nil || !stopped {
+			return result, err
+		}
+		complete, result, err := r.ensureKataCleanup(ctx, snapshot)
+		if err != nil || !complete {
+			return result, err
+		}
+	}
 
 	jobName := r.getJobName(snapshot)
 	job := &batchv1.Job{}
@@ -210,6 +263,16 @@ func (r *SandboxSnapshotReconciler) handleDeletion(ctx context.Context, snapshot
 		}
 		log.Info("Deleted unpause job", "job", unpauseJobName)
 	}
+	if snapshot.Status.Format == sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1 {
+		cleanupJob := &batchv1.Job{}
+		cleanupJobName := r.getKataCleanupJobName(snapshot)
+		if err := r.Get(ctx, types.NamespacedName{Namespace: snapshot.Namespace, Name: cleanupJobName}, cleanupJob); err == nil {
+			if deleteErr := r.Delete(ctx, cleanupJob, client.PropagationPolicy(metav1.DeletePropagationBackground)); deleteErr != nil && !errors.IsNotFound(deleteErr) {
+				return ctrl.Result{}, deleteErr
+			}
+			log.Info("Deleted Kata cleanup job", "job", cleanupJobName)
+		}
+	}
 
 	if controllerutil.ContainsFinalizer(snapshot, sandboxSnapshotFinalizer) {
 		if err := utils.UpdateFinalizer(r.Client, snapshot, utils.RemoveFinalizerOpType, sandboxSnapshotFinalizer); err != nil {
@@ -217,6 +280,174 @@ func (r *SandboxSnapshotReconciler) handleDeletion(ctx context.Context, snapshot
 		}
 	}
 	return ctrl.Result{}, nil
+}
+
+func (r *SandboxSnapshotReconciler) ensureKataCommitJobStopped(ctx context.Context, snapshot *sandboxv1alpha1.SandboxSnapshot) (bool, ctrl.Result, error) {
+	job := &batchv1.Job{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: snapshot.Namespace, Name: r.getJobName(snapshot)}, job)
+	if errors.IsNotFound(err) {
+		return true, ctrl.Result{}, nil
+	}
+	if err != nil {
+		return false, ctrl.Result{}, err
+	}
+	if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil && !errors.IsNotFound(err) {
+		return false, ctrl.Result{}, err
+	}
+	return false, ctrl.Result{RequeueAfter: time.Second}, nil
+}
+
+func (r *SandboxSnapshotReconciler) resolveSnapshotFormat(
+	ctx context.Context,
+	snapshot *sandboxv1alpha1.SandboxSnapshot,
+	pod *corev1.Pod,
+	workloadContract snapshotcontract.WorkloadContract,
+) (sandboxv1alpha1.SandboxSnapshotFormat, error) {
+	requested := snapshot.Spec.Format
+	if requested == "" {
+		if workloadContract.Provider == snapshotcontract.ProviderQEMU {
+			return sandboxv1alpha1.SandboxSnapshotFormatQEMUV1, nil
+		}
+		return sandboxv1alpha1.SandboxSnapshotFormatRootfsV1, nil
+	}
+	switch requested {
+	case sandboxv1alpha1.SandboxSnapshotFormatRootfsV1:
+		if workloadContract.Provider != snapshotcontract.ProviderRootfs {
+			return "", fmt.Errorf("rootfs-v1 cannot snapshot checkpoint provider %q", workloadContract.Provider)
+		}
+	case sandboxv1alpha1.SandboxSnapshotFormatQEMUV1:
+		if workloadContract.Provider != snapshotcontract.ProviderQEMU {
+			return "", fmt.Errorf("qemu-v1 requires checkpoint provider %q", snapshotcontract.ProviderQEMU)
+		}
+	case sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1:
+		if !r.KataVMStateEnabled {
+			return "", fmt.Errorf("kata-vmstate-v1 is disabled")
+		}
+		if hasBatchSandboxControllerOwner(snapshot) {
+			return "", fmt.Errorf("kata-vmstate-v1 is only valid for public snapshots")
+		}
+		if workloadContract.Provider != snapshotcontract.ProviderRootfs {
+			return "", fmt.Errorf("kata-vmstate-v1 cannot snapshot checkpoint provider %q", workloadContract.Provider)
+		}
+		if pod.Spec.RuntimeClassName == nil || *pod.Spec.RuntimeClassName != kataRuntimeClassName {
+			return "", fmt.Errorf("kata-vmstate-v1 requires runtimeClassName %q", kataRuntimeClassName)
+		}
+		if pod.Annotations[kataUnsupportedSecureAccessAnnotation] != "" {
+			return "", fmt.Errorf("kata-vmstate-v1 does not yet support secure-access-enabled sandboxes")
+		}
+		if pod.Annotations[kataUnsupportedEgressAuthAnnotation] != "" {
+			return "", fmt.Errorf("kata-vmstate-v1 does not yet support egress-policy-enabled sandboxes")
+		}
+		runtimeClass := &nodev1.RuntimeClass{}
+		if err := r.Get(ctx, types.NamespacedName{Name: kataRuntimeClassName}, runtimeClass); err != nil {
+			return "", fmt.Errorf("get RuntimeClass %q: %w", kataRuntimeClassName, err)
+		}
+		if runtimeClass.Handler != kataRuntimeHandler {
+			return "", fmt.Errorf("RuntimeClass %q must use handler %q", kataRuntimeClassName, kataRuntimeHandler)
+		}
+	default:
+		return "", fmt.Errorf("unsupported format %q", requested)
+	}
+	return requested, nil
+}
+
+func kataSnapshotName(uid types.UID) (string, error) {
+	if uid == "" {
+		return "", fmt.Errorf("SandboxSnapshot UID is required")
+	}
+	sum := sha256.Sum256([]byte(uid))
+	return fmt.Sprintf("ks-%x", sum[:16]), nil
+}
+
+func kataPodTemplate(pod *corev1.Pod) (runtime.RawExtension, error) {
+	labels := copyPodTemplateMap(pod.Labels)
+	for _, key := range []string{
+		labelPoolName,
+		labelPoolRevision,
+		labelBatchSandboxNameKey,
+		labelBatchSandboxPodIndexKey,
+		labelSandboxIdentity,
+		labelSandboxSnapshotID,
+		labelSourceSandboxIdentity,
+		labelSandboxSnapshotName,
+	} {
+		delete(labels, key)
+	}
+	annotations := copyPodTemplateMap(pod.Annotations)
+	delete(annotations, kataSnapshotAnnotation)
+	spec := *pod.Spec.DeepCopy()
+	spec.NodeName = ""
+	template := corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{Labels: labels, Annotations: annotations},
+		Spec:       spec,
+	}
+	raw, err := json.Marshal(template)
+	if err != nil {
+		return runtime.RawExtension{}, fmt.Errorf("marshal source Pod template: %w", err)
+	}
+	return runtime.RawExtension{Raw: raw}, nil
+}
+
+func (r *SandboxSnapshotReconciler) ensureKataRestorePlanSecret(
+	ctx context.Context,
+	snapshot *sandboxv1alpha1.SandboxSnapshot,
+	snapshotName string,
+	podTemplate []byte,
+) (string, error) {
+	if len(podTemplate) == 0 {
+		return "", fmt.Errorf("captured Pod template is empty")
+	}
+	secretName := snapshotName + kataRestorePlanSecretSuffix
+	existing := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: snapshot.Namespace, Name: secretName}, existing)
+	if err == nil {
+		return secretName, validateKataRestorePlanSecret(snapshot, existing, podTemplate)
+	}
+	if !errors.IsNotFound(err) {
+		return "", fmt.Errorf("get Kata restore plan Secret %q: %w", secretName, err)
+	}
+	immutable := true
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretName,
+			Namespace: snapshot.Namespace,
+			Labels:    map[string]string{labelSandboxSnapshotName: snapshot.Name},
+		},
+		Immutable: &immutable,
+		Type:      corev1.SecretTypeOpaque,
+		Data:      map[string][]byte{kataRestorePlanSecretKey: append([]byte(nil), podTemplate...)},
+	}
+	if err := ctrl.SetControllerReference(snapshot, secret, r.Scheme); err != nil {
+		return "", fmt.Errorf("set Kata restore plan Secret owner: %w", err)
+	}
+	if err := r.Create(ctx, secret); err != nil {
+		if !errors.IsAlreadyExists(err) {
+			return "", fmt.Errorf("create Kata restore plan Secret %q: %w", secretName, err)
+		}
+		raced := &corev1.Secret{}
+		if getErr := r.Get(ctx, types.NamespacedName{Namespace: snapshot.Namespace, Name: secretName}, raced); getErr != nil {
+			return "", fmt.Errorf("read raced Kata restore plan Secret %q: %w", secretName, getErr)
+		}
+		if validateErr := validateKataRestorePlanSecret(snapshot, raced, podTemplate); validateErr != nil {
+			return "", validateErr
+		}
+	}
+	return secretName, nil
+}
+
+func validateKataRestorePlanSecret(snapshot *sandboxv1alpha1.SandboxSnapshot, secret *corev1.Secret, podTemplate []byte) error {
+	if secret == nil || secret.Type != corev1.SecretTypeOpaque || secret.Immutable == nil || !*secret.Immutable {
+		return fmt.Errorf("Kata restore plan Secret must be immutable and opaque")
+	}
+	if !bytes.Equal(secret.Data[kataRestorePlanSecretKey], podTemplate) || len(secret.Data) != 1 {
+		return fmt.Errorf("Kata restore plan Secret %q does not match the captured Pod template", secret.Name)
+	}
+	for _, owner := range secret.OwnerReferences {
+		if owner.APIVersion == sandboxv1alpha1.GroupVersion.String() && owner.Kind == "SandboxSnapshot" && owner.Name == snapshot.Name && owner.UID == snapshot.UID && owner.Controller != nil && *owner.Controller {
+			return nil
+		}
+	}
+	return fmt.Errorf("Kata restore plan Secret %q is not controlled by SandboxSnapshot %s/%s", secret.Name, snapshot.Namespace, snapshot.Name)
 }
 
 // findPodForSandbox finds the running pod belonging to a BatchSandbox.
@@ -363,6 +594,9 @@ func commitJobSecurityContext(requiresHostPID bool) *corev1.SecurityContext {
 }
 
 func (r *SandboxSnapshotReconciler) buildCommitJob(snapshot *sandboxv1alpha1.SandboxSnapshot, sourcePodUID string, contracts ...snapshotcontract.WorkloadContract) (*batchv1.Job, error) {
+	if snapshot.Status.Format == sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1 {
+		return r.buildKataVMStateJob(snapshot, sourcePodUID, false)
+	}
 	jobName := r.getJobName(snapshot)
 	imageCommitterImage := r.imageCommitterImage()
 
@@ -521,6 +755,124 @@ func (r *SandboxSnapshotReconciler) buildCommitJob(snapshot *sandboxv1alpha1.San
 		return nil, fmt.Errorf("failed to set controller reference: %w", err)
 	}
 	return job, nil
+}
+
+func (r *SandboxSnapshotReconciler) buildKataVMStateJob(snapshot *sandboxv1alpha1.SandboxSnapshot, sourcePodUID string, cleanup bool) (*batchv1.Job, error) {
+	if snapshot.Status.KataVMState == nil {
+		return nil, fmt.Errorf("kata-vmstate-v1 snapshot status is missing kataVMState")
+	}
+	if snapshot.Status.SourcePodName == "" && !cleanup {
+		return nil, fmt.Errorf("kata-vmstate-v1 snapshot status is missing sourcePodName")
+	}
+	if snapshot.Status.SourceNodeName == "" {
+		return nil, fmt.Errorf("kata-vmstate-v1 snapshot status is missing sourceNodeName")
+	}
+	snapshotName := snapshot.Status.KataVMState.SnapshotName
+	if !isValidKataSnapshotName(snapshotName) {
+		return nil, fmt.Errorf("invalid Kata snapshot name %q", snapshotName)
+	}
+	if !filepath.IsAbs(r.hostKataCtlPath()) || filepath.Clean(r.hostKataCtlPath()) != r.hostKataCtlPath() || r.hostKataCtlPath() == "/" {
+		return nil, fmt.Errorf("host kata-ctl path must be a clean absolute path")
+	}
+	if sourcePodUID == "" && !cleanup {
+		return nil, fmt.Errorf("kata-vmstate-v1 snapshot requires the source Pod UID")
+	}
+
+	jobName := r.getJobName(snapshot)
+	args := []string{
+		"kata-vmstate", "create",
+		"--pod-name", snapshot.Status.SourcePodName,
+		"--pod-namespace", snapshot.Namespace,
+		"--pod-uid", sourcePodUID,
+		"--snapshot-name", snapshotName,
+		"--kata-ctl-path", r.hostKataCtlPath(),
+	}
+	volumes := []corev1.Volume{{
+		Name: kataHostRootVolumeName,
+		VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
+			Path: "/",
+		}},
+	}}
+	hostToContainer := corev1.MountPropagationHostToContainer
+	volumeMounts := []corev1.VolumeMount{{
+		Name:             kataHostRootVolumeName,
+		MountPath:        kataHostRootMountPath,
+		MountPropagation: &hostToContainer,
+	}}
+	env := []corev1.EnvVar(nil)
+	if cleanup {
+		jobName = r.getKataCleanupJobName(snapshot)
+		args = []string{"kata-vmstate", "delete", "--snapshot-name", snapshotName}
+	} else {
+		volumes = append(volumes, corev1.Volume{
+			Name: "containerd-sock",
+			VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
+				Path: r.containerdSocketPath(),
+			}},
+		})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{Name: "containerd-sock", MountPath: ContainerdSocketPath})
+		env = append(env, corev1.EnvVar{Name: "CONTAINERD_SOCKET", Value: ContainerdSocketPath})
+	}
+	privileged := true
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      jobName,
+			Namespace: snapshot.Namespace,
+			Labels: map[string]string{
+				labelSandboxSnapshotName:  snapshot.Name,
+				labelPrivilegedNodeAccess: "true",
+			},
+		},
+		Spec: batchv1.JobSpec{
+			BackoffLimit:            ptrToInt32(DefaultCommitJobBackoffLimit),
+			TTLSecondsAfterFinished: ptrToInt32(int32(defaultTTLSecondsAfterFinished)),
+			ActiveDeadlineSeconds:   ptrToInt64(int64(r.getCommitJobTimeout().Seconds())),
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				RestartPolicy:    corev1.RestartPolicyNever,
+				ImagePullSecrets: r.imageCommitterPullSecrets(),
+				Containers: []corev1.Container{{
+					Name:            commitJobContainerName,
+					Image:           r.imageCommitterImage(),
+					ImagePullPolicy: corev1.PullIfNotPresent,
+					Command:         []string{"/usr/local/bin/image-committer"},
+					Args:            args,
+					Env:             env,
+					VolumeMounts:    volumeMounts,
+					SecurityContext: &corev1.SecurityContext{
+						RunAsUser:                ptrToInt64(0),
+						RunAsNonRoot:             ptrToBool(false),
+						Privileged:               &privileged,
+						AllowPrivilegeEscalation: ptrToBool(true),
+					},
+				}},
+				Volumes:  volumes,
+				NodeName: snapshot.Status.SourceNodeName,
+			}},
+		},
+	}
+	if err := r.applyImageCommitterPodTemplate(&job.Spec.Template); err != nil {
+		return nil, err
+	}
+	if !cleanup {
+		if err := ctrl.SetControllerReference(snapshot, job, r.Scheme); err != nil {
+			return nil, fmt.Errorf("failed to set controller reference: %w", err)
+		}
+	}
+	return job, nil
+}
+
+func isValidKataSnapshotName(name string) bool {
+	if len(name) != 35 || !strings.HasPrefix(name, "ks-") {
+		return false
+	}
+	return isLowerHex(strings.TrimPrefix(name, "ks-"))
+}
+
+func (r *SandboxSnapshotReconciler) hostKataCtlPath() string {
+	if r.HostKataCtlPath != "" {
+		return r.HostKataCtlPath
+	}
+	return defaultHostKataCtlPath
 }
 
 func (r *SandboxSnapshotReconciler) applyImageCommitterPodTemplate(generated *corev1.PodTemplateSpec) error {
@@ -873,6 +1225,21 @@ func (r *SandboxSnapshotReconciler) updateSnapshotStatusFromSucceededCommitJob(c
 				},
 			}
 		}
+		if latest.Status.Format == sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1 {
+			if !found || result.KataVMState == nil {
+				return fmt.Errorf("successful Kata commit job did not report kataVMState result")
+			}
+			if latest.Status.KataVMState == nil {
+				return fmt.Errorf("kata-vmstate-v1 snapshot status has no resolved kataVMState")
+			}
+			if result.KataVMState.SnapshotName != latest.Status.KataVMState.SnapshotName {
+				return fmt.Errorf("Kata commit job returned snapshot name %q, expected %q", result.KataVMState.SnapshotName, latest.Status.KataVMState.SnapshotName)
+			}
+			if result.KataVMState.RuntimeVersion == "" {
+				return fmt.Errorf("Kata commit job returned an empty runtime version")
+			}
+			latest.Status.KataVMState.RuntimeVersion = result.KataVMState.RuntimeVersion
+		}
 		latest.Status.Phase = sandboxv1alpha1.SandboxSnapshotPhaseSucceed
 		applySnapshotPhaseConditions(&latest.Status, "", "")
 		return r.Status().Update(ctx, latest)
@@ -944,4 +1311,96 @@ func (r *SandboxSnapshotReconciler) getJobName(snapshot *sandboxv1alpha1.Sandbox
 
 func (r *SandboxSnapshotReconciler) getUnpauseJobName(snapshot *sandboxv1alpha1.SandboxSnapshot) string {
 	return fmt.Sprintf("%s-unpause", snapshot.Name)
+}
+
+func (r *SandboxSnapshotReconciler) getKataCleanupJobName(snapshot *sandboxv1alpha1.SandboxSnapshot) string {
+	return snapshot.Name + kataCleanupJobNameSuffix
+}
+
+func (r *SandboxSnapshotReconciler) ensureKataCleanup(ctx context.Context, snapshot *sandboxv1alpha1.SandboxSnapshot) (bool, ctrl.Result, error) {
+	if snapshot.Status.KataVMState == nil || !isValidKataSnapshotName(snapshot.Status.KataVMState.SnapshotName) {
+		return false, ctrl.Result{}, fmt.Errorf("cannot clean up invalid kataVMState status")
+	}
+	jobName := r.getKataCleanupJobName(snapshot)
+	job := &batchv1.Job{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: snapshot.Namespace, Name: jobName}, job)
+	jobExists := err == nil
+	if err == nil {
+		if job.Status.Succeeded > 0 {
+			result, found, resultErr := r.getCommitJobResult(ctx, snapshot.Namespace, jobName)
+			if resultErr != nil {
+				return false, ctrl.Result{}, resultErr
+			}
+			if !found || result.KataVMState == nil || result.KataVMState.SnapshotName != snapshot.Status.KataVMState.SnapshotName {
+				return false, ctrl.Result{}, fmt.Errorf("successful Kata cleanup job returned an invalid snapshot result")
+			}
+			return true, ctrl.Result{}, nil
+		}
+		nodeExists, err := r.requireReadyKataCleanupNode(ctx, snapshot.Status.SourceNodeName)
+		if err != nil {
+			return false, ctrl.Result{}, err
+		}
+		if !nodeExists {
+			return true, ctrl.Result{}, nil
+		}
+		if failed := findJobCondition(job.Status.Conditions, batchv1.JobFailed); failed == nil {
+			return false, ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+	} else if !errors.IsNotFound(err) {
+		return false, ctrl.Result{}, err
+	}
+
+	nodeExists, err := r.requireReadyKataCleanupNode(ctx, snapshot.Status.SourceNodeName)
+	if err != nil {
+		return false, ctrl.Result{}, err
+	}
+	if !nodeExists {
+		return true, ctrl.Result{}, nil
+	}
+	if jobExists {
+		if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !errors.IsNotFound(err) {
+			return false, ctrl.Result{}, err
+		}
+		return false, ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+
+	cleanupJob, err := r.buildKataVMStateJob(snapshot, "", true)
+	if err != nil {
+		return false, ctrl.Result{}, err
+	}
+	if err := r.Create(ctx, cleanupJob); err != nil && !errors.IsAlreadyExists(err) {
+		return false, ctrl.Result{}, err
+	}
+	return false, ctrl.Result{RequeueAfter: time.Second}, nil
+}
+
+func (r *SandboxSnapshotReconciler) requireReadyKataCleanupNode(ctx context.Context, nodeName string) (bool, error) {
+	if nodeName == "" {
+		return false, fmt.Errorf("source node is not recorded for Kata snapshot cleanup")
+	}
+	node := &corev1.Node{}
+	if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
+		if errors.IsNotFound(err) {
+			// Artifacts are node-local. Once the source node is gone there is no
+			// remaining node on which cleanup can or needs to run.
+			return false, nil
+		}
+		return false, fmt.Errorf("source node %q unavailable for Kata snapshot cleanup: %w", nodeName, err)
+	}
+	if !nodeIsReady(node) {
+		return false, fmt.Errorf("source node %q is not Ready for Kata snapshot cleanup", nodeName)
+	}
+	return true, nil
+}
+
+func nodeIsReady(node *corev1.Node) bool {
+	if node == nil || !node.DeletionTimestamp.IsZero() {
+		return false
+	}
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == corev1.NodeReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+	return false
 }

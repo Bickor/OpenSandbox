@@ -53,6 +53,15 @@ spec:
               Pure atomic capability: caller fills spec, Controller only reads spec.
               Registry/snapshotPushSecret/snapshotType come from Controller Manager startup params.
             properties:
+              format:
+                description: |-
+                  Format explicitly selects a snapshot backend. When empty, QEMU workload
+                  annotations select qemu-v1 and all other workloads retain rootfs-v1.
+                enum:
+                - rootfs-v1
+                - qemu-v1
+                - kata-vmstate-v1
+                type: string
               sandboxName:
                 description: |-
                   SandboxName is the name of the target BatchSandbox (same namespace as SandboxSnapshot).
@@ -132,7 +141,31 @@ spec:
                 enum:
                 - rootfs-v1
                 - qemu-v1
+                - kata-vmstate-v1
                 type: string
+              kataVMState:
+                description: |-
+                  KataVMState contains the node-local Kata artifact and restore template for
+                  kata-vmstate-v1 snapshots.
+                properties:
+                  restorePlanSecretName:
+                    description: |-
+                      RestorePlanSecretName identifies the controller-owned Secret containing
+                      the captured PodTemplate. The template may contain credentials and must
+                      not be exposed through the viewer-readable SandboxSnapshot status.
+                    type: string
+                  runtimeVersion:
+                    description: RuntimeVersion is read from kata-snapshot.json after
+                      snapshot creation.
+                    type: string
+                  snapshotName:
+                    description: SnapshotName is the opaque directory name below the
+                      Kata snapshot root.
+                    type: string
+                required:
+                - restorePlanSecretName
+                - snapshotName
+                type: object
               observedGeneration:
                 description: ObservedGeneration is the most recent spec generation
                   observed by the Controller.

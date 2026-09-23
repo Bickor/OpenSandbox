@@ -8,7 +8,7 @@ rules:
   - ""
   resources:
   - configmaps
-  - secrets
+  - nodes
   verbs:
   - get
   - list
@@ -41,6 +41,15 @@ rules:
   - patch
   - update
 - apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - create
+  - get
+  - list
+  - watch
+- apiGroups:
   - batch
   resources:
   - jobs
@@ -60,6 +69,14 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - node.k8s.io
+  resources:
+  - runtimeclasses
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - sandbox.opensandbox.io
   resources:

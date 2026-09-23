@@ -31,6 +31,7 @@ import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxImageSpec
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxLifecycle
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxState
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SnapshotFilter
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SnapshotFormat
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.Volume
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
@@ -402,6 +403,89 @@ class SandboxesAdapterTest {
     }
 
     @Test
+    fun `createSandbox full-state restore should send only restore fields with null timeout`() {
+        mockWebServer.enqueue(
+            MockResponse()
+                .setBody(
+                    """
+                    {
+                      "id": "vmstate-sbx",
+                      "status": { "state": "Running" },
+                      "createdAt": "2025-01-01T00:00:00Z",
+                      "entrypoint": []
+                    }
+                    """.trimIndent(),
+                ).setResponseCode(202),
+        )
+
+        sandboxesAdapter.createSandbox(
+            spec = null,
+            entrypoint = listOf("ignored"),
+            env = mapOf("IGNORED" to "true"),
+            metadata = mapOf("workload" to "vmstate"),
+            timeout = null,
+            resource = mapOf("cpu" to "8"),
+            platform = null,
+            networkPolicy = NetworkPolicy.builder().build(),
+            extensions = mapOf("ignored" to "true"),
+            volumes = null,
+            secureAccess = true,
+            snapshotId = "snap-vmstate",
+            credentialProxy = CredentialProxyConfig.enabled(),
+            lifecycle = SandboxLifecycle.builder().preStart(
+                LifecycleHook.builder().command("ignored").build(),
+            ).build(),
+            fullStateRestore = true,
+        )
+
+        val payload = Json.parseToJsonElement(mockWebServer.takeRequest().body.readUtf8()).jsonObject
+        assertEquals(setOf("snapshotId", "timeout", "metadata"), payload.keys)
+        assertEquals("snap-vmstate", payload["snapshotId"]!!.jsonPrimitive.content)
+        assertEquals(JsonNull, payload["timeout"])
+        assertEquals("vmstate", payload["metadata"]!!.jsonObject["workload"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `createSandbox full-state restore should send numeric timeout and empty metadata`() {
+        mockWebServer.enqueue(
+            MockResponse()
+                .setBody(
+                    """
+                    {
+                      "id": "vmstate-sbx",
+                      "status": { "state": "Running" },
+                      "createdAt": "2025-01-01T00:00:00Z",
+                      "entrypoint": []
+                    }
+                    """.trimIndent(),
+                ).setResponseCode(202),
+        )
+
+        sandboxesAdapter.createSandbox(
+            spec = null,
+            entrypoint = null,
+            env = emptyMap(),
+            metadata = emptyMap(),
+            timeout = Duration.ofSeconds(45),
+            resource = emptyMap(),
+            platform = null,
+            networkPolicy = null,
+            extensions = emptyMap(),
+            volumes = null,
+            secureAccess = false,
+            snapshotId = "snap-vmstate",
+            credentialProxy = null,
+            lifecycle = null,
+            fullStateRestore = true,
+        )
+
+        val payload = Json.parseToJsonElement(mockWebServer.takeRequest().body.readUtf8()).jsonObject
+        assertEquals(setOf("snapshotId", "timeout", "metadata"), payload.keys)
+        assertEquals(45, payload["timeout"]!!.jsonPrimitive.content.toInt())
+        assertTrue(payload["metadata"]!!.jsonObject.isEmpty())
+    }
+
+    @Test
     fun `createSnapshot should send request to snapshots api and parse response`() {
         val sandboxId = "sandbox-123"
         val responseBody =
@@ -432,6 +516,43 @@ class SandboxesAdapterTest {
         assertEquals("/v1/sandboxes/$sandboxId/snapshots", request.path)
         val payload = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
         assertEquals("baseline", payload["name"]!!.jsonPrimitive.content)
+        assertTrue("format" !in payload)
+    }
+
+    @Test
+    fun `createSnapshot should send format and parse restore metadata`() {
+        val responseBody =
+            """
+            {
+                "id": "snap-123",
+                "sandboxId": "sandbox-123",
+                "format": "future-v2",
+                "restoreConstraints": {
+                    "placement": "same-node",
+                    "sourceNode": "node-1",
+                    "durable": false
+                },
+                "status": { "state": "Ready" },
+                "createdAt": "2023-01-01T10:00:00Z"
+            }
+            """.trimIndent()
+        mockWebServer.enqueue(MockResponse().setBody(responseBody).setResponseCode(201))
+
+        val result =
+            sandboxesAdapter.createSnapshot(
+                "sandbox-123",
+                "baseline",
+                SnapshotFormat.KATA_VMSTATE_V1,
+            )
+
+        val request = mockWebServer.takeRequest()
+        val payload = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+        assertEquals("kata-vmstate-v1", payload["format"]!!.jsonPrimitive.content)
+        assertEquals("future-v2", result.format)
+        assertNotNull(result.restoreConstraints)
+        assertEquals("same-node", result.restoreConstraints!!.placement)
+        assertEquals("node-1", result.restoreConstraints!!.sourceNode)
+        assertEquals(false, result.restoreConstraints!!.durable)
     }
 
     @Test

@@ -31,7 +31,10 @@ from requests.exceptions import ConnectTimeout, ReadTimeout
 
 from opensandbox_server.services.constants import SANDBOX_ID_LABEL, SandboxErrorCodes
 from opensandbox_server.services.snapshot_models import SnapshotState
-from opensandbox_server.services.snapshot_runtime import SnapshotRuntimeStatus
+from opensandbox_server.services.snapshot_runtime import (
+    SnapshotRuntimeStatus,
+    SnapshotRuntimeUnsupportedError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +60,12 @@ class DockerSnapshotRuntime:
         sandbox_id: str,
         *,
         namespace: str | None = None,
+        format: str | None = None,
     ) -> None:
+        if format not in (None, "rootfs-v1"):
+            raise SnapshotRuntimeUnsupportedError(
+                f"Docker snapshot runtime does not support format {format!r}."
+            )
         return None
 
     def create_snapshot(
@@ -66,6 +74,7 @@ class DockerSnapshotRuntime:
         sandbox_id: str,
         *,
         namespace: str | None = None,
+        format: str | None = None,
     ) -> Optional[SnapshotRuntimeStatus]:
         return self._create_snapshot(snapshot_id, sandbox_id)
 
@@ -143,6 +152,7 @@ class DockerSnapshotRuntime:
         return SnapshotRuntimeStatus(
             state=SnapshotState.READY,
             image=image_ref,
+            format="rootfs-v1",
             reason="snapshot_recovery_ready",
             message="Recovered snapshot image after server restart.",
         )
@@ -184,6 +194,7 @@ class DockerSnapshotRuntime:
         return SnapshotRuntimeStatus(
             state=SnapshotState.READY,
             image=image_ref,
+            format="rootfs-v1",
             reason="snapshot_runtime_ready",
             message="Docker snapshot image created successfully.",
         )

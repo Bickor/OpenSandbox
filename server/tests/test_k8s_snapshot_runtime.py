@@ -17,6 +17,7 @@ from __future__ import annotations
 from copy import deepcopy
 
 import pytest
+from fastapi import HTTPException
 from kubernetes.client import ApiException
 
 from opensandbox_server.services.k8s.snapshot_runtime import (
@@ -65,6 +66,28 @@ class FakeK8sClient:
 
     def list_pods(self, namespace: str, label_selector: str = ""):
         return [deepcopy(pod) for pod in self.pods.values()]
+
+    def list_custom_objects(
+        self,
+        *,
+        group: str,
+        version: str,
+        namespace: str,
+        plural: str,
+        label_selector: str = "",
+        **kwargs,
+    ):
+        if plural != "batchsandboxes":
+            return []
+        _, _, expected = label_selector.partition("=")
+        return [
+            deepcopy(workload)
+            for workload in self.workloads.values()
+            if (workload.get("metadata", {}).get("labels") or {}).get(
+                "opensandbox.io/snapshot-id"
+            )
+            == expected
+        ]
 
     def read_runtime_class(self, name: str):
         runtime_class = self.runtime_classes.get(name)
@@ -125,6 +148,7 @@ def _snapshot_cr(*, phase: str, containers: list[dict] | None = None, sandbox_id
         "metadata": {
             "name": name,
             "namespace": "default",
+            "uid": "snapshot-uid",
             "labels": {
                 "opensandbox.io/snapshot-id": SNAPSHOT_ID,
                 "opensandbox.io/source-sandbox-id": sandbox_id,
@@ -197,6 +221,40 @@ def test_preflight_allows_non_gvisor_runtimeclass() -> None:
     runtime.preflight_create_snapshot(SANDBOX_ID)
 
     assert k8s_client.created == []
+
+
+def test_preflight_requires_kata_v2_handler_for_kata_vmstate() -> None:
+    k8s_client = FakeK8sClient()
+    k8s_client.workloads[SANDBOX_ID] = {
+        "spec": {"template": {"spec": {"runtimeClassName": "kata-vm-isolation-v2"}}},
+    }
+    k8s_client.pods[f"{SANDBOX_ID}-0"] = {
+        "spec": {"runtimeClassName": "kata-vm-isolation-v2"},
+        "status": {"phase": "Running"},
+    }
+    k8s_client.runtime_classes["kata-vm-isolation-v2"] = {"handler": "runc"}
+    runtime = KubernetesSnapshotRuntime(k8s_client, namespace="default")
+
+    with pytest.raises(SnapshotRuntimeUnsupportedError, match="kata-v2"):
+        runtime.preflight_create_snapshot(
+            SANDBOX_ID,
+            format="kata-vmstate-v1",
+        )
+
+
+def test_preflight_accepts_kata_v2_handler_for_kata_vmstate() -> None:
+    k8s_client = FakeK8sClient()
+    k8s_client.workloads[SANDBOX_ID] = {
+        "spec": {"template": {"spec": {"runtimeClassName": "kata-vm-isolation-v2"}}},
+    }
+    k8s_client.pods[f"{SANDBOX_ID}-0"] = {
+        "spec": {"runtimeClassName": "kata-vm-isolation-v2"},
+        "status": {"phase": "Running"},
+    }
+    k8s_client.runtime_classes["kata-vm-isolation-v2"] = {"handler": "kata-v2"}
+    runtime = KubernetesSnapshotRuntime(k8s_client, namespace="default")
+
+    runtime.preflight_create_snapshot(SANDBOX_ID, format="kata-vmstate-v1")
 
 
 def test_preflight_uses_allocated_pool_pod_runtimeclass() -> None:
@@ -290,6 +348,79 @@ def test_inspect_snapshot_rejects_qemu_snapshot_without_public_restore_plan() ->
     assert status.state == SnapshotState.FAILED
     assert status.reason == "snapshot_restore_qemu_not_supported"
     assert "BatchSandbox pause/resume" in (status.message or "")
+
+
+def test_inspect_snapshot_maps_complete_kata_vmstate_without_image() -> None:
+    k8s_client = FakeK8sClient()
+    snapshot = _snapshot_cr(phase="Succeed")
+    snapshot["status"].update(
+        {
+            "format": "kata-vmstate-v1",
+            "kataVMState": {
+                "restorePlanSecretName": "kata-restore-plan",
+                "snapshotName": "kata-snapshot-a",
+                "runtimeVersion": "3.8.0",
+            },
+            "sourceNodeName": "node-a",
+        }
+    )
+    k8s_client.objects[build_public_snapshot_name(SNAPSHOT_ID)] = snapshot
+    runtime = KubernetesSnapshotRuntime(k8s_client, namespace="default")
+
+    status = runtime.inspect_snapshot(SNAPSHOT_ID)
+
+    assert status.state == SnapshotState.READY
+    assert status.image is None
+    assert status.backend == "kata-vmstate-v1"
+    assert status.restore_plan_secret_name == "kata-restore-plan"
+    assert status.restore_plan_owner_name == build_public_snapshot_name(SNAPSHOT_ID)
+    assert status.restore_plan_owner_uid == "snapshot-uid"
+    assert status.runtime_class_name == "kata-vm-isolation-v2"
+
+
+def test_inspect_snapshot_rejects_incomplete_kata_vmstate() -> None:
+    k8s_client = FakeK8sClient()
+    snapshot = _snapshot_cr(phase="Succeed")
+    snapshot["status"].update(
+        {"format": "kata-vmstate-v1", "kataVMState": {"sourceNodeName": "node-a"}}
+    )
+    k8s_client.objects[build_public_snapshot_name(SNAPSHOT_ID)] = snapshot
+    runtime = KubernetesSnapshotRuntime(k8s_client, namespace="default")
+
+    status = runtime.inspect_snapshot(SNAPSHOT_ID)
+
+    assert status.state == SnapshotState.FAILED
+    assert status.reason == "snapshot_runtime_incomplete_kata_vmstate"
+
+
+def test_inspect_snapshot_rejects_unknown_format() -> None:
+    k8s_client = FakeK8sClient()
+    snapshot = _snapshot_cr(phase="Succeed")
+    snapshot["status"]["format"] = "future-v1"
+    k8s_client.objects[build_public_snapshot_name(SNAPSHOT_ID)] = snapshot
+    runtime = KubernetesSnapshotRuntime(k8s_client, namespace="default")
+
+    status = runtime.inspect_snapshot(SNAPSHOT_ID)
+
+    assert status.state == SnapshotState.FAILED
+    assert status.reason == "snapshot_runtime_unknown_format"
+
+
+def test_create_snapshot_passes_explicit_format_to_cr() -> None:
+    k8s_client = FakeK8sClient()
+    runtime = KubernetesSnapshotRuntime(k8s_client, namespace="default")
+
+    runtime.create_snapshot(
+        SNAPSHOT_ID,
+        SANDBOX_ID,
+        format="kata-vmstate-v1",
+    )
+
+    body = k8s_client.created[0]
+    assert body["spec"] == {
+        "sandboxName": SANDBOX_ID,
+        "format": "kata-vmstate-v1",
+    }
 
 
 def test_inspect_snapshot_maps_failed_condition() -> None:
@@ -474,6 +605,29 @@ def test_delete_snapshot_deletes_cr_and_ignores_missing_cr() -> None:
     runtime.delete_snapshot(SNAPSHOT_ID)
 
     assert k8s_client.deleted == [build_public_snapshot_name(SNAPSHOT_ID)]
+
+
+def test_delete_snapshot_rejects_active_restored_sandbox() -> None:
+    k8s_client = FakeK8sClient()
+    snapshot_name = build_public_snapshot_name(SNAPSHOT_ID)
+    k8s_client.objects[snapshot_name] = {
+        "metadata": {"name": snapshot_name},
+        "spec": {"sandboxName": SANDBOX_ID},
+    }
+    k8s_client.workloads["restored-sandbox"] = {
+        "metadata": {
+            "name": "restored-sandbox",
+            "labels": {"opensandbox.io/snapshot-id": SNAPSHOT_ID},
+        }
+    }
+    runtime = KubernetesSnapshotRuntime(k8s_client, namespace="default")
+
+    with pytest.raises(HTTPException) as exc_info:
+        runtime.delete_snapshot(SNAPSHOT_ID)
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["code"] == "SNAPSHOT::DELETE_CONFLICT"
+    assert k8s_client.deleted == []
 
 
 def test_create_snapshot_submits_without_waiting_for_terminal_status() -> None:

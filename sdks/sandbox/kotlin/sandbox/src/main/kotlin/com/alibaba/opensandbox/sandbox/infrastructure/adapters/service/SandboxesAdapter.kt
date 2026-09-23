@@ -45,6 +45,7 @@ import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxLifecycle
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxOrigin
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxRenewResponse
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SnapshotFilter
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SnapshotFormat
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SnapshotInfo
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.TemplateFilter
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.TemplateInfo
@@ -68,6 +69,10 @@ import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.toSandb
 import com.alibaba.opensandbox.sandbox.transport.RequestDeadline
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
@@ -168,6 +173,7 @@ internal class SandboxesAdapter(
             credentialProxy = credentialProxy,
             resourceRequests = resourceRequests,
             lifecycle = null,
+            fullStateRestore = false,
         )
 
     override fun createSandbox(
@@ -186,10 +192,15 @@ internal class SandboxesAdapter(
         credentialProxy: CredentialProxyConfig?,
         resourceRequests: Map<String, String>?,
         lifecycle: SandboxLifecycle?,
+        fullStateRestore: Boolean,
     ): SandboxCreateResponse {
         logger.info("Creating sandbox with startup source: {}", spec?.image ?: snapshotId)
 
         return try {
+            if (fullStateRestore) {
+                require(snapshotId != null) { "fullStateRestore requires snapshotId" }
+                return createFullStateRestoreSandbox(snapshotId, timeout, metadata)
+            }
             val createRequest =
                 SandboxModelConverter.toApiCreateSandboxRequest(
                     spec = spec,
@@ -215,6 +226,45 @@ internal class SandboxesAdapter(
             response
         } catch (e: Exception) {
             throw e.toSandboxException()
+        }
+    }
+
+    private fun createFullStateRestoreSandbox(
+        snapshotId: String,
+        timeout: Duration?,
+        metadata: Map<String, String>,
+    ): SandboxCreateResponse {
+        val url = provider.config.getBaseUrl().toHttpUrl().newBuilder().addPathSegment("sandboxes").build()
+        val payload =
+            buildJsonObject {
+                put("snapshotId", snapshotId)
+                if (timeout == null) {
+                    put("timeout", kotlinx.serialization.json.JsonNull)
+                } else {
+                    put("timeout", timeout.seconds.toInt())
+                }
+                put(
+                    "metadata",
+                    JsonObject(metadata.mapValues { JsonPrimitive(it.value) }),
+                )
+            }
+        val request =
+            Request.Builder()
+                .url(url)
+                .post(payload.toString().toRequestBody("application/json".toMediaType()))
+                .header("Accept", "application/json")
+                .build()
+
+        provider.authenticatedClient.newCall(request).execute().use { response ->
+            val responseBody = response.body?.string().orEmpty()
+            if (response.isSuccessful) {
+                return Serializer.kotlinxSerializationJson
+                    .decodeFromString<com.alibaba.opensandbox.sandbox.api.models.CreateSandboxResponse>(responseBody)
+                    .toSandboxCreateResponse()
+            }
+            throw response.toSandboxApiException(responseBody) { statusCode, body ->
+                "Failed to create full-state restore sandbox. Status code: $statusCode, Body: $body"
+            }
         }
     }
 
@@ -286,15 +336,56 @@ internal class SandboxesAdapter(
     override fun createSnapshot(
         sandboxId: String,
         name: String?,
+    ): SnapshotInfo = createSnapshot(sandboxId, name, null)
+
+    override fun createSnapshot(
+        sandboxId: String,
+        name: String?,
+        format: String?,
     ): SnapshotInfo {
         return try {
-            snapshotApi.sandboxesSandboxIdSnapshotsPost(
-                sandboxId,
-                name?.let { com.alibaba.opensandbox.sandbox.api.models.CreateSnapshotRequest(name = it) },
-            )
-                .toSnapshotInfo()
+            if (format != null) {
+                require(format in setOf(SnapshotFormat.ROOTFS_V1, SnapshotFormat.QEMU_V1, SnapshotFormat.KATA_VMSTATE_V1)) {
+                    "Unsupported snapshot format: $format"
+                }
+            }
+            createSnapshotRaw(sandboxId, name, format).toSnapshotInfo()
         } catch (e: Exception) {
             throw e.toSandboxException()
+        }
+    }
+
+    private fun createSnapshotRaw(
+        sandboxId: String,
+        name: String?,
+        format: String?,
+    ): com.alibaba.opensandbox.sandbox.api.models.Snapshot {
+        val url =
+            provider.config.getBaseUrl().toHttpUrl().newBuilder()
+                .addPathSegment("sandboxes")
+                .addPathSegment(sandboxId)
+                .addPathSegment("snapshots")
+                .build()
+        val payload =
+            buildJsonObject {
+                name?.let { put("name", it) }
+                format?.let { put("format", it) }
+            }
+        val request =
+            Request.Builder()
+                .url(url)
+                .post(payload.toString().toRequestBody("application/json".toMediaType()))
+                .header("Accept", "application/json")
+                .build()
+
+        provider.authenticatedClient.newCall(request).execute().use { response ->
+            val responseBody = response.body?.string().orEmpty()
+            if (response.isSuccessful) {
+                return Serializer.kotlinxSerializationJson.decodeFromString(responseBody)
+            }
+            throw response.toSandboxApiException(responseBody) { statusCode, body ->
+                "Failed to create snapshot. Status code: $statusCode, Body: $body"
+            }
         }
     }
 

@@ -21,7 +21,9 @@ This file tracks AKS-specific changes carried by the `aks-dev` branch relative t
 
 ## Unreleased
 
-- _No unreleased AKS-local changes._
+- Added the opt-in `kata-vmstate-v1` public snapshot backend for
+  `kata-vm-isolation-v2`, including same-node VM-state capture and restore,
+  node-local cleanup, lifecycle API format selection, and SDK metadata.
 
 ## aksdev/20260918-1
 

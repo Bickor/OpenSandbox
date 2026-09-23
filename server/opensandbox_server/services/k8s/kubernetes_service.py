@@ -104,7 +104,10 @@ from opensandbox_server.services.k8s.client import (
     POOL_PLURAL,
 )
 from opensandbox_server.services.k8s.provider_factory import create_workload_provider
-from opensandbox_server.services.snapshot_restore import resolve_sandbox_image_from_request
+from opensandbox_server.services.snapshot_restore import (
+    resolve_sandbox_from_request,
+    verify_snapshot_restore_ready,
+)
 from opensandbox_server.tenants.context import get_current_tenant
 from opensandbox_server.tenants.provider import TenantProvider
 
@@ -821,8 +824,11 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         self._ensure_pool_mode_compatible(request, has_pool_ref)
 
         if not has_pool_ref:
-            request = await resolve_sandbox_image_from_request(request)
-            ensure_entrypoint(request.entrypoint or [])
+            request = await resolve_sandbox_from_request(request)
+            if request.snapshot_restore_config is None or (
+                request.snapshot_restore_config.format != "kata-vmstate-v1"
+            ):
+                ensure_entrypoint(request.entrypoint or [])
         ensure_metadata_labels(request.metadata)
         ensure_platform_valid(request.platform)
         ensure_timeout_within_limit(
@@ -910,24 +916,61 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
             #      ``_wait_for_sandbox_ready`` failure must rollback before
             #      sweeping (the existing inner try/except handles that).
             try:
-                workload_info = await asyncio.to_thread(
-                    self.workload_provider.create_workload,
-                    sandbox_id=sandbox_id,
-                    namespace=self._resolve_namespace(),
-                    image_spec=request.image,
-                    entrypoint=request.entrypoint,
-                    env=context.sandbox_env,
-                    resource_limits=context.resource_limits,
-                    resource_requests=context.resource_requests or None,
-                    labels=context.labels,
-                    annotations=context.annotations or None,
-                    expires_at=context.expires_at,
-                    execd_image=self.execd_image,
-                    extensions=request.extensions,
-                    egress_settings=context.egress_settings,
-                    volumes=request.volumes,
-                    platform=request.platform,
-                )
+                if request.snapshot_restore_config is not None and (
+                    request.snapshot_restore_config.format == "kata-vmstate-v1"
+                ):
+                    create_from_kata_snapshot = getattr(
+                        self.workload_provider,
+                        "create_workload_from_kata_snapshot",
+                        None,
+                    )
+                    if create_from_kata_snapshot is None:
+                        raise ValueError(
+                            "kata-vmstate-v1 restore requires the BatchSandbox workload provider."
+                        )
+                    workload_info = await asyncio.to_thread(
+                        create_from_kata_snapshot,
+                        sandbox_id=sandbox_id,
+                        namespace=self._resolve_namespace(),
+                        restore_config=request.snapshot_restore_config,
+                        labels=context.labels,
+                        annotations=context.annotations or None,
+                        expires_at=context.expires_at,
+                    )
+                    await verify_snapshot_restore_ready(request)
+                    activate = getattr(
+                        self.workload_provider,
+                        "activate_kata_snapshot_workload",
+                        None,
+                    )
+                    if activate is None:
+                        raise ValueError(
+                            "kata-vmstate-v1 restore requires an activatable BatchSandbox provider."
+                        )
+                    await asyncio.to_thread(
+                        activate,
+                        sandbox_id,
+                        self._resolve_namespace(),
+                    )
+                else:
+                    workload_info = await asyncio.to_thread(
+                        self.workload_provider.create_workload,
+                        sandbox_id=sandbox_id,
+                        namespace=self._resolve_namespace(),
+                        image_spec=request.image,
+                        entrypoint=request.entrypoint,
+                        env=context.sandbox_env,
+                        resource_limits=context.resource_limits,
+                        resource_requests=context.resource_requests or None,
+                        labels=context.labels,
+                        annotations=context.annotations or None,
+                        expires_at=context.expires_at,
+                        execd_image=self.execd_image,
+                        extensions=request.extensions,
+                        egress_settings=context.egress_settings,
+                        volumes=request.volumes,
+                        platform=request.platform,
+                    )
                 workload_left_alive = True
             except ValueError:
                 # Preflight failed; no CR. PVCs are safe to sweep.
@@ -1022,7 +1065,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                     expires_at=context.expires_at,
                     metadata=request.metadata,
                     extensions=extract_extensions_from_mapping(annotations),
-                    entrypoint=request.entrypoint,
+                    entrypoint=request.entrypoint or [],
                     platform=effective_platform or request.platform,
                 )
                 # Reached success — the caller now owns the sandbox lifecycle

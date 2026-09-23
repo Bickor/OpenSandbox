@@ -48,6 +48,7 @@ import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxLifecycle
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxMetrics
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxRenewResponse
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SnapshotInfo
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SnapshotRestoreConstraints
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SnapshotStatus
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.Volume
 import java.time.Duration
@@ -438,6 +439,15 @@ internal object SandboxModelConverter {
             id = this.id,
             sandboxId = this.sandboxId,
             name = this.name,
+            format = this.format,
+            restoreConstraints =
+                this.restoreConstraints?.let {
+                    SnapshotRestoreConstraints(
+                        placement = it.placement.value,
+                        sourceNode = it.sourceNode,
+                        durable = it.durable,
+                    )
+                },
             status =
                 SnapshotStatus(
                     state = this.status.state,

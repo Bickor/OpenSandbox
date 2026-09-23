@@ -129,6 +129,30 @@ async def test_snapshot_restore_preserves_explicit_entrypoint(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
+async def test_image_snapshot_restore_requires_resource_limits(monkeypatch, tmp_path) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    repo.create(
+        SnapshotRecord(
+            id="snap-image",
+            source_sandbox_id="sbx-001",
+            restore_config=SnapshotRestoreConfig(image="registry.example.com/snapshot:1"),
+            status=SnapshotStatusRecord(state=SnapshotState.READY),
+        )
+    )
+    monkeypatch.setattr(
+        "opensandbox_server.services.snapshot_restore.get_snapshot_repository",
+        lambda: repo,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await resolve_sandbox_image_from_request(
+            CreateSandboxRequest(snapshotId="snap-image")
+        )
+    assert exc_info.value.status_code == 400
+    assert "resourceLimits" in exc_info.value.detail["message"]
+
+
+@pytest.mark.asyncio
 async def test_snapshot_restore_rejects_unready_snapshot(monkeypatch, tmp_path) -> None:
     repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
     repo.create(
@@ -175,6 +199,104 @@ async def test_snapshot_restore_passthrough_without_snapshot_id(monkeypatch, tmp
     resolved = await resolve_sandbox_image_from_request(pool_only)
     assert resolved is pool_only
     assert resolved.resolved_snapshot_backend is None
+
+
+@pytest.mark.asyncio
+async def test_kata_snapshot_restore_attaches_private_plan_without_image_or_resources(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    restore_config = SnapshotRestoreConfig(
+        backend="kata-vmstate-v1",
+        format="kata-vmstate-v1",
+        restore_plan_secret_name="kata-restore-plan",
+        restore_plan_owner_name="osb-snap-kata",
+        restore_plan_owner_uid="snapshot-uid",
+        source_node_name="node-a",
+        snapshot_name="kata-snapshot-a",
+        runtime_version="3.8.0",
+        runtime_class_name="kata-vm-isolation-v2",
+    )
+    repo.create(
+        SnapshotRecord(
+            id="snap-kata",
+            source_sandbox_id="sbx-001",
+            restore_config=restore_config,
+            status=SnapshotStatusRecord(state=SnapshotState.READY),
+        )
+    )
+    monkeypatch.setattr(
+        "opensandbox_server.services.snapshot_restore.get_snapshot_repository",
+        lambda: repo,
+    )
+
+    request = CreateSandboxRequest(snapshotId="snap-kata", timeout=600, metadata={"team": "a"})
+    resolved = await resolve_sandbox_image_from_request(request)
+
+    assert resolved.image is None
+    assert resolved.entrypoint is None
+    assert resolved.resource_limits is None
+    assert resolved.snapshot_restore_config == restore_config
+    assert "pod_template" not in resolved.snapshot_restore_config.to_dict()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("entrypoint", ["sh"]),
+        ("env", {"A": "B"}),
+        ("resourceLimits", {"cpu": "1"}),
+        ("resourceRequests", {"cpu": "1"}),
+        ("platform", {"os": "linux", "arch": "amd64"}),
+        ("networkPolicy", {"defaultAction": "allow", "egress": []}),
+        ("credentialProxy", {"enabled": False}),
+        ("secureAccess", False),
+        ("volumes", []),
+        ("lifecycle", {"preStart": {"command": ["true"]}}),
+        ("extensions", {}),
+    ],
+)
+async def test_kata_snapshot_restore_rejects_workload_shape_fields(
+    monkeypatch,
+    tmp_path,
+    field,
+    value,
+) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    repo.create(
+        SnapshotRecord(
+            id="snap-kata",
+            source_sandbox_id="sbx-001",
+            restore_config=SnapshotRestoreConfig(
+                format="kata-vmstate-v1",
+                restore_plan_secret_name="kata-restore-plan",
+                restore_plan_owner_name="osb-snap-kata",
+                restore_plan_owner_uid="snapshot-uid",
+                source_node_name="node-a",
+                snapshot_name="kata-snapshot-a",
+                runtime_version="3.8.0",
+                runtime_class_name="kata-vm-isolation-v2",
+            ),
+            status=SnapshotStatusRecord(state=SnapshotState.READY),
+        )
+    )
+    monkeypatch.setattr(
+        "opensandbox_server.services.snapshot_restore.get_snapshot_repository",
+        lambda: repo,
+    )
+    request = CreateSandboxRequest.model_validate({"snapshotId": "snap-kata", field: value})
+
+    with pytest.raises(HTTPException) as exc_info:
+        await resolve_sandbox_image_from_request(request)
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail["code"] == "SANDBOX::INVALID_PARAMETER"
+    assert exc_info.value.detail["message"] == (
+        "kata-vmstate-v1 snapshot restore accepts only snapshotId, timeout, and metadata; "
+        f"conflicting fields: {field}."
+    )
 
     image_backed = CreateSandboxRequest(
         image=ImageSpec(uri="registry.example.com/app:1"),

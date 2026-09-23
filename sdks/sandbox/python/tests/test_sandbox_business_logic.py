@@ -978,6 +978,66 @@ async def test_create_restore_from_snapshot_preserves_custom_entrypoint(
 
 
 @pytest.mark.asyncio
+async def test_create_full_state_restore_sets_explicit_service_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _CreateResponse:
+        id = "sbx-created"
+
+    class _SandboxServiceCreateStub:
+        async def create_sandbox(self, **kwargs):
+            assert kwargs["full_state_restore"] is True
+            assert kwargs["snapshot_id"] == "snap-vmstate"
+            assert kwargs["timeout"] is None
+            assert kwargs["metadata"] == {"workload": "vmstate"}
+            return _CreateResponse()
+
+        async def get_sandbox_endpoint(self, _sandbox_id, port, _use_server_proxy=False):
+            return SandboxEndpoint(endpoint=f"sbx.internal:{port}")
+
+        async def kill_sandbox(self, _sandbox_id):
+            return None
+
+    class _FactoryStub:
+        def __init__(self, _connection_config):
+            pass
+
+        def create_sandbox_service(self):
+            return _SandboxServiceCreateStub()
+
+        def create_filesystem_service(self, _endpoint):
+            return _Noop()
+
+        def create_command_service(self, _endpoint):
+            return _Noop()
+
+        def create_health_service(self, _endpoint):
+            return _Noop()
+
+        def create_metrics_service(self, _endpoint):
+            return _Noop()
+
+        def create_egress_service(self, _endpoint):
+            return _EgressServiceStub()
+
+        def create_diagnostics_service(self):
+            return _DiagnosticsServiceStub()
+
+        def create_isolated_session_service(self, _endpoint):
+            return _Noop()
+
+    monkeypatch.setattr("opensandbox.sandbox.AdapterFactory", _FactoryStub)
+
+    await Sandbox.create(
+        snapshot_id="snap-vmstate",
+        timeout=None,
+        metadata={"workload": "vmstate"},
+        full_state_restore=True,
+        skip_health_check=True,
+    )
+
+
+@pytest.mark.asyncio
 async def test_create_from_template_passes_only_allowed_fields(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

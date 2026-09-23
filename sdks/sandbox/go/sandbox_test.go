@@ -92,6 +92,74 @@ func TestCreateSandbox_ForwardsLifecycle(t *testing.T) {
 	require.Equal(t, "checkpoint", received.Periodic[0].Name)
 }
 
+func TestCreateSandbox_FullStateRestoreWireBody(t *testing.T) {
+	tests := []struct {
+		name          string
+		manualCleanup bool
+		timeout       *int
+		wantTimeout   any
+	}{
+		{name: "timeout", timeout: intPtr(45), wantTimeout: float64(45)},
+		{name: "manual cleanup", manualCleanup: true, wantTimeout: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var received map[string]any
+			var srv *httptest.Server
+			srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPost && r.URL.Path == "/v1/sandboxes":
+					require.NoError(t, json.NewDecoder(r.Body).Decode(&received))
+					jsonResponse(w, http.StatusCreated, SandboxInfo{
+						ID:         "sbx-vmstate",
+						Status:     SandboxStatus{State: StateRunning},
+						Entrypoint: []string{},
+						CreatedAt:  time.Now().UTC(),
+					})
+				case r.Method == http.MethodGet && r.URL.Path == "/v1/sandboxes/sbx-vmstate":
+					jsonResponse(w, http.StatusOK, SandboxInfo{
+						ID:         "sbx-vmstate",
+						Status:     SandboxStatus{State: StateRunning},
+						Entrypoint: []string{},
+						CreatedAt:  time.Now().UTC(),
+					})
+				case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/endpoints/"):
+					jsonResponse(w, http.StatusOK, Endpoint{Endpoint: srv.URL})
+				default:
+					w.WriteHeader(http.StatusNoContent)
+				}
+			}))
+			defer srv.Close()
+
+			_, err := CreateSandbox(context.Background(), ConnectionConfig{
+				Domain:         srv.URL,
+				DisableMetrics: true,
+			}, SandboxCreateOptions{
+				SnapshotID:       "snap-vmstate",
+				FullStateRestore: true,
+				TimeoutSeconds:   tt.timeout,
+				ManualCleanup:    tt.manualCleanup,
+				Metadata:         map[string]string{"workload": "vmstate"},
+				Entrypoint:       []string{"ignored"},
+				ResourceLimits:   ResourceLimits{"cpu": "8"},
+				ResourceRequests: ResourceLimits{"cpu": "4"},
+				Env:              map[string]string{"IGNORED": "true"},
+				SecureAccess:     true,
+				Extensions:       map[string]string{"ignored": "true"},
+				SkipHealthCheck:  true,
+			})
+			require.NoError(t, err)
+			require.Len(t, received, 3)
+			require.Equal(t, "snap-vmstate", received["snapshotId"])
+			require.Equal(t, tt.wantTimeout, received["timeout"])
+			require.Equal(t, map[string]any{"workload": "vmstate"}, received["metadata"])
+		})
+	}
+}
+
+func intPtr(value int) *int { return &value }
+
 func TestSandbox_Kill(t *testing.T) {
 	var (
 		gotMethod string

@@ -535,6 +535,19 @@ class TestK8sClient:
             namespace="ns", body=body
         )
 
+    def test_read_secret_returns_secret_and_maps_not_found_to_none(self, k8s_runtime_config):
+        c = self._make_client(k8s_runtime_config)
+        secret = MagicMock()
+        c._core_v1_api.read_namespaced_secret.return_value = secret
+
+        assert c.read_secret("ns", "plan") is secret
+        c._core_v1_api.read_namespaced_secret.assert_called_once_with(
+            namespace="ns", name="plan"
+        )
+
+        c._core_v1_api.read_namespaced_secret.side_effect = ApiException(status=404)
+        assert c.read_secret("ns", "missing") is None
+
     def test_list_pods_returns_items(self, k8s_runtime_config):
         c = self._make_client(k8s_runtime_config)
         mock_pod = MagicMock()
@@ -571,6 +584,17 @@ class TestK8sClient:
         c._node_v1_api.read_runtime_class.return_value = MagicMock(metadata=MagicMock(name="gvisor"))
         result = c.read_runtime_class("gvisor")
         c._node_v1_api.read_runtime_class.assert_called_once_with("gvisor")
+        assert result is not None
+
+    def test_read_node_delegates_to_api(self, k8s_runtime_config):
+        c = self._make_client(k8s_runtime_config)
+        c._core_v1_api.read_node.return_value = MagicMock(
+            metadata=MagicMock(name="node-a")
+        )
+
+        result = c.read_node("node-a")
+
+        c._core_v1_api.read_node.assert_called_once_with("node-a")
         assert result is not None
 
     def test_write_limiter_called_on_create(self, k8s_runtime_config):

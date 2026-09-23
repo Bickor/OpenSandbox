@@ -215,6 +215,46 @@ public class SandboxesAdapterTests
         json.RootElement.GetProperty("secureAccess").GetBoolean().Should().BeTrue();
     }
 
+    [Theory]
+    [InlineData(45, false)]
+    [InlineData(null, true)]
+    public async Task CreateSandboxAsync_ShouldSerializeOnlyFullStateRestoreFields(
+        int? timeout,
+        bool expectNullTimeout)
+    {
+        var handler = new CaptureCreateRequestHandler();
+        var client = new HttpClient(handler);
+        var wrapper = new HttpClientWrapper(client, "http://localhost:8080/v1");
+        var adapter = new SandboxesAdapter(wrapper);
+
+        _ = await adapter.CreateSandboxAsync(new CreateSandboxRequest
+        {
+            FullStateRestore = true,
+            SnapshotId = "snap-vmstate",
+            Timeout = timeout,
+            Metadata = new Dictionary<string, string> { ["workload"] = "vmstate" },
+            Entrypoint = ["ignored"],
+            ResourceLimits = new Dictionary<string, string> { ["cpu"] = "8" },
+            Env = new Dictionary<string, string> { ["IGNORED"] = "true" },
+            SecureAccess = true
+        });
+
+        using var json = JsonDocument.Parse(handler.RequestBody!);
+        json.RootElement.EnumerateObject().Select(property => property.Name)
+            .Should().Equal("snapshotId", "timeout", "metadata");
+        json.RootElement.GetProperty("snapshotId").GetString().Should().Be("snap-vmstate");
+        if (expectNullTimeout)
+        {
+            json.RootElement.GetProperty("timeout").ValueKind.Should().Be(JsonValueKind.Null);
+        }
+        else
+        {
+            json.RootElement.GetProperty("timeout").GetInt32().Should().Be(45);
+        }
+        json.RootElement.GetProperty("metadata").GetProperty("workload").GetString()
+            .Should().Be("vmstate");
+    }
+
     [Fact]
     public async Task CreateSandboxAsync_ShouldSerializeLifecycleHooks()
     {
@@ -293,6 +333,70 @@ public class SandboxesAdapterTests
 
         handler.PathAndQuery.Should().Be(
             "/v1/snapshots?name=toolchain%3Acsharp%40rev-1");
+    }
+
+    [Fact]
+    public async Task CreateSnapshotAsync_ShouldSendFormatAndParseRestoreMetadata()
+    {
+        const string payload = """
+        {
+          "id": "snap-1",
+          "sandboxId": "sbx-1",
+          "format": "future-v2",
+          "restoreConstraints": {
+            "placement": "same-node",
+            "sourceNode": "node-1",
+            "durable": false
+          },
+          "status": { "state": "Ready" },
+          "createdAt": "2026-09-23T12:00:00Z"
+        }
+        """;
+        var handler = new CapturingHandler(payload);
+        var client = new HttpClient(handler);
+        var wrapper = new HttpClientWrapper(client, "http://localhost:8080/v1");
+        var adapter = new SandboxesAdapter(wrapper);
+
+        var snapshot = await adapter.CreateSnapshotAsync(
+            "sbx-1",
+            new CreateSnapshotRequest
+            {
+                Name = "baseline",
+                Format = SnapshotFormats.KataVmstateV1
+            });
+
+        handler.PathAndQuery.Should().Be("/v1/sandboxes/sbx-1/snapshots");
+        using var json = JsonDocument.Parse(handler.RequestBody!);
+        json.RootElement.GetProperty("format").GetString().Should().Be("kata-vmstate-v1");
+        snapshot.Format.Should().Be("future-v2");
+        snapshot.RestoreConstraints.Should().NotBeNull();
+        snapshot.RestoreConstraints!.Placement.Should().Be("same-node");
+        snapshot.RestoreConstraints.SourceNode.Should().Be("node-1");
+        snapshot.RestoreConstraints.Durable.Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task CreateSnapshotAsync_ShouldOmitUnrequestedFormat()
+    {
+        const string payload = """
+        {
+          "id": "snap-1",
+          "sandboxId": "sbx-1",
+          "status": { "state": "Creating" },
+          "createdAt": "2026-09-23T12:00:00Z"
+        }
+        """;
+        var handler = new CapturingHandler(payload);
+        var client = new HttpClient(handler);
+        var wrapper = new HttpClientWrapper(client, "http://localhost:8080/v1");
+        var adapter = new SandboxesAdapter(wrapper);
+
+        _ = await adapter.CreateSnapshotAsync(
+            "sbx-1",
+            new CreateSnapshotRequest { Name = "baseline" });
+
+        using var json = JsonDocument.Parse(handler.RequestBody!);
+        json.RootElement.TryGetProperty("format", out _).Should().BeFalse();
     }
 
     [Fact]

@@ -225,6 +225,40 @@ public class SandboxEgressLifecycleTests
     }
 
     [Fact]
+    public async Task CreateAsync_ShouldSelectFullStateRestoreRequestMode()
+    {
+        var sandboxes = new StubSandboxes();
+        var adapterFactory = new StubAdapterFactory(sandboxes, new StubEgress());
+
+        await using var sandbox = await Sandbox.CreateAsync(new SandboxCreateOptions
+        {
+            SnapshotId = "snap-vmstate",
+            FullStateRestore = true,
+            ManualCleanup = true,
+            Metadata = new Dictionary<string, string> { ["workload"] = "vmstate" },
+            Entrypoint = ["ignored"],
+            Resource = new Dictionary<string, string> { ["cpu"] = "8" },
+            SecureAccess = true,
+            ConnectionConfig = new ConnectionConfig(new ConnectionConfigOptions
+            {
+                Domain = "127.0.0.1:8080",
+                Protocol = ConnectionProtocol.Http
+            }),
+            AdapterFactory = adapterFactory,
+            SkipHealthCheck = true
+        });
+
+        var request = sandboxes.LastCreateRequest!;
+        request.FullStateRestore.Should().BeTrue();
+        request.SnapshotId.Should().Be("snap-vmstate");
+        request.Timeout.Should().BeNull();
+        request.Metadata.Should().ContainKey("workload").WhoseValue.Should().Be("vmstate");
+        request.Entrypoint.Should().BeNull();
+        request.ResourceLimits.Should().BeNull();
+        request.SecureAccess.Should().BeNull();
+    }
+
+    [Fact]
     public async Task CreateAsync_ShouldRejectRelativeHostPath()
     {
         var sandboxes = new StubSandboxes();
