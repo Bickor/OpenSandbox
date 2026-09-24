@@ -231,6 +231,38 @@ class TestBatchSandboxProvider:
         assert "containers" in body["spec"]["template"]["spec"]
         assert "volumes" in body["spec"]["template"]["spec"]
 
+    def test_create_workload_with_preinstalled_execd_omits_installer_volume(
+        self, mock_k8s_client
+    ):
+        provider = BatchSandboxProvider(mock_k8s_client)
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "test-id", "uid": "test-uid"}
+        }
+
+        provider.create_workload(
+            sandbox_id="test-id",
+            namespace="test-ns",
+            image_spec=ImageSpec(uri="example/preinstalled:latest"),
+            entrypoint=["/bin/sh"],
+            env={},
+            resource_limits={},
+            labels={"opensandbox.io/id": "test-id"},
+            expires_at=None,
+            execd_image="execd:latest",
+            extensions={"bootstrap.execd.preinstalled": "enable"},
+        )
+
+        body = mock_k8s_client.create_custom_object.call_args.kwargs["body"]
+        pod_spec = body["spec"]["template"]["spec"]
+        assert "initContainers" not in pod_spec
+        assert all(volume.get("name") != "opensandbox-bin" for volume in pod_spec["volumes"])
+        main = pod_spec["containers"][0]
+        assert all(
+            mount.get("name") != "opensandbox-bin"
+            for mount in main.get("volumeMounts", [])
+        )
+        assert main["command"][:1] == ["/opt/opensandbox/bootstrap.sh"]
+
     def test_create_workload_from_kata_snapshot_sanitizes_exact_manifest(
         self,
         mock_k8s_client,

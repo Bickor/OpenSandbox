@@ -21,6 +21,11 @@ ACCESS_RENEW_EXTEND_SECONDS_METADATA_KEY = "opensandbox.io/access-renew-extend-s
 # execd can use bwrap namespace isolation (OSEP-0013).
 BOOTSTRAP_EXECD_ISOLATION_KEY = "bootstrap.execd.isolation"
 
+# When set to "enable", the workload image already contains execd and
+# bootstrap.sh under /opt/opensandbox. This avoids an emptyDir-based installer,
+# which is not visible to Kata runtimes configured with shared_fs="none".
+BOOTSTRAP_EXECD_PREINSTALLED_KEY = "bootstrap.execd.preinstalled"
+
 # Default mount path for the isolation upper directory.
 # Must match the execd DefaultConfig().UpperRoot value.
 ISOLATION_UPPER_MOUNT_PATH = "/var/lib/execd/isolation"

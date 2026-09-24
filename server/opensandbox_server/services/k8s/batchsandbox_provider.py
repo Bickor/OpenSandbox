@@ -28,7 +28,10 @@ from opensandbox_server.config import (
     AppConfig,
     INGRESS_MODE_GATEWAY,
 )
-from opensandbox_server.extensions.keys import BOOTSTRAP_EXECD_ISOLATION_KEY
+from opensandbox_server.extensions.keys import (
+    BOOTSTRAP_EXECD_ISOLATION_KEY,
+    BOOTSTRAP_EXECD_PREINSTALLED_KEY,
+)
 from opensandbox_server.services.constants import (
     OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT,
     SANDBOX_ID_LABEL,
@@ -402,11 +405,14 @@ class BatchSandboxProvider(WorkloadProvider):
         disable_ipv6_for_egress = (
             egress_settings.disable_ipv6 if egress_settings is not None else False
         )
-        init_container = _build_execd_init_container(
-            execd_image,
-            self.execd_init_resources,
-            disable_ipv6_for_egress=disable_ipv6_for_egress,
-        )
+        execd_preinstalled = extensions.get(BOOTSTRAP_EXECD_PREINSTALLED_KEY) == "enable"
+        init_container = None
+        if not execd_preinstalled:
+            init_container = _build_execd_init_container(
+                execd_image,
+                self.execd_init_resources,
+                disable_ipv6_for_egress=disable_ipv6_for_egress,
+            )
         
         main_env = dict(env)
         main_env["OPENSANDBOX_ID"] = sandbox_id
@@ -427,12 +433,9 @@ class BatchSandboxProvider(WorkloadProvider):
         )
         
         containers = [_container_to_dict(main_container)]
-        pod_volumes = [
-            {
-                "name": "opensandbox-bin",
-                "emptyDir": {}
-            }
-        ]
+        pod_volumes = []
+        if not execd_preinstalled:
+            pod_volumes.append({"name": "opensandbox-bin", "emptyDir": {}})
         if (extensions or {}).get(BOOTSTRAP_EXECD_ISOLATION_KEY) == "enable":
             pod_volumes.append({
                 "name": "isolation-upper",
@@ -440,10 +443,19 @@ class BatchSandboxProvider(WorkloadProvider):
             })
         pod_spec = {
             "automountServiceAccountToken": False,
-            "initContainers": [_container_to_dict(init_container)],
             "containers": containers,
             "volumes": pod_volumes,
         }
+        if init_container is not None:
+            pod_spec["initContainers"] = [_container_to_dict(init_container)]
+        if execd_preinstalled:
+            for container in containers:
+                mounts = container.get("volumeMounts", [])
+                container["volumeMounts"] = [
+                    mount for mount in mounts if mount.get("name") != "opensandbox-bin"
+                ]
+                if not container["volumeMounts"]:
+                    container.pop("volumeMounts", None)
         if windows_profile:
             apply_windows_profile_overrides(
                 pod_spec=pod_spec,
