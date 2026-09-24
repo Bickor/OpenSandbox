@@ -43,6 +43,8 @@ const (
 	podNamespaceLabel  = "io.kubernetes.pod.namespace"
 	podUIDLabel        = "io.kubernetes.pod.uid"
 	containerNameLabel = "io.kubernetes.container.name"
+	containerKindLabel = "io.cri-containerd.kind"
+	sandboxKind        = "sandbox"
 )
 
 var snapshotNamePattern = regexp.MustCompile(`^ks-[0-9a-f]{32}$`)
@@ -202,10 +204,11 @@ func selectPauseContainer(containers []containerMetadata, request createRequest)
 	var matches []string
 	for _, container := range containers {
 		labels := container.Labels
+		isSandbox := labels[containerNameLabel] == PauseContainerName || labels[containerKindLabel] == sandboxKind
 		if labels[podNameLabel] == request.PodName &&
 			labels[podNamespaceLabel] == request.PodNamespace &&
 			labels[podUIDLabel] == request.PodUID &&
-			labels[containerNameLabel] == PauseContainerName {
+			isSandbox {
 			matches = append(matches, container.ID)
 		}
 	}

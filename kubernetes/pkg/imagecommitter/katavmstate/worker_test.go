@@ -45,6 +45,13 @@ func TestSelectPauseContainerRequiresExactlyOneMatch(t *testing.T) {
 	if _, err := selectPauseContainer([]containerMetadata{matching, matching}, request); err == nil {
 		t.Fatal("multiple matches unexpectedly succeeded")
 	}
+	currentSandbox := containerMetadata{ID: "current-sandbox-id", Labels: map[string]string{
+		podNameLabel: "pod", podNamespaceLabel: "tenant", podUIDLabel: "uid", containerKindLabel: sandboxKind,
+	}}
+	id, err = selectPauseContainer([]containerMetadata{nonPause, currentSandbox}, request)
+	if err != nil || id != "current-sandbox-id" {
+		t.Fatalf("selectPauseContainer() with containerd sandbox label = %q, %v", id, err)
+	}
 }
 
 func TestWorkerCreateInvokesChrootedKataCtlAndReadsRuntimeVersion(t *testing.T) {
