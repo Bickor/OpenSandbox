@@ -59,6 +59,7 @@ type Result struct {
 type VMStateResult struct {
 	SnapshotName   string `json:"snapshotName"`
 	RuntimeVersion string `json:"runtimeVersion,omitempty"`
+	ManifestDigest string `json:"manifestDigest,omitempty"`
 }
 
 type createRequest struct {

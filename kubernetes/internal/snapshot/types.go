@@ -73,6 +73,7 @@ type Result struct {
 type KataVMStateResult struct {
 	SnapshotName   string `json:"snapshotName"`
 	RuntimeVersion string `json:"runtimeVersion,omitempty"`
+	ManifestDigest string `json:"manifestDigest,omitempty"`
 }
 
 type ContainerResult struct {

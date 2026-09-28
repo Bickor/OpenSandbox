@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	containerd "github.com/containerd/containerd"
@@ -34,7 +35,38 @@ func Run(ctx context.Context, args []string, terminationMessagePath string, outp
 		return err
 	}
 	var result Result
-	if operation == "delete" {
+	var store objectStore
+	account, container := os.Getenv("KATA_SNAPSHOT_BLOB_ACCOUNT_URL"), os.Getenv("KATA_SNAPSHOT_BLOB_CONTAINER")
+	if account != "" || container != "" {
+		store, err = newBlobStore(account, container)
+		if err != nil {
+			return err
+		}
+	}
+	if operation == "prepare" {
+		if store == nil {
+			return errors.New("remote snapshot restore requires Blob storage configuration")
+		}
+		err = prepareSnapshot(ctx, store, filepath.Join(HostRoot, SnapshotRoot), snapshotName, os.Getenv("KATA_SNAPSHOT_MANIFEST_DIGEST"))
+		result = Result{Containers: []struct{}{}, KataVMState: VMStateResult{SnapshotName: snapshotName}}
+	} else if operation == "delete-remote" {
+		if err := validateSnapshotName(snapshotName); err != nil {
+			return err
+		}
+		if store == nil {
+			return errors.New("remote deletion requires Blob storage configuration")
+		}
+		err = store.deletePrefix(ctx, objectPrefix(snapshotName))
+		result = Result{Containers: []struct{}{}, KataVMState: VMStateResult{SnapshotName: snapshotName}}
+	} else if operation == "delete" {
+		if err := validateSnapshotName(snapshotName); err != nil {
+			return err
+		}
+		if store != nil {
+			if err := store.deletePrefix(ctx, objectPrefix(snapshotName)); err != nil {
+				return err
+			}
+		}
 		result, err = (&worker{
 			hostRoot:     HostRoot,
 			snapshotRoot: SnapshotRoot,
@@ -50,6 +82,17 @@ func Run(ctx context.Context, args []string, terminationMessagePath string, outp
 		}
 		defer client.Close()
 		result, err = newWorker(client).create(ctx, request)
+		if err == nil && store != nil {
+			root := filepath.Join(HostRoot, SnapshotRoot, request.SnapshotName)
+			plan, planErr := os.ReadFile("/restore-plan/pod-template.json")
+			if planErr != nil {
+				return fmt.Errorf("read private restore plan: %w", planErr)
+			}
+			if err := os.WriteFile(filepath.Join(root, restorePlanFile), plan, 0600); err != nil {
+				return err
+			}
+			result.KataVMState.ManifestDigest, err = uploadSnapshot(ctx, store, root, request.SnapshotName, result.KataVMState.RuntimeVersion)
+		}
 	}
 	if err != nil {
 		return err
@@ -68,7 +111,7 @@ func Run(ctx context.Context, args []string, terminationMessagePath string, outp
 
 func parseArgs(args []string) (string, createRequest, string, error) {
 	if len(args) < 2 || args[0] != "kata-vmstate" {
-		return "", createRequest{}, "", errors.New("usage: image-committer kata-vmstate <create|delete> [flags]")
+		return "", createRequest{}, "", errors.New("usage: image-committer kata-vmstate <create|prepare|delete|delete-remote> [flags]")
 	}
 	switch args[1] {
 	case "create":
@@ -87,7 +130,7 @@ func parseArgs(args []string) (string, createRequest, string, error) {
 			return "", createRequest{}, "", errors.New("kata-vmstate create does not accept positional arguments")
 		}
 		return "create", request, "", nil
-	case "delete":
+	case "delete", "delete-remote", "prepare":
 		flags := flag.NewFlagSet("kata-vmstate delete", flag.ContinueOnError)
 		flags.SetOutput(io.Discard)
 		var snapshotName string
@@ -98,7 +141,7 @@ func parseArgs(args []string) (string, createRequest, string, error) {
 		if flags.NArg() != 0 {
 			return "", createRequest{}, "", errors.New("kata-vmstate delete does not accept positional arguments")
 		}
-		return "delete", createRequest{}, snapshotName, nil
+		return args[1], createRequest{}, snapshotName, nil
 	default:
 		return "", createRequest{}, "", fmt.Errorf("unsupported kata-vmstate operation %q", args[1])
 	}

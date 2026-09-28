@@ -32,6 +32,8 @@ opensandbox-controller:
         enabled: false
         # -- Absolute kata-ctl path on Kata worker nodes.
         hostKataCtlPath: /opt/aks-sandbox-demo/kata-v2/bin/kata-ctl
+        blobAccountURL: ""
+        blobContainer: ""
 
 # Server component values
 opensandbox-server:

@@ -204,6 +204,8 @@ class BatchSandboxProvider(WorkloadProvider):
         template_annotations[KATA_SNAPSHOT_ANNOTATION] = restore_config.snapshot_name
         if annotations:
             template_annotations.update(annotations)
+        template_annotations["opensandbox.io/kata-restore-snapshot"] = restore_config.restore_plan_owner_name
+        template_annotations["opensandbox.io/kata-restore-snapshot-uid"] = restore_config.restore_plan_owner_uid
         metadata["annotations"] = template_annotations
 
         pod_spec = pod_template.get("spec")

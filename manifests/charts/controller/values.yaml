@@ -83,6 +83,9 @@ controller:
       enabled: false
       # -- Absolute kata-ctl path on Kata worker nodes.
       hostKataCtlPath: /opt/aks-sandbox-demo/kata-v2/bin/kata-ctl
+      # Optional remote artifact store. Configure both; uses worker Workload Identity.
+      blobAccountURL: ""
+      blobContainer: ""
 
   # -- Enable leader election for controller manager
   leaderElection:
