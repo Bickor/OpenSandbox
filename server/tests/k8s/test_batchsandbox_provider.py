@@ -346,6 +346,8 @@ class TestBatchSandboxProvider:
                     "keep": "annotation",
                     KATA_SNAPSHOT_ANNOTATION: "kata-snapshot-a",
                     "opensandbox.io/secure-access-token": "new-token",
+                    "opensandbox.io/kata-restore-snapshot": restore_config.restore_plan_owner_name,
+                    "opensandbox.io/kata-restore-snapshot-uid": restore_config.restore_plan_owner_uid,
                 },
             },
             "spec": {
@@ -363,6 +365,8 @@ class TestBatchSandboxProvider:
                             "keep": "annotation",
                             KATA_SNAPSHOT_ANNOTATION: "kata-snapshot-a",
                             "opensandbox.io/secure-access-token": "new-token",
+                            "opensandbox.io/kata-restore-snapshot": restore_config.restore_plan_owner_name,
+                            "opensandbox.io/kata-restore-snapshot-uid": restore_config.restore_plan_owner_uid,
                         },
                     },
                     "spec": {

@@ -120,6 +120,14 @@ type KataVMStateSnapshot struct {
 	// the captured PodTemplate. The template may contain credentials and must
 	// not be exposed through the viewer-readable SandboxSnapshot status.
 	RestorePlanSecretName string `json:"restorePlanSecretName"`
+	// BlobAccountURL and BlobContainer pin the operator-selected remote store.
+	// +optional
+	BlobAccountURL string `json:"blobAccountURL,omitempty"`
+	// +optional
+	BlobContainer string `json:"blobContainer,omitempty"`
+	// ManifestDigest pins the committed manifest. Empty means not uploaded.
+	// +optional
+	ManifestDigest string `json:"manifestDigest,omitempty"`
 }
 
 // SandboxSnapshotCondition represents a condition of a SandboxSnapshot.

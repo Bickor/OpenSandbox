@@ -148,6 +148,16 @@ spec:
                   KataVMState contains the node-local Kata artifact and restore template for
                   kata-vmstate-v1 snapshots.
                 properties:
+                  blobAccountURL:
+                    description: BlobAccountURL and BlobContainer pin the operator-selected
+                      remote store.
+                    type: string
+                  blobContainer:
+                    type: string
+                  manifestDigest:
+                    description: ManifestDigest pins the committed manifest. Empty
+                      means not uploaded.
+                    type: string
                   restorePlanSecretName:
                     description: |-
                       RestorePlanSecretName identifies the controller-owned Secret containing

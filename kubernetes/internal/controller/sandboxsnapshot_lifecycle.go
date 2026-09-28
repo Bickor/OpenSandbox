@@ -119,6 +119,8 @@ func (r *SandboxSnapshotReconciler) handlePending(ctx context.Context, snapshot 
 		kataVMState = &sandboxv1alpha1.KataVMStateSnapshot{
 			SnapshotName:          snapshotName,
 			RestorePlanSecretName: restorePlanSecretName,
+			BlobAccountURL:        r.KataBlobAccountURL,
+			BlobContainer:         r.KataBlobContainer,
 		}
 	} else {
 		sourceContainers := pod.Spec.Containers
@@ -375,6 +377,8 @@ func kataPodTemplate(pod *corev1.Pod) (runtime.RawExtension, error) {
 	}
 	annotations := copyPodTemplateMap(pod.Annotations)
 	delete(annotations, kataSnapshotAnnotation)
+	delete(annotations, kataRestoreSnapshotAnnotation)
+	delete(annotations, kataRestoreOwnerAnnotation)
 	spec := *pod.Spec.DeepCopy()
 	spec.NodeName = ""
 	template := corev1.PodTemplateSpec{
@@ -800,6 +804,13 @@ func (r *SandboxSnapshotReconciler) buildKataVMStateJob(snapshot *sandboxv1alpha
 		MountPropagation: &hostToContainer,
 	}}
 	env := []corev1.EnvVar(nil)
+	if snapshot.Status.KataVMState.BlobAccountURL != "" {
+		env = append(env, kataBlobEnv(snapshot.Status.KataVMState)...)
+		if !cleanup {
+			volumes = append(volumes, corev1.Volume{Name: "restore-plan", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: snapshot.Status.KataVMState.RestorePlanSecretName}}})
+			volumeMounts = append(volumeMounts, corev1.VolumeMount{Name: "restore-plan", MountPath: "/restore-plan", ReadOnly: true})
+		}
+	}
 	if cleanup {
 		jobName = r.getKataCleanupJobName(snapshot)
 		args = []string{"kata-vmstate", "delete", "--snapshot-name", snapshotName}
@@ -1239,6 +1250,12 @@ func (r *SandboxSnapshotReconciler) updateSnapshotStatusFromSucceededCommitJob(c
 				return fmt.Errorf("Kata commit job returned an empty runtime version")
 			}
 			latest.Status.KataVMState.RuntimeVersion = result.KataVMState.RuntimeVersion
+			if latest.Status.KataVMState.BlobAccountURL != "" {
+				if len(result.KataVMState.ManifestDigest) != 64 || !isLowerHex(result.KataVMState.ManifestDigest) {
+					return fmt.Errorf("remote Kata snapshot did not return a valid manifest digest")
+				}
+				latest.Status.KataVMState.ManifestDigest = result.KataVMState.ManifestDigest
+			}
 		}
 		latest.Status.Phase = sandboxv1alpha1.SandboxSnapshotPhaseSucceed
 		applySnapshotPhaseConditions(&latest.Status, "", "")
@@ -1320,6 +1337,14 @@ func (r *SandboxSnapshotReconciler) getKataCleanupJobName(snapshot *sandboxv1alp
 func (r *SandboxSnapshotReconciler) ensureKataCleanup(ctx context.Context, snapshot *sandboxv1alpha1.SandboxSnapshot) (bool, ctrl.Result, error) {
 	if snapshot.Status.KataVMState == nil || !isValidKataSnapshotName(snapshot.Status.KataVMState.SnapshotName) {
 		return false, ctrl.Result{}, fmt.Errorf("cannot clean up invalid kataVMState status")
+	}
+	if snapshot.Status.KataVMState.BlobAccountURL != "" {
+		node := &corev1.Node{}
+		if err := r.Get(ctx, types.NamespacedName{Name: snapshot.Status.SourceNodeName}, node); errors.IsNotFound(err) {
+			return r.ensureRemoteOnlyCleanup(ctx, snapshot)
+		} else if err != nil {
+			return false, ctrl.Result{}, err
+		}
 	}
 	jobName := r.getKataCleanupJobName(snapshot)
 	job := &batchv1.Job{}

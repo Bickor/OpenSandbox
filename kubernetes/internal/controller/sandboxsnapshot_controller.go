@@ -114,6 +114,10 @@ type SandboxSnapshotReconciler struct {
 
 	// HostKataCtlPath is the absolute kata-ctl path inside the host root.
 	HostKataCtlPath string
+	// Optional account/container for newly created Kata snapshots. Existing
+	// snapshots retain their original store in status across config changes.
+	KataBlobAccountURL string
+	KataBlobContainer  string
 }
 
 // +kubebuilder:rbac:groups=sandbox.opensandbox.io,resources=sandboxsnapshots,verbs=get;list;watch;create;update;patch;delete
