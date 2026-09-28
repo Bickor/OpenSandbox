@@ -9,7 +9,7 @@ from pathlib import Path
 COMPONENTS = {"controller", "server", "image-committer-azure"}
 
 
-def assemble(metadata: Path, output: Path, version: str, commit: str, repository: str):
+def assemble(metadata: Path, output: Path, version: str, commit: str, repository: str, remote_snapshots: bool = False):
     if not re.fullmatch(r"\d+\.\d+\.\d+-rc\.\d+", version):
         raise ValueError("expected X.Y.Z-rc.N preview version")
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
@@ -46,6 +46,7 @@ def assemble(metadata: Path, output: Path, version: str, commit: str, repository
             "repository": repository,
             "commit": commit,
             "platforms": ["linux/amd64"],
+            "capabilities": {"kataVMState": True, "remoteSnapshots": remote_snapshots, "restorePlacement": "same-node"},
             "images": images,
             "chart": {"file": chart.name, "sha256": chart_digest},
         },
@@ -56,9 +57,12 @@ def assemble(metadata: Path, output: Path, version: str, commit: str, repository
             }},
             "opensandbox-server": {"server": {"image": image("server")}},
         },
-        "demo-remote-snapshots.json": {"enabled": True, "controllerImage": images["controller"],
-                                      "serverImage": images["server"], "committerImage": images["image-committer-azure"]},
     }
+    if remote_snapshots:
+        assets["demo-remote-snapshots.json"] = {
+            "enabled": True, "controllerImage": images["controller"],
+            "serverImage": images["server"], "committerImage": images["image-committer-azure"],
+        }
     for name, content in assets.items():
         (output / name).write_text(json.dumps(content, indent=2, sort_keys=True) + "\n")
     files = [chart, *(output / name for name in assets)]
@@ -74,4 +78,5 @@ if __name__ == "__main__":
     parser.add_argument("--version", required=True)
     parser.add_argument("--commit", required=True)
     parser.add_argument("--repository", required=True)
+    parser.add_argument("--remote-snapshots", action="store_true")
     assemble(**vars(parser.parse_args()))

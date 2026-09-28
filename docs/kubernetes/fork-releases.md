@@ -34,12 +34,13 @@ explicitly make these fork packages public before anonymous AKS/ACR pulls.
 `release.json` records the source SHA, controller/server/Azure-committer image
 digests and matching chart checksum. `release-values.json` is a Helm override;
 configure the account/container and Workload Identity separately.
-`demo-remote-snapshots.json` is the fragment for the demo Environment's
-`spec.platform.remoteSnapshots`. `SHA256SUMS` covers the four assets.
+`release.json.capabilities.remoteSnapshots` distinguishes the local snapshot
+baseline from releases containing Blob support. Only remote-capable releases
+include `demo-remote-snapshots.json`, the fragment for the demo Environment's
+`spec.platform.remoteSnapshots`. `SHA256SUMS` covers every release asset.
 
 The target is Linux amd64, matching the demo's Kata/MSHV snapshot runtime.
 Other OpenSandbox components and the Kata installer retain the demo's existing
 pins. An artifact release avoids repeated local builds; it does not establish
 cluster compatibility or successful Blob-backed process continuation. Perform
-the live validation in [remote snapshots](/kubernetes/kata-remote-snapshots)
-before promoting a preview for broader use.
+live snapshot/restore validation before promoting a preview for broader use.

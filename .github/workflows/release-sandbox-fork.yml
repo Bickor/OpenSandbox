@@ -148,9 +148,13 @@ jobs:
           mkdir -p dist/fork
           helm package manifests/charts/opensandbox --destination dist/fork \
             --version "$VERSION" --app-version "$VERSION"
+          features=()
+          if [[ -f kubernetes/pkg/imagecommitter/katavmstate/remote.go ]]; then
+            features+=(--remote-snapshots)
+          fi
           python3 manifests/release/fork_release.py --metadata release-metadata \
             --output dist/fork --version "$VERSION" --commit "$GITHUB_SHA" \
-            --repository "$GITHUB_REPOSITORY"
+            --repository "$GITHUB_REPOSITORY" "${features[@]}"
           helm template opensandbox "dist/fork/opensandbox-$VERSION.tgz" \
             --values dist/fork/release-values.json > /dev/null
       - name: Publish preview release

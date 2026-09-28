@@ -28,17 +28,25 @@ class ReleaseTests(unittest.TestCase):
         value.update(overrides)
         (self.metadata / f"{component}.json").write_text(json.dumps(value))
 
-    def assemble(self):
-        assemble(self.metadata, self.output, self.version, self.commit, "Bickor/OpenSandbox")
+    def assemble(self, remote_snapshots=False):
+        assemble(self.metadata, self.output, self.version, self.commit, "Bickor/OpenSandbox", remote_snapshots)
 
     def test_complete_bundle(self):
         self.assemble()
         release = json.loads((self.output / "release.json").read_text())
         self.assertEqual(set(release["images"]), COMPONENTS)
         self.assertEqual(release["commit"], self.commit)
-        self.assertEqual(len((self.output / "SHA256SUMS").read_text().splitlines()), 4)
+        self.assertEqual(len((self.output / "SHA256SUMS").read_text().splitlines()), 3)
+        self.assertFalse(release["capabilities"]["remoteSnapshots"])
+        self.assertFalse((self.output / "demo-remote-snapshots.json").exists())
         values = json.loads((self.output / "release-values.json").read_text())
         self.assertEqual(values["opensandbox-server"]["server"]["image"]["digest"], "sha256:" + "b" * 64)
+
+    def test_remote_bundle(self):
+        self.assemble(remote_snapshots=True)
+        self.assertTrue(json.loads((self.output / "release.json").read_text())["capabilities"]["remoteSnapshots"])
+        self.assertTrue((self.output / "demo-remote-snapshots.json").exists())
+        self.assertEqual(len((self.output / "SHA256SUMS").read_text().splitlines()), 4)
 
     def test_rejects_mixed_commits(self):
         self.write("server", commit="c" * 40)
