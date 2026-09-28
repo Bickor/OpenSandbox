@@ -74,12 +74,16 @@ release-<appVersion> image tag published by the umbrella release pipeline.
 Explicit tags pass through; plain semver keeps the legacy 'v' prefix.
 */}}
 {{- define "opensandbox-server.serverImage" -}}
+{{- if .Values.server.image.digest -}}
+{{- printf "%s@%s" .Values.server.image.repository .Values.server.image.digest -}}
+{{- else -}}
 {{- $tag := .Values.server.image.tag | default (printf "release-%s" .Chart.AppVersion) }}
 {{- $finalTag := $tag }}
 {{- if and (not (hasPrefix "v" $tag)) (regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+" $tag) }}
 {{- $finalTag = printf "v%s" $tag }}
 {{- end }}
 {{- printf "%s:%s" .Values.server.image.repository $finalTag }}
+{{- end }}
 {{- end }}
 
 {{/*

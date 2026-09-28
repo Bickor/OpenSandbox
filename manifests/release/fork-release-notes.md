@@ -1,14 +1,15 @@
 ## AKS sandbox snapshot preview
 
 Versioned **linux/amd64** server, controller and Azure snapshot-worker images,
-built together from the tagged source. This includes the Kata VM-state backend
-and Azure Blob remote artifact persistence with same-node restoration.
+built together from the tagged source. Check `release.json` → `capabilities`
+for this version's features. All current previews retain same-node restoration.
 
 ### Assets
 
 - `release.json`: exact source commit, three GHCR image digests and chart SHA-256.
 - `release-values.json`: Helm overrides for those exact images.
-- `demo-remote-snapshots.json`: Environment `spec.platform.remoteSnapshots` fragment.
+- `demo-remote-snapshots.json`: Environment fragment, included only when this
+  release contains Azure Blob remote snapshot support.
 - `opensandbox-*.tgz`: matching umbrella chart and CRDs.
 - `SHA256SUMS`: checksums for all release assets.
 
@@ -20,4 +21,5 @@ release, not an upstream umbrella release.
 This is a preview, **not evidence of successful live AKS/Blob VM restoration**.
 The source node, snapshot catalog and restore-plan Secret must still exist.
 Cross-node recovery and catalog import are not included. See the tagged
-`docs/kubernetes/kata-remote-snapshots.md` and `docs/kubernetes/fork-releases.md`.
+`docs/kubernetes/fork-releases.md` and, for remote-capable releases,
+`docs/kubernetes/kata-remote-snapshots.md`.
