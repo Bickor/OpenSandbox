@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
@@ -23,8 +25,9 @@ type objectStore interface {
 }
 
 type blobStore struct {
-	client    *azblob.Client
-	container string
+	client       *azblob.Client
+	container    string
+	delegatedSAS bool
 }
 
 func newBlobStore(account, container string) (objectStore, error) {
@@ -35,6 +38,9 @@ func newBlobStore(account, container string) (objectStore, error) {
 	if container == "" || strings.ContainsAny(container, "/\\?#") {
 		return nil, errors.New("Blob container is required and must be a single name")
 	}
+	if token := os.Getenv("KATA_SNAPSHOT_BLOB_SAS_TOKEN"); token != "" {
+		return newDelegatedBlobStore(account, container, token, time.Now())
+	}
 	credential, err := azidentity.NewDefaultAzureCredential(nil)
 	if err != nil {
 		return nil, err
@@ -44,6 +50,42 @@ func newBlobStore(account, container string) (objectStore, error) {
 		return nil, err
 	}
 	return &blobStore{client: client, container: container}, nil
+}
+
+// Optional test/BYOC credential path. Only short-lived, HTTPS, container-scoped
+// user-delegation SAS is accepted; account keys and account SAS are not supported.
+// Inject through a Kubernetes Secret, never a controller flag or snapshot status.
+func newDelegatedBlobStore(account, container, token string, now time.Time) (objectStore, error) {
+	values, err := url.ParseQuery(strings.TrimPrefix(strings.TrimSpace(token), "?"))
+	if err != nil {
+		return nil, errors.New("invalid delegated Blob SAS")
+	}
+	for _, key := range []string{"skoid", "sktid", "skt", "ske", "sks", "skv", "sig", "se"} {
+		if values.Get(key) == "" || len(values[key]) != 1 {
+			return nil, errors.New("container user-delegation SAS is required")
+		}
+	}
+	expires, err := time.Parse(time.RFC3339, values.Get("se"))
+	if err != nil || !expires.After(now) || expires.After(now.Add(24*time.Hour)) || values.Get("sr") != "c" || values.Get("spr") != "https" || values.Get("ss") != "" || values.Get("srt") != "" {
+		return nil, errors.New("delegated SAS must be HTTPS, container-scoped, and expire within 24 hours")
+	}
+	client, err := azblob.NewClientWithNoCredential(strings.TrimRight(account, "/")+"?"+values.Encode(), nil)
+	if err != nil {
+		return nil, errors.New("cannot configure delegated Blob client")
+	}
+	return &blobStore{client: client, container: container, delegatedSAS: true}, nil
+}
+
+func (s *blobStore) transferError(err error) error {
+	if err == nil || !s.delegatedSAS {
+		return err
+	}
+	// Azure SDK errors can contain the request URL, including its SAS query.
+	var response *azcore.ResponseError
+	if errors.As(err, &response) {
+		return fmt.Errorf("delegated Blob request failed: HTTP %d (%s)", response.StatusCode, response.ErrorCode)
+	}
+	return errors.New("delegated Blob request failed; check connectivity and SAS validity")
 }
 
 // Objects are immutable. A retry may encounter a previously committed object;
@@ -57,15 +99,32 @@ func (s *blobStore) put(ctx context.Context, key string, body io.Reader) error {
 	if bloberror.HasCode(err, bloberror.BlobAlreadyExists, bloberror.ConditionNotMet) {
 		return nil
 	}
-	return err
+	return s.transferError(err)
 }
 
 func (s *blobStore) get(ctx context.Context, key string) (io.ReadCloser, error) {
 	response, err := s.client.DownloadStream(ctx, s.container, key, nil)
 	if err != nil {
-		return nil, err
+		return nil, s.transferError(err)
 	}
-	return response.NewRetryReader(ctx, nil), nil
+	reader := response.NewRetryReader(ctx, nil)
+	if s.delegatedSAS {
+		return &redactedBlobReader{ReadCloser: reader, store: s}, nil
+	}
+	return reader, nil
+}
+
+type redactedBlobReader struct {
+	io.ReadCloser
+	store *blobStore
+}
+
+func (r *redactedBlobReader) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if err == io.EOF {
+		return n, err
+	}
+	return n, r.store.transferError(err)
 }
 
 func (s *blobStore) deletePrefix(ctx context.Context, prefix string) error {
@@ -76,12 +135,12 @@ func (s *blobStore) deletePrefix(ctx context.Context, prefix string) error {
 	for pager.More() {
 		page, err := pager.NextPage(ctx)
 		if err != nil {
-			return err
+			return s.transferError(err)
 		}
 		for _, item := range page.Segment.BlobItems {
 			_, err := s.client.DeleteBlob(ctx, s.container, *item.Name, nil)
 			if err != nil && !bloberror.HasCode(err, bloberror.BlobNotFound) {
-				return err
+				return s.transferError(err)
 			}
 		}
 	}
