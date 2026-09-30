@@ -31,6 +31,13 @@ explicitly make these fork packages public before anonymous AKS/ACR pulls.
 
 ## Consume a release
 
+QEMU-capable releases declare `capabilities.qemuSnapshots: true`. Their Azure
+committer uses `kubernetes/Dockerfile.image-committer-azure`, including nerdctl,
+the standard QEMU worker, checkpoint helper and VMState loader. The release job
+checks those executables in the published image before publishing the bundle.
+Consumers should verify the source commit includes the public QEMU restore
+changes as well as checking the capability and immutable image/chart digests.
+
 `release.json` records the source SHA, controller/server/Azure-committer image
 digests and matching chart checksum. `release-values.json` is a Helm override;
 configure the account/container and Workload Identity separately.
