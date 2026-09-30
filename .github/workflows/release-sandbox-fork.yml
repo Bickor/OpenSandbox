@@ -43,7 +43,7 @@ jobs:
           cache-dependency-path: kubernetes/go.sum
       - name: Test snapshot worker and controllers
         working-directory: kubernetes
-        run: go test ./pkg/imagecommitter/katavmstate ./internal/controller -run 'Test.*(Kata|Snapshot|Blob)'
+        run: go test ./pkg/imagecommitter/katavmstate ./cmd/image-committer ./cmd/image-committer-azure ./internal/controller -run 'Test.*(Kata|Snapshot|Blob|QEMU)'
       - name: Test release assembly
         run: python3 -m unittest discover -s manifests/release -p 'test_fork_release.py'
 
@@ -97,6 +97,10 @@ jobs:
             context=server
             dockerfile=server/Dockerfile
             args=(--build-arg "SETUPTOOLS_SCM_PRETEND_VERSION=${VERSION/-rc./rc}")
+          elif [[ "$COMPONENT" == image-committer-azure ]]; then
+            context=kubernetes
+            dockerfile=kubernetes/Dockerfile.image-committer-azure
+            args=()
           else
             context=.build/fork
             dockerfile=manifests/release/Dockerfile.fork-component
@@ -110,6 +114,10 @@ jobs:
             "${args[@]}" --metadata-file "$RUNNER_TEMP/image.json" --push "$context"
           digest=$(jq -er '."containerimage.digest"' "$RUNNER_TEMP/image.json")
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          if [[ "$COMPONENT" == image-committer-azure ]]; then
+            docker run --rm --entrypoint /bin/sh "$REGISTRY/$COMPONENT@$digest" -c \
+              'test -x /usr/local/bin/image-committer-qemu && test -x /usr/local/bin/qemu-checkpoint-helper && test -x /usr/local/bin/vmstate-loader && nerdctl --version'
+          fi
           mkdir -p release-metadata
           jq -n --arg component "$COMPONENT" --arg image "$REGISTRY/$COMPONENT@$digest" \
             --arg digest "$digest" --arg commit "$GITHUB_SHA" \
@@ -152,6 +160,7 @@ jobs:
           if [[ -f kubernetes/pkg/imagecommitter/katavmstate/remote.go ]]; then
             features+=(--remote-snapshots)
           fi
+          features+=(--qemu-snapshots)
           python3 manifests/release/fork_release.py --metadata release-metadata \
             --output dist/fork --version "$VERSION" --commit "$GITHUB_SHA" \
             --repository "$GITHUB_REPOSITORY" "${features[@]}"

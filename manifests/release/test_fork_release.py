@@ -48,6 +48,12 @@ class ReleaseTests(unittest.TestCase):
         self.assertTrue((self.output / "demo-remote-snapshots.json").exists())
         self.assertEqual(len((self.output / "SHA256SUMS").read_text().splitlines()), 4)
 
+    def test_qemu_bundle(self):
+        assemble(self.metadata, self.output, self.version, self.commit, "Bickor/OpenSandbox", qemu_snapshots=True)
+        capabilities = json.loads((self.output / "release.json").read_text())["capabilities"]
+        self.assertTrue(capabilities["qemuSnapshots"])
+        self.assertFalse(capabilities["remoteSnapshots"])
+
     def test_rejects_mixed_commits(self):
         self.write("server", commit="c" * 40)
         with self.assertRaises(ValueError):
