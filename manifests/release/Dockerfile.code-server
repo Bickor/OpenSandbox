@@ -1,6 +1,6 @@
 ARG EXECD_IMAGE
 FROM ${EXECD_IMAGE} AS execd
-FROM codercom/code-server:4.96.4
+FROM codercom/code-server:4.104.1@sha256:49b0086dd41a23088b08dc7249af06d3bb4d1dd72ef9e3ed56c9d0341a74d6bf
 USER root
 COPY --from=execd /execd /opt/opensandbox/execd
 COPY --from=execd /bootstrap.sh /opt/opensandbox/bootstrap.sh
@@ -10,3 +10,4 @@ COPY --from=execd /opt/opensandbox/opensandbox-session-gate /opt/opensandbox/ope
 COPY --from=execd /opt/opensandbox/opensandbox-launcher /opt/opensandbox/opensandbox-launcher
 RUN chmod 0755 /opt/opensandbox/* && mkdir -p /home/coder/project && chown -R coder:coder /home/coder/project
 USER coder
+ENV EXECD_ENVS=/tmp/execd.env
