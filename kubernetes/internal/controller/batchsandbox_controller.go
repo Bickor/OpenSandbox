@@ -83,6 +83,7 @@ type BatchSandboxReconciler struct {
 	StatusRVExpectation expectations.ResourceVersionExpectation
 	// ResumePullSecret is the K8s Secret name for pulling snapshot images during resume.
 	ResumePullSecret string
+	KataSnapshotJobs *SandboxSnapshotReconciler
 }
 
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;update;patch;delete
@@ -217,6 +218,15 @@ func (r *BatchSandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if !poolStrategy.IsPooledMode() &&
 		batchSbx.Status.Phase != sandboxv1alpha1.BatchSandboxPhasePaused &&
 		!hasTerminalPodFailureCondition(batchSbx.Status.Conditions) {
+		if len(pods) == 0 {
+			ready, err := r.prepareKataRestore(ctx, batchSbx)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if !ready {
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			}
+		}
 		err := r.scaleBatchSandbox(ctx, batchSbx, batchSbx.Spec.Template, pods)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to scale batch sandbox %w", err)

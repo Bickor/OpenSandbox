@@ -68,6 +68,60 @@ def test_create_snapshot_returns_202_and_location_header(
     assert calls[0][1].name == "checkpoint-before-import"
 
 
+def test_create_snapshot_serializes_format_and_restore_constraints(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+) -> None:
+    now = datetime.now(timezone.utc)
+
+    class StubService:
+        @staticmethod
+        def create_snapshot(sandbox_id: str, request) -> Snapshot:
+            assert request.format == "kata-vmstate-v1"
+            return Snapshot(
+                id="snap-kata",
+                sandboxId=sandbox_id,
+                format=request.format,
+                restoreConstraints={
+                    "placement": "same-node",
+                    "sourceNode": "node-a",
+                    "durable": False,
+                },
+                status=SnapshotStatus(state="Ready"),
+                createdAt=now,
+            )
+
+    monkeypatch.setattr(lifecycle, "snapshot_service", StubService())
+
+    response = client.post(
+        "/v1/sandboxes/sbx-001/snapshots",
+        headers=auth_headers,
+        json={"format": "kata-vmstate-v1"},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["format"] == "kata-vmstate-v1"
+    assert response.json()["restoreConstraints"] == {
+        "placement": "same-node",
+        "sourceNode": "node-a",
+        "durable": False,
+    }
+
+
+def test_create_snapshot_rejects_unknown_format(
+    client: TestClient,
+    auth_headers: dict,
+) -> None:
+    response = client.post(
+        "/v1/sandboxes/sbx-001/snapshots",
+        headers=auth_headers,
+        json={"format": "future-v1"},
+    )
+
+    assert response.status_code == 422
+
+
 def test_create_snapshot_accepts_empty_body(
     client: TestClient,
     auth_headers: dict,
@@ -155,6 +209,46 @@ def test_get_snapshot_returns_service_payload(
 
     assert response.status_code == 200
     assert response.json()["id"] == "snap-001"
+
+
+def test_get_snapshot_never_serializes_private_kata_restore_plan(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+) -> None:
+    now = datetime.now(timezone.utc)
+
+    class StubService:
+        @staticmethod
+        def get_snapshot(snapshot_id: str) -> Snapshot:
+            return Snapshot(
+                id=snapshot_id,
+                sandboxId="sbx-001",
+                format="kata-vmstate-v1",
+                restoreConstraints={
+                    "placement": "same-node",
+                    "sourceNode": "node-a",
+                    "durable": False,
+                },
+                status=SnapshotStatus(state="Ready"),
+                createdAt=now,
+            )
+
+    monkeypatch.setattr(lifecycle, "snapshot_service", StubService())
+
+    payload = client.get("/v1/snapshots/snap-kata", headers=auth_headers).json()
+
+    assert set(payload) == {
+        "id",
+        "sandboxId",
+        "format",
+        "restoreConstraints",
+        "status",
+        "createdAt",
+    }
+    assert "podTemplate" not in str(payload)
+    assert "snapshotName" not in str(payload)
+    assert "runtimeVersion" not in str(payload)
 
 
 def test_delete_snapshot_returns_204_and_calls_service(

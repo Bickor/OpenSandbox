@@ -81,12 +81,16 @@ ClusterRole name for gateway
 Gateway image with tag (prepend v to semver if missing)
 */}}
 {{- define "opensandbox-ingress-gateway.image" -}}
+{{- if .Values.gateway.image.digest }}
+{{- printf "%s@%s" .Values.gateway.image.repository .Values.gateway.image.digest }}
+{{- else }}
 {{- $tag := .Values.gateway.image.tag | default "v1.0.2" }}
 {{- $finalTag := $tag }}
 {{- if and (not (hasPrefix "v" $tag)) (regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+" $tag) }}
 {{- $finalTag = printf "v%s" $tag }}
 {{- end }}
 {{- printf "%s:%s" .Values.gateway.image.repository $finalTag }}
+{{- end }}
 {{- end }}
 
 {{/*

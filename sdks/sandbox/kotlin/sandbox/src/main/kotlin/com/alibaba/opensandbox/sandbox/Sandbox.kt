@@ -432,6 +432,7 @@ class Sandbox internal constructor(
             volumes: List<Volume>?,
             resourceRequests: Map<String, String>? = null,
             lifecycle: SandboxLifecycle? = null,
+            fullStateRestore: Boolean = false,
         ): Sandbox {
             val timeoutLabel = if (timeout != null) "${timeout.seconds}s" else "manual-cleanup"
             val startupSource = imageSpec?.image ?: snapshotId
@@ -465,6 +466,7 @@ class Sandbox internal constructor(
                                 snapshotId = snapshotId,
                                 resourceRequests = resourceRequests,
                                 lifecycle = lifecycle,
+                                fullStateRestore = fullStateRestore,
                             )
                         createdSandboxId = response.id
                         InitializationResult.NewSandbox(response.id)
@@ -729,6 +731,11 @@ class Sandbox internal constructor(
     }
 
     fun createSnapshot(name: String? = null): SnapshotInfo = sandboxService.createSnapshot(id, name)
+
+    fun createSnapshot(
+        name: String?,
+        format: String,
+    ): SnapshotInfo = sandboxService.createSnapshot(id, name, format)
 
     /**
      * Gets current egress policy for this sandbox.
@@ -1020,6 +1027,7 @@ class Sandbox internal constructor(
          */
         private var imageSpec: SandboxImageSpec? = null
         private var snapshotId: String? = null
+        private var fullStateRestore: Boolean = false
 
         /**
          * Sandbox entrypoint
@@ -1142,6 +1150,16 @@ class Sandbox internal constructor(
             }
             this.snapshotId = snapshotId
             this.imageSpec = null
+            return this
+        }
+
+        /**
+         * Sends a minimal full-state restore request containing only snapshotId,
+         * timeout, and metadata.
+         */
+        @JvmOverloads
+        fun fullStateRestore(enabled: Boolean = true): Builder {
+            this.fullStateRestore = enabled
             return this
         }
 
@@ -1573,6 +1591,9 @@ class Sandbox internal constructor(
             if (spec != null && spec.image.isBlank()) {
                 throw InvalidArgumentException("Sandbox image cannot be blank")
             }
+            if (fullStateRestore && snapshotId == null) {
+                throw InvalidArgumentException("fullStateRestore requires snapshotId")
+            }
 
             return create(
                 imageSpec = spec,
@@ -1596,6 +1617,7 @@ class Sandbox internal constructor(
                 volumes = if (volumes.isEmpty()) null else volumes.toList(),
                 resourceRequests = resourceRequests,
                 lifecycle = lifecycle,
+                fullStateRestore = fullStateRestore,
             )
         }
     }

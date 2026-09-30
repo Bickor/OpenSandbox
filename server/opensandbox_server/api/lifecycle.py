@@ -112,11 +112,10 @@ async def create_sandbox(
     Raises:
         HTTPException: If sandbox creation scheduling fails
     """
-    validate_extensions(request.extensions)
     # Resolve snapshotId before backend routing: the owning backend recorded
     # on the snapshot row selects the fsb vs pod backend for restores.
-    if not (request.template_id or "").strip():
-        request = await resolve_sandbox_image_from_request(request)
+    request = await resolve_sandbox_image_from_request(request)
+    validate_extensions(request.extensions)
     return await sandbox_service.create_sandbox(request)
 
 
@@ -422,7 +421,7 @@ def create_snapshot(
     """
     Create a persistent point-in-time snapshot from a sandbox.
     """
-    create_request = request or CreateSnapshotRequest()
+    create_request = request or CreateSnapshotRequest(name=None, format=None)
     snapshot = snapshot_service.create_snapshot(sandbox_id, create_request)
     response.headers["Location"] = f"/v1/snapshots/{snapshot.id}"
     return snapshot

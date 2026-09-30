@@ -42,6 +42,7 @@ from opensandbox_server.api.schema import (
     ListSnapshotsResponse,
     PaginationInfo,
     Snapshot,
+    SnapshotRestoreConstraints,
     SnapshotStatus,
 )
 from opensandbox_server.config import get_config
@@ -148,10 +149,17 @@ class PersistedSnapshotService(SnapshotService):
 
         namespace = self._get_tenant_namespace()
         try:
-            self._snapshot_runtime.preflight_create_snapshot(
-                sandbox_id,
-                namespace=namespace,
-            )
+            if request.format is None:
+                self._snapshot_runtime.preflight_create_snapshot(
+                    sandbox_id,
+                    namespace=namespace,
+                )
+            else:
+                self._snapshot_runtime.preflight_create_snapshot(
+                    sandbox_id,
+                    namespace=namespace,
+                    format=request.format,
+                )
         except SnapshotRuntimeUnsupportedError as exc:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -175,7 +183,7 @@ class PersistedSnapshotService(SnapshotService):
             source_sandbox_id=sandbox_id,
             namespace=namespace,
             name=request.name,
-            restore_config=self._default_restore_config(),
+            restore_config=SnapshotRestoreConfig(format=request.format),
             status=SnapshotStatusRecord(
                 state=SnapshotState.CREATING,
                 reason="snapshot_accepted",
@@ -250,6 +258,14 @@ class PersistedSnapshotService(SnapshotService):
                 },
             )
         self._verify_tenant_access(record)
+
+        preflight_delete = getattr(self._snapshot_runtime, "preflight_delete_snapshot", None)
+        if preflight_delete is not None:
+            preflight_delete(
+                snapshot_id,
+                namespace=record.namespace,
+                source_sandbox_id=record.source_sandbox_id,
+            )
 
         if record.status.state == SnapshotState.CREATING:
             raise HTTPException(
@@ -448,11 +464,19 @@ class PersistedSnapshotService(SnapshotService):
 
     def _create_snapshot_worker(self, record: SnapshotRecord) -> None:
         try:
-            runtime_status = self._snapshot_runtime.create_snapshot(
-                record.id,
-                record.source_sandbox_id,
-                namespace=record.namespace,
-            )
+            if record.restore_config.format is None:
+                runtime_status = self._snapshot_runtime.create_snapshot(
+                    record.id,
+                    record.source_sandbox_id,
+                    namespace=record.namespace,
+                )
+            else:
+                runtime_status = self._snapshot_runtime.create_snapshot(
+                    record.id,
+                    record.source_sandbox_id,
+                    namespace=record.namespace,
+                    format=record.restore_config.format,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.exception(
                 f"Failed to create snapshot {record.id} from sandbox "
@@ -496,6 +520,7 @@ class PersistedSnapshotService(SnapshotService):
                 runtime_status.image,
                 record.namespace,
                 record.source_sandbox_id,
+                runtime_status.format or record.restore_config.format,
             )
             return
 
@@ -505,6 +530,7 @@ class PersistedSnapshotService(SnapshotService):
                 runtime_status.image,
                 current_record.namespace,
                 current_record.source_sandbox_id,
+                runtime_status.format or current_record.restore_config.format,
             )
             if self._preserve_deleting_on_cleanup_failure and not cleaned:
                 return
@@ -601,7 +627,19 @@ class PersistedSnapshotService(SnapshotService):
     ) -> SnapshotRecord | None:
         now = datetime.now(timezone.utc)
         if runtime_status.state == SnapshotState.READY:
-            if not runtime_status.image:
+            restore_config = SnapshotRestoreConfig(
+                image=runtime_status.image,
+                backend=runtime_status.backend,
+                format=runtime_status.format or record.restore_config.format,
+                restore_plan_secret_name=runtime_status.restore_plan_secret_name,
+                restore_plan_owner_name=runtime_status.restore_plan_owner_name,
+                restore_plan_owner_uid=runtime_status.restore_plan_owner_uid,
+                source_node_name=runtime_status.source_node_name,
+                snapshot_name=runtime_status.snapshot_name,
+                runtime_version=runtime_status.runtime_version,
+                runtime_class_name=runtime_status.runtime_class_name,
+            )
+            if not runtime_status.image and not restore_config.is_complete_kata_plan():
                 return SnapshotRecord(
                     id=record.id,
                     source_sandbox_id=record.source_sandbox_id,
@@ -612,7 +650,9 @@ class PersistedSnapshotService(SnapshotService):
                     status=SnapshotStatusRecord(
                         state=SnapshotState.FAILED,
                         reason="snapshot_runtime_missing_image",
-                        message="Runtime reported Ready without a snapshot image.",
+                        message=(
+                            "Runtime reported Ready without a snapshot image or complete Kata restore plan."
+                        ),
                         last_transition_at=now,
                     ),
                     created_at=record.created_at,
@@ -625,10 +665,7 @@ class PersistedSnapshotService(SnapshotService):
                 namespace=record.namespace,
                 name=record.name,
                 description=record.description,
-                restore_config=SnapshotRestoreConfig(
-                    image=runtime_status.image,
-                    backend=runtime_status.backend,
-                ),
+                restore_config=restore_config,
                 status=SnapshotStatusRecord(
                     state=SnapshotState.READY,
                     reason=runtime_status.reason,
@@ -640,13 +677,17 @@ class PersistedSnapshotService(SnapshotService):
             )
 
         if runtime_status.state == SnapshotState.FAILED:
+            restore_config = SnapshotRestoreConfig.from_dict(
+                record.restore_config.to_dict()
+            )
+            restore_config.format = runtime_status.format or restore_config.format
             return SnapshotRecord(
                 id=record.id,
                 source_sandbox_id=record.source_sandbox_id,
                 namespace=record.namespace,
                 name=record.name,
                 description=record.description,
-                restore_config=record.restore_config,
+                restore_config=restore_config,
                 status=SnapshotStatusRecord(
                     state=SnapshotState.FAILED,
                     reason=runtime_status.reason,
@@ -665,8 +706,9 @@ class PersistedSnapshotService(SnapshotService):
         image: str | None,
         namespace: str | None = "default",
         source_sandbox_id: str | None = None,
+        format: str | None = None,
     ) -> bool:
-        if not image:
+        if not image and format != "kata-vmstate-v1":
             return False
 
         try:
@@ -713,10 +755,22 @@ class PersistedSnapshotService(SnapshotService):
 
     @staticmethod
     def _to_snapshot_response(record: SnapshotRecord) -> Snapshot:
+        restore_constraints = None
+        if (
+            record.restore_config.format == "kata-vmstate-v1"
+            and record.restore_config.source_node_name
+        ):
+            restore_constraints = SnapshotRestoreConstraints(
+                placement="same-node",
+                sourceNode=record.restore_config.source_node_name,
+                durable=False,
+            )
         return Snapshot(
             id=record.id,
             sandboxId=record.source_sandbox_id,
             name=record.name,
+            format=record.restore_config.format,
+            restoreConstraints=restore_constraints,
             status=SnapshotStatus(
                 state=record.status.state.value,
                 reason=record.status.reason,

@@ -479,6 +479,18 @@ class TestCreateSandboxRequestSnapshotCompat:
         assert request.image is None
         assert request.snapshot_id == "snap-001"
 
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("image", {"uri": "example/app:1"}),
+            ("templateId", "tpl-1"),
+            ("extensions", {"poolRef": "pool-a"}),
+        ],
+    )
+    def test_rejects_universally_conflicting_snapshot_sources(self, field, value):
+        with pytest.raises(ValidationError):
+            CreateSandboxRequest.model_validate({"snapshotId": "snap-001", field: value})
+
     def test_rejects_when_both_image_and_snapshot_missing(self):
         with pytest.raises(ValidationError):
             CreateSandboxRequest(
@@ -800,14 +812,12 @@ class TestCreateSandboxRequestPoolMode:
         assert request.extensions["poolRef"] == "my-pool"
         assert request.env == {"KEY": "value"}
 
-    def test_pool_mode_rejects_snapshot_id_with_pool_ref(self):
-        with pytest.raises(ValidationError) as exc_info:
+    def test_snapshot_with_pool_ref_is_rejected(self):
+        with pytest.raises(ValidationError):
             CreateSandboxRequest(
                 snapshotId="snap-001",
                 extensions={"poolRef": "my-pool"},
             )
-        errors = exc_info.value.errors()
-        assert any("snapshotId" in str(e) and "poolRef" in str(e) for e in errors)
 
     def test_pool_mode_parses_credential_proxy_for_service_validation(self):
         """The service returns the documented 400 instead of a parsing-time 422."""

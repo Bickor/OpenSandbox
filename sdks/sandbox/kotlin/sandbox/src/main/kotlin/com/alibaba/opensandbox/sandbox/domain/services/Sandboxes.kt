@@ -144,7 +144,13 @@ interface Sandboxes {
         credentialProxy: CredentialProxyConfig?,
         resourceRequests: Map<String, String>? = null,
         lifecycle: SandboxLifecycle?,
+        fullStateRestore: Boolean = false,
     ): SandboxCreateResponse {
+        if (fullStateRestore) {
+            throw UnsupportedOperationException(
+                "Full-state restore is not supported by this Sandboxes implementation",
+            )
+        }
         if (lifecycle == null || lifecycle.isEmpty) {
             return createSandbox(
                 spec = spec,
@@ -280,6 +286,15 @@ interface Sandboxes {
         sandboxId: String,
         name: String? = null,
     ): SnapshotInfo
+
+    fun createSnapshot(
+        sandboxId: String,
+        name: String?,
+        format: String?,
+    ): SnapshotInfo {
+        require(format == null) { "This Sandboxes implementation does not support snapshot formats" }
+        return createSnapshot(sandboxId, name)
+    }
 
     fun getSnapshot(snapshotId: String): SnapshotInfo
 

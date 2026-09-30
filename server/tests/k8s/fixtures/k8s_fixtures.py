@@ -43,6 +43,7 @@ def mock_k8s_client():
     client.delete_custom_object = MagicMock()
     client.patch_custom_object = MagicMock()
     client.create_secret = MagicMock()
+    client.read_secret = MagicMock(return_value=None)
     client.list_pods = MagicMock(return_value=[])
     return client
 

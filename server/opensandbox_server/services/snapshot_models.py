@@ -51,9 +51,42 @@ class SnapshotRestoreConfig:
 
     image: str | None = None
     backend: str | None = None
+    format: str | None = None
+    restore_plan_secret_name: str | None = None
+    restore_plan_owner_name: str | None = None
+    restore_plan_owner_uid: str | None = None
+    source_node_name: str | None = None
+    snapshot_name: str | None = None
+    runtime_version: str | None = None
+    runtime_class_name: str | None = None
+
+    def is_complete_kata_plan(self) -> bool:
+        return (
+            self.format == "kata-vmstate-v1"
+            and all(
+                isinstance(value, str) and bool(value.strip())
+                for value in (
+                    self.restore_plan_secret_name,
+                    self.restore_plan_owner_name,
+                    self.restore_plan_owner_uid,
+                    self.source_node_name,
+                    self.snapshot_name,
+                    self.runtime_version,
+                    self.runtime_class_name,
+                )
+            )
+        )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        values = {"image": self.image, "backend": self.backend}
+        values.update(
+            {
+                key: value
+                for key, value in asdict(self).items()
+                if key not in values and value is not None
+            }
+        )
+        return values
 
     @classmethod
     def from_dict(cls, values: Mapping[str, Any]) -> "SnapshotRestoreConfig":

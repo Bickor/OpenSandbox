@@ -34,6 +34,7 @@ from opensandbox.models.sandboxes import (
     SandboxInfo,
     SandboxRenewResponse,
     SnapshotFilter,
+    SnapshotFormat,
     SnapshotInfo,
 )
 from opensandbox.models.templates import (
@@ -269,11 +270,14 @@ class SandboxManager:
         await self._sandbox_service.resume_sandbox(sandbox_id)
 
     async def create_snapshot(
-        self, sandbox_id: str, name: str | None = None
+        self,
+        sandbox_id: str,
+        name: str | None = None,
+        format: SnapshotFormat | None = None,
     ) -> SnapshotInfo:
         """Create a snapshot from a sandbox."""
         return await self._sandbox_service.create_snapshot(
-            sandbox_id, CreateSnapshotRequest(name=name)
+            sandbox_id, CreateSnapshotRequest(name=name, format=format)
         )
 
     async def get_snapshot(self, snapshot_id: str) -> SnapshotInfo:

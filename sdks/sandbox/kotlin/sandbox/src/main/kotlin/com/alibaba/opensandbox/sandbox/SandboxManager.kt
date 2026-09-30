@@ -277,6 +277,12 @@ class SandboxManager internal constructor(
         name: String? = null,
     ): SnapshotInfo = sandboxService.createSnapshot(sandboxId, name)
 
+    fun createSnapshot(
+        sandboxId: String,
+        name: String?,
+        format: String,
+    ): SnapshotInfo = sandboxService.createSnapshot(sandboxId, name, format)
+
     fun getSnapshot(snapshotId: String): SnapshotInfo = sandboxService.getSnapshot(snapshotId)
 
     fun listSnapshots(filter: SnapshotFilter): PagedSnapshotInfos = sandboxService.listSnapshots(filter)

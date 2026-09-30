@@ -30,6 +30,7 @@ from .create_sandbox_response import CreateSandboxResponse
 from .create_sandbox_response_extensions import CreateSandboxResponseExtensions
 from .create_sandbox_response_metadata import CreateSandboxResponseMetadata
 from .create_snapshot_request import CreateSnapshotRequest
+from .create_snapshot_request_format import CreateSnapshotRequestFormat
 from .credential_proxy_config import CredentialProxyConfig
 from .endpoint import Endpoint
 from .endpoint_headers import EndpointHeaders
@@ -72,6 +73,8 @@ from .sandbox_lifecycle import SandboxLifecycle
 from .sandbox_metadata import SandboxMetadata
 from .sandbox_status import SandboxStatus
 from .snapshot import Snapshot
+from .snapshot_restore_constraints import SnapshotRestoreConstraints
+from .snapshot_restore_constraints_placement import SnapshotRestoreConstraintsPlacement
 from .snapshot_status import SnapshotStatus
 from .volume import Volume
 
@@ -90,6 +93,7 @@ __all__ = (
     "CreateSandboxResponseExtensions",
     "CreateSandboxResponseMetadata",
     "CreateSnapshotRequest",
+    "CreateSnapshotRequestFormat",
     "CredentialProxyConfig",
     "Endpoint",
     "EndpointHeaders",
@@ -132,6 +136,8 @@ __all__ = (
     "SandboxMetadata",
     "SandboxStatus",
     "Snapshot",
+    "SnapshotRestoreConstraints",
+    "SnapshotRestoreConstraintsPlacement",
     "SnapshotStatus",
     "Volume",
 )

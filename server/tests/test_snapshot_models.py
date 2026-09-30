@@ -78,3 +78,20 @@ def test_snapshot_restore_config_serialization_ignores_unknown_fields() -> None:
         )
         == config
     )
+
+
+def test_snapshot_restore_config_round_trips_complete_kata_plan() -> None:
+    config = SnapshotRestoreConfig(
+        format="kata-vmstate-v1",
+        restore_plan_secret_name="kata-restore-plan",
+        restore_plan_owner_name="osb-snap-kata",
+        restore_plan_owner_uid="snapshot-uid",
+        source_node_name="node-a",
+        snapshot_name="kata-snapshot-a",
+        runtime_version="3.8.0",
+        runtime_class_name="kata-vm-isolation-v2",
+    )
+
+    assert SnapshotRestoreConfig.from_dict(config.to_dict()) == config
+    assert config.is_complete_kata_plan()
+    assert "pod_template" not in config.to_dict()

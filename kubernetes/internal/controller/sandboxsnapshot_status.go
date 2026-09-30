@@ -103,6 +103,7 @@ func (r *SandboxSnapshotReconciler) persistResolvedData(
 	sourcePodName, sourceNodeName string,
 	format sandboxv1alpha1.SandboxSnapshotFormat,
 	containers []sandboxv1alpha1.ContainerSnapshot,
+	kataVMState *sandboxv1alpha1.KataVMStateSnapshot,
 ) error {
 	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		latest := &sandboxv1alpha1.SandboxSnapshot{}
@@ -113,6 +114,7 @@ func (r *SandboxSnapshotReconciler) persistResolvedData(
 		latest.Status.SourceNodeName = sourceNodeName
 		latest.Status.Format = format
 		latest.Status.Containers = containers
+		latest.Status.KataVMState = kataVMState
 		return r.Status().Update(ctx, latest)
 	})
 }

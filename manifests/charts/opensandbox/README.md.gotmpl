@@ -90,6 +90,9 @@ opensandbox-controller:
                   cpu: 100m
                   memory: 128Mi
       resumePullSecret: registry-pull-secret
+      kataVMState:
+        enabled: false
+        hostKataCtlPath: /opt/aks-sandbox-demo/kata-v2/bin/kata-ctl
 
 opensandbox-server:
   server:

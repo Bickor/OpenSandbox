@@ -52,6 +52,7 @@ from opensandbox.models.sandboxes import (
     SandboxMetrics,
     SandboxOrigin,
     SandboxRenewResponse,
+    SnapshotFormat,
     SnapshotInfo,
     Volume,
 )
@@ -371,10 +372,12 @@ class Sandbox:
         """
         return await self._sandbox_service.patch_sandbox_metadata(self.id, patch)
 
-    async def create_snapshot(self, name: str | None = None) -> SnapshotInfo:
+    async def create_snapshot(
+        self, name: str | None = None, format: SnapshotFormat | None = None
+    ) -> SnapshotInfo:
         """Create a persistent snapshot from this sandbox."""
         return await self._sandbox_service.create_snapshot(
-            self.id, CreateSnapshotRequest(name=name)
+            self.id, CreateSnapshotRequest(name=name, format=format)
         )
 
     async def get_egress_policy(self) -> NetworkPolicy:
@@ -551,6 +554,7 @@ class Sandbox:
         health_check_polling_interval: timedelta = timedelta(milliseconds=200),
         skip_health_check: bool = False,
         lifecycle: SandboxLifecycle | None = None,
+        full_state_restore: bool = False,
     ) -> "Sandbox":
         """
         Create a new sandbox instance with the specified configuration.
@@ -575,6 +579,8 @@ class Sandbox:
             health_check_polling_interval: Polling interval used while waiting for endpoint publication and readiness/health.
             skip_health_check: Skip health checks; endpoint publication is still awaited.
             lifecycle: Optional pre-start and periodic lifecycle hooks.
+            full_state_restore: Send only snapshot_id, timeout, and metadata. This is
+                intended for snapshots that resume a captured VM process.
 
         Returns:
             Fully configured and ready Sandbox instance
@@ -590,11 +596,23 @@ class Sandbox:
             validate_polling_interval(health_check_polling_interval)
 
         config = (connection_config or ConnectionConfig()).with_transport_if_missing()
-        entrypoint = entrypoint or ["tail", "-f", "/dev/null"]
+        if full_state_restore and snapshot_id is None:
+            raise InvalidArgumentException(
+                "full_state_restore requires snapshot_id"
+            )
+        entrypoint = (
+            None
+            if full_state_restore
+            else entrypoint or ["tail", "-f", "/dev/null"]
+        )
         env = env or {}
         metadata = metadata or {}
-        resource = resource or {"cpu": "1", "memory": "2Gi"}
-        extensions = extensions or {}
+        resource = (
+            {}
+            if full_state_restore
+            else resource or {"cpu": "1", "memory": "2Gi"}
+        )
+        extensions = {} if full_state_restore else extensions or {}
 
         if isinstance(image, str):
             image = SandboxImageSpec(image=image)
@@ -607,6 +625,26 @@ class Sandbox:
             f"Creating sandbox with startup source: {startup_source} (timeout: {timeout_log})"
         )
 
+        create_kwargs = {
+            "spec": image,
+            "entrypoint": entrypoint,
+            "env": env,
+            "metadata": metadata,
+            "timeout": timeout,
+            "resource": resource,
+            "network_policy": network_policy,
+            "credential_proxy": credential_proxy,
+            "extensions": extensions,
+            "volumes": volumes,
+            "platform": platform,
+            "secure_access": secure_access,
+            "snapshot_id": snapshot_id,
+            "resource_requests": resource_requests,
+            "lifecycle": lifecycle,
+        }
+        if full_state_restore:
+            create_kwargs["full_state_restore"] = True
+
         return await cls._launch(
             config=config,
             startup_source=startup_source,
@@ -615,23 +653,7 @@ class Sandbox:
             health_check=health_check,
             health_check_polling_interval=health_check_polling_interval,
             skip_health_check=skip_health_check,
-            create_call=lambda service: service.create_sandbox(
-                spec=image,
-                entrypoint=entrypoint,
-                env=env,
-                metadata=metadata,
-                timeout=timeout,
-                resource=resource,
-                network_policy=network_policy,
-                credential_proxy=credential_proxy,
-                extensions=extensions,
-                volumes=volumes,
-                platform=platform,
-                secure_access=secure_access,
-                snapshot_id=snapshot_id,
-                resource_requests=resource_requests,
-                lifecycle=lifecycle,
-            ),
+            create_call=lambda service: service.create_sandbox(**create_kwargs),
         )
 
     @classmethod

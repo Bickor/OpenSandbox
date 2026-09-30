@@ -166,6 +166,7 @@ class SandboxesAdapter(Sandboxes):
         credential_proxy: CredentialProxyConfig | None = None,
         resource_requests: dict[str, str] | None = None,
         lifecycle: SandboxLifecycle | None = None,
+        full_state_restore: bool = False,
     ) -> SandboxCreateResponse:
         """Create a new sandbox instance with the specified configuration."""
         logger.info(
@@ -191,6 +192,7 @@ class SandboxesAdapter(Sandboxes):
                 snapshot_id=snapshot_id,
                 resource_requests=resource_requests,
                 lifecycle=lifecycle,
+                full_state_restore=full_state_restore,
             )
 
             client = await self._get_client()

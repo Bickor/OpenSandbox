@@ -51,7 +51,9 @@ class _SandboxServiceStub:
         raise RuntimeError("not used")
 
     async def create_snapshot(self, sandbox_id, request):
-        self.snapshot_calls.append(("create", (sandbox_id, request.name)))
+        self.snapshot_calls.append(
+            ("create", (sandbox_id, request.name, request.format))
+        )
         return type("Snapshot", (), {"id": "snap-1"})()
 
     async def get_snapshot(self, snapshot_id):
@@ -133,7 +135,9 @@ async def test_manager_snapshot_methods_delegate() -> None:
     svc = _SandboxServiceStub()
     mgr = SandboxManager(svc, ConnectionConfig())
 
-    created = await mgr.create_snapshot("sbx-1", "before-upgrade")
+    created = await mgr.create_snapshot(
+        "sbx-1", "before-upgrade", "kata-vmstate-v1"
+    )
     loaded = await mgr.get_snapshot("snap-1")
     listed = await mgr.list_snapshots(type("Filter", (), {})())
     await mgr.delete_snapshot("snap-1")
@@ -141,7 +145,10 @@ async def test_manager_snapshot_methods_delegate() -> None:
     assert created.id == "snap-1"
     assert loaded.id == "snap-1"
     assert listed.snapshot_infos[0].id == "snap-1"
-    assert svc.snapshot_calls[0] == ("create", ("sbx-1", "before-upgrade"))
+    assert svc.snapshot_calls[0] == (
+        "create",
+        ("sbx-1", "before-upgrade", "kata-vmstate-v1"),
+    )
     assert svc.snapshot_calls[1] == ("get", "snap-1")
     assert svc.snapshot_calls[3] == ("delete", "snap-1")
 

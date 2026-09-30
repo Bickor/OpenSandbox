@@ -258,6 +258,16 @@ class SandboxTest {
     }
 
     @Test
+    fun `builder fullStateRestore should enable explicit restore mode`() {
+        val builder = Sandbox.builder().snapshotId("snap-vmstate").fullStateRestore()
+
+        val field = builder.javaClass.getDeclaredField("fullStateRestore")
+        field.isAccessible = true
+
+        assertTrue(field.getBoolean(builder))
+    }
+
+    @Test
     fun `pause should delegate to sandboxService`() {
         every { sandboxService.invalidateEndpointCache(sandboxId) } just Runs
         every { sandboxService.pauseSandbox(sandboxId) } just Runs

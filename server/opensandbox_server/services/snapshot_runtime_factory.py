@@ -73,8 +73,17 @@ class CompositeSnapshotRuntime:
         sandbox_id: str,
         *,
         namespace: str | None = None,
+        format: str | None = None,
     ) -> None:
-        self._for_source(sandbox_id).preflight_create_snapshot(sandbox_id, namespace=namespace)
+        runtime = self._for_source(sandbox_id)
+        if format is None:
+            runtime.preflight_create_snapshot(sandbox_id, namespace=namespace)
+        else:
+            runtime.preflight_create_snapshot(
+                sandbox_id,
+                namespace=namespace,
+                format=format,
+            )
 
     def create_snapshot(
         self,
@@ -82,11 +91,20 @@ class CompositeSnapshotRuntime:
         sandbox_id: str,
         *,
         namespace: str | None = None,
+        format: str | None = None,
     ) -> Optional[SnapshotRuntimeStatus]:
-        return self._for_source(sandbox_id).create_snapshot(
+        runtime = self._for_source(sandbox_id)
+        if format is None:
+            return runtime.create_snapshot(
+                snapshot_id,
+                sandbox_id,
+                namespace=namespace,
+            )
+        return runtime.create_snapshot(
             snapshot_id,
             sandbox_id,
             namespace=namespace,
+            format=format,
         )
 
     def get_snapshot_status(self, snapshot_id: str) -> Optional[SnapshotRuntimeStatus]:

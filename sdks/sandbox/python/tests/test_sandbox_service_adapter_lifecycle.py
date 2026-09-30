@@ -26,10 +26,13 @@ from opensandbox.config.connection_sync import ConnectionConfigSync
 from opensandbox.exceptions import SandboxApiException
 from opensandbox.models.sandboxes import (
     CreateSnapshotRequest,
+    CredentialProxyConfig,
+    LifecycleHook,
     NetworkPolicy,
     NetworkRule,
     SandboxFilter,
     SandboxImageSpec,
+    SandboxLifecycle,
     SnapshotFilter,
 )
 from opensandbox.sync.adapters.sandboxes_adapter import (
@@ -89,12 +92,24 @@ def _api_list_sandboxes_response():
 
 def _api_snapshot(snapshot_id: str):
     from opensandbox.api.lifecycle.models.snapshot import Snapshot
+    from opensandbox.api.lifecycle.models.snapshot_restore_constraints import (
+        SnapshotRestoreConstraints,
+    )
+    from opensandbox.api.lifecycle.models.snapshot_restore_constraints_placement import (
+        SnapshotRestoreConstraintsPlacement,
+    )
     from opensandbox.api.lifecycle.models.snapshot_status import SnapshotStatus
 
     return Snapshot(
         id=snapshot_id,
         sandbox_id="sbx-1",
         name="before-upgrade",
+        format_="future-v2",
+        restore_constraints=SnapshotRestoreConstraints(
+            placement=SnapshotRestoreConstraintsPlacement.SAME_NODE,
+            source_node="node-1",
+            durable=False,
+        ),
         status=SnapshotStatus(state="Ready"),
         created_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
     )
@@ -230,6 +245,97 @@ async def test_create_sandbox_restore_from_snapshot(
     assert dumped["snapshotId"] == "snap-123"
     assert "image" not in dumped
     assert "entrypoint" not in dumped
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("timeout", "expected_timeout"),
+    [
+        (timedelta(seconds=45), 45),
+        (None, None),
+    ],
+)
+async def test_create_sandbox_full_state_restore_sends_only_restore_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    timeout: timedelta | None,
+    expected_timeout: int | None,
+) -> None:
+    called = {}
+
+    async def _fake_asyncio_detailed(*, client, body):
+        called["body"] = body.to_dict()
+        return _Resp(status_code=200, parsed=_api_create_sandbox_response(str(uuid4())))
+
+    monkeypatch.setattr(
+        "opensandbox.api.lifecycle.api.sandboxes.post_sandboxes.asyncio_detailed",
+        _fake_asyncio_detailed,
+    )
+
+    adapter = SandboxesAdapter(ConnectionConfig(domain="example.com:8080", api_key="k"))
+    await adapter.create_sandbox(
+        spec=None,
+        entrypoint=["ignored"],
+        env={"IGNORED": "true"},
+        metadata={"workload": "vmstate"},
+        timeout=timeout,
+        resource={"cpu": "8"},
+        resource_requests={"cpu": "4"},
+        platform=None,
+        network_policy=NetworkPolicy(),
+        credential_proxy=CredentialProxyConfig(enabled=True),
+        extensions={"ignored": "true"},
+        volumes=[],
+        secure_access=True,
+        snapshot_id="snap-vmstate",
+        lifecycle=SandboxLifecycle(
+            preStart=LifecycleHook(command=["ignored"])
+        ),
+        full_state_restore=True,
+    )
+
+    assert called["body"] == {
+        "snapshotId": "snap-vmstate",
+        "timeout": expected_timeout,
+        "metadata": {"workload": "vmstate"},
+    }
+
+
+def test_sync_create_sandbox_full_state_restore_sends_only_restore_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = {}
+
+    def _fake_sync_detailed(*, client, body):
+        called["body"] = body.to_dict()
+        return _Resp(status_code=200, parsed=_api_create_sandbox_response(str(uuid4())))
+
+    monkeypatch.setattr(
+        "opensandbox.api.lifecycle.api.sandboxes.post_sandboxes.sync_detailed",
+        _fake_sync_detailed,
+    )
+
+    adapter = SyncSandboxesAdapter(ConnectionConfigSync())
+    adapter.create_sandbox(
+        spec=None,
+        entrypoint=["ignored"],
+        env={"IGNORED": "true"},
+        metadata={},
+        timeout=None,
+        resource={"cpu": "8"},
+        platform=None,
+        network_policy=NetworkPolicy(),
+        extensions={"ignored": "true"},
+        volumes=[],
+        secure_access=True,
+        snapshot_id="snap-vmstate",
+        full_state_restore=True,
+    )
+
+    assert called["body"] == {
+        "snapshotId": "snap-vmstate",
+        "timeout": None,
+        "metadata": {},
+    }
 
 
 @pytest.mark.asyncio
@@ -478,7 +584,7 @@ async def test_snapshot_lifecycle_calls_openapi(
     calls: list[tuple[str, object]] = []
 
     async def _create_snapshot(*, client, sandbox_id, body):
-        calls.append(("create", (sandbox_id, body.name)))
+        calls.append(("create", (sandbox_id, body.to_dict())))
         return _Resp(status_code=202, parsed=_api_snapshot("snap-1"))
 
     async def _get_snapshot(*, client, snapshot_id):
@@ -529,7 +635,8 @@ async def test_snapshot_lifecycle_calls_openapi(
 
     adapter = SandboxesAdapter(ConnectionConfig())
     created = await adapter.create_snapshot(
-        "sbx-1", CreateSnapshotRequest(name="before-upgrade")
+        "sbx-1",
+        CreateSnapshotRequest(name="before-upgrade", format="kata-vmstate-v1"),
     )
     loaded = await adapter.get_snapshot("snap-1")
     listed = await adapter.list_snapshots(
@@ -544,14 +651,34 @@ async def test_snapshot_lifecycle_calls_openapi(
     await adapter.delete_snapshot("snap-1")
 
     assert created.id == "snap-1"
+    assert created.format == "future-v2"
+    assert created.restore_constraints is not None
+    assert created.restore_constraints.source_node == "node-1"
+    assert created.restore_constraints.durable is False
     assert loaded.id == "snap-1"
     assert listed.snapshot_infos[0].id == "snap-1"
     assert calls == [
-        ("create", ("sbx-1", "before-upgrade")),
+        (
+            "create",
+            (
+                "sbx-1",
+                {"name": "before-upgrade", "format": "kata-vmstate-v1"},
+            ),
+        ),
         ("get", "snap-1"),
         ("list", ("sbx-1", "toolchain:python@rev-1", ["Ready"], 1, 10)),
         ("delete", "snap-1"),
     ]
+
+
+def test_create_snapshot_request_omits_unset_format() -> None:
+    from opensandbox.adapters.converter.sandbox_model_converter import (
+        SandboxModelConverter,
+    )
+
+    assert SandboxModelConverter.to_api_create_snapshot_request(
+        CreateSnapshotRequest(name="baseline")
+    ).to_dict() == {"name": "baseline"}
 
 
 def test_sync_list_snapshots_forwards_name_filter(

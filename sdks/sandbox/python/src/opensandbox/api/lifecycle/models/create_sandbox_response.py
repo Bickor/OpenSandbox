@@ -46,7 +46,9 @@ class CreateSandboxResponse:
         created_at (datetime.datetime): Sandbox creation timestamp
         entrypoint (list[str]): Entry process specification for the sandbox. For image-created sandboxes,
             this is copied from the creation request. For snapshot-created sandboxes,
-            this is restored from the snapshot.
+            this is restored from the snapshot. Full VM-state restores return
+            an empty array because the captured process continues without
+            starting a new entrypoint.
         metadata (CreateSandboxResponseMetadata | Unset): Custom metadata from creation request
         extensions (CreateSandboxResponseExtensions | Unset): Opaque extension data restored from provider-specific
             storage

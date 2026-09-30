@@ -64,8 +64,16 @@ type QEMURequest struct {
 // Result is written to the Job termination message after all referenced
 // registry manifests are available by digest.
 type Result struct {
-	Containers     []ContainerResult `json:"containers"`
-	VirtualMachine *VMStateResult    `json:"virtualMachine,omitempty"`
+	Containers     []ContainerResult  `json:"containers"`
+	VirtualMachine *VMStateResult     `json:"virtualMachine,omitempty"`
+	KataVMState    *KataVMStateResult `json:"kataVMState,omitempty"`
+}
+
+// KataVMStateResult is the stable worker result for a node-local Kata snapshot.
+type KataVMStateResult struct {
+	SnapshotName   string `json:"snapshotName"`
+	RuntimeVersion string `json:"runtimeVersion,omitempty"`
+	ManifestDigest string `json:"manifestDigest,omitempty"`
 }
 
 type ContainerResult struct {

@@ -25,6 +25,7 @@ from threading import Lock
 from typing import Callable, Iterable, Optional
 from uuid import UUID
 
+from fastapi import HTTPException, status
 from kubernetes.client import ApiException
 
 from opensandbox_server.services.snapshot_models import SnapshotState
@@ -40,6 +41,7 @@ _GROUP = "sandbox.opensandbox.io"
 _VERSION = "v1alpha1"
 _PLURAL = "sandboxsnapshots"
 _BATCHSANDBOX_PLURAL = "batchsandboxes"
+_RESTORED_SNAPSHOT_ID_LABEL = "opensandbox.io/snapshot-id"
 _POOL_ALLOCATION_ANNOTATION = "sandbox.opensandbox.io/alloc-status"
 _BATCHSANDBOX_NAME_LABEL = "batch-sandbox.sandbox.opensandbox.io/name"
 
@@ -50,6 +52,9 @@ PUBLIC_SNAPSHOT_ID_LABEL = "opensandbox.io/snapshot-id"
 PUBLIC_SNAPSHOT_SOURCE_SANDBOX_ID_LABEL = "opensandbox.io/source-sandbox-id"
 PUBLIC_SNAPSHOT_SCOPE_VALUE = "public"
 MAIN_CONTAINER_NAME = "sandbox"
+SUPPORTED_SNAPSHOT_FORMATS = frozenset(
+    {"rootfs-v1", "qemu-v1", "kata-vmstate-v1"}
+)
 
 
 def _stable_hex(value: str) -> str:
@@ -101,6 +106,7 @@ class KubernetesSnapshotRuntime:
         sandbox_id: str,
         *,
         namespace: str | None = None,
+        format: str | None = None,
     ) -> None:
         ns = namespace if namespace is not None else self._namespace
         try:
@@ -129,6 +135,10 @@ class KubernetesSnapshotRuntime:
                 "runtime_class_name",
             )
             if runtime_class_name is None:
+                if format == "kata-vmstate-v1":
+                    raise SnapshotRuntimeUnsupportedError(
+                        "Kata VM-state snapshots require RuntimeClass handler 'kata-v2'."
+                    )
                 return
             if not isinstance(runtime_class_name, str) or not runtime_class_name:
                 raise SnapshotRuntimePreflightError(
@@ -150,7 +160,15 @@ class KubernetesSnapshotRuntime:
                 f"Cannot verify snapshot runtime for sandbox {sandbox_id}."
             ) from exc
 
-        if self._is_gvisor_handler(handler):
+        if format == "kata-vmstate-v1":
+            if runtime_class_name != "kata-vm-isolation-v2" or handler != "kata-v2":
+                raise SnapshotRuntimeUnsupportedError(
+                    "Kata VM-state snapshots require RuntimeClass "
+                    f"'kata-vm-isolation-v2' with handler 'kata-v2', got "
+                    f"{runtime_class_name!r} with handler {handler!r}."
+                )
+
+        if format != "kata-vmstate-v1" and self._is_gvisor_handler(handler):
             raise SnapshotRuntimeUnsupportedError(
                 f"gVisor RuntimeClass {runtime_class_name!r} (handler {handler!r}) "
                 "does not support the built-in rootfs snapshot committer."
@@ -162,6 +180,7 @@ class KubernetesSnapshotRuntime:
         sandbox_id: str,
         *,
         namespace: str | None = None,
+        format: str | None = None,
     ) -> Optional[SnapshotRuntimeStatus]:
         snapshot_name = build_public_snapshot_name(snapshot_id)
         ns = namespace if namespace is not None else self._namespace
@@ -169,7 +188,13 @@ class KubernetesSnapshotRuntime:
         # A fresh namespace may never have been watched; register before any
         # status can change so the reactor observes this snapshot's events.
         self._ensure_namespace_watch(ns)
-        body = self._build_snapshot_body(snapshot_id, sandbox_id, snapshot_name, namespace=ns)
+        body = self._build_snapshot_body(
+            snapshot_id,
+            sandbox_id,
+            snapshot_name,
+            namespace=ns,
+            format=format,
+        )
         should_validate_existing_source = False
 
         if self._postgresql_ha_enabled:
@@ -363,7 +388,27 @@ class KubernetesSnapshotRuntime:
     ) -> None:
         snapshot_name = build_public_snapshot_name(snapshot_id)
         fallback = namespace if namespace is not None else self._namespace
-        ns = self._snapshot_namespaces.pop(snapshot_id, fallback)
+        ns = self._snapshot_namespaces.get(snapshot_id, fallback)
+        consumers = self._k8s_client.list_custom_objects(
+            group=_GROUP,
+            version=_VERSION,
+            namespace=ns,
+            plural=_BATCHSANDBOX_PLURAL,
+            label_selector=f"{_RESTORED_SNAPSHOT_ID_LABEL}={snapshot_id}",
+            use_cache=False,
+        )
+        if consumers:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "SNAPSHOT::DELETE_CONFLICT",
+                    "message": (
+                        f"Snapshot {snapshot_id} is still used by "
+                        f"{len(consumers)} sandbox resource(s)."
+                    ),
+                },
+            )
+        self._snapshot_namespaces.pop(snapshot_id, None)
         try:
             self._k8s_client.delete_custom_object(
                 group=_GROUP,
@@ -377,6 +422,34 @@ class KubernetesSnapshotRuntime:
                 logger.info(f"Kubernetes SandboxSnapshot {snapshot_name} already absent")
                 return
             raise RuntimeError(f"Failed to delete Kubernetes SandboxSnapshot {snapshot_name}: {exc}") from exc
+
+    def preflight_delete_snapshot(
+        self,
+        snapshot_id: str,
+        *,
+        namespace: str | None = None,
+        source_sandbox_id: str | None = None,
+    ) -> None:
+        ns = namespace if namespace is not None else self._namespace
+        consumers = self._k8s_client.list_custom_objects(
+            group=_GROUP,
+            version=_VERSION,
+            namespace=ns,
+            plural=_BATCHSANDBOX_PLURAL,
+            label_selector=f"{_RESTORED_SNAPSHOT_ID_LABEL}={snapshot_id}",
+            use_cache=False,
+        )
+        if consumers:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "SNAPSHOT::DELETE_CONFLICT",
+                    "message": (
+                        f"Snapshot {snapshot_id} is still used by "
+                        f"{len(consumers)} sandbox resource(s)."
+                    ),
+                },
+            )
 
     def inspect_snapshot(
         self,
@@ -418,7 +491,18 @@ class KubernetesSnapshotRuntime:
 
         return self._snapshot_status_from_cr(snapshot)
 
-    def _build_snapshot_body(self, snapshot_id: str, sandbox_id: str, snapshot_name: str, *, namespace: str = "default") -> dict:
+    def _build_snapshot_body(
+        self,
+        snapshot_id: str,
+        sandbox_id: str,
+        snapshot_name: str,
+        *,
+        namespace: str = "default",
+        format: str | None = None,
+    ) -> dict:
+        spec = {"sandboxName": sandbox_id}
+        if format is not None:
+            spec["format"] = format
         return {
             "apiVersion": f"{_GROUP}/{_VERSION}",
             "kind": "SandboxSnapshot",
@@ -431,9 +515,7 @@ class KubernetesSnapshotRuntime:
                     PUBLIC_SNAPSHOT_SCOPE_LABEL: PUBLIC_SNAPSHOT_SCOPE_VALUE,
                 },
             },
-            "spec": {
-                "sandboxName": sandbox_id,
-            },
+            "spec": spec,
         }
 
     def _source_pod(
@@ -554,11 +636,21 @@ class KubernetesSnapshotRuntime:
     def _snapshot_status_from_cr(self, snapshot: dict) -> SnapshotRuntimeStatus:
         status = snapshot.get("status", {})
         phase = status.get("phase")
+        snapshot_format = status.get("format") or "rootfs-v1"
+
+        if snapshot_format not in SUPPORTED_SNAPSHOT_FORMATS:
+            return SnapshotRuntimeStatus(
+                state=SnapshotState.FAILED,
+                format=str(snapshot_format),
+                reason="snapshot_runtime_unknown_format",
+                message=f"Unsupported Kubernetes snapshot format {snapshot_format!r}.",
+            )
 
         if phase == "Succeed":
-            if status.get("format") == "qemu-v1":
+            if snapshot_format == "qemu-v1":
                 return SnapshotRuntimeStatus(
                     state=SnapshotState.FAILED,
+                    format=snapshot_format,
                     reason="snapshot_restore_qemu_not_supported",
                     message=(
                         "QEMU VMState restore is currently supported only by "
@@ -566,12 +658,15 @@ class KubernetesSnapshotRuntime:
                         "not yet persist the complete Pod template restore plan."
                     ),
                 )
+            if snapshot_format == "kata-vmstate-v1":
+                return self._kata_status_from_cr(snapshot, status)
             image_status = self._select_restore_image(status.get("containers") or [])
             if image_status.state == SnapshotState.FAILED:
                 return image_status
             return SnapshotRuntimeStatus(
                 state=SnapshotState.READY,
                 image=image_status.image,
+                format=snapshot_format,
                 reason="snapshot_runtime_ready",
                 message="Kubernetes snapshot image created successfully.",
             )
@@ -580,15 +675,68 @@ class KubernetesSnapshotRuntime:
             reason, message = self._failure_reason_and_message(status)
             return SnapshotRuntimeStatus(
                 state=SnapshotState.FAILED,
+                format=snapshot_format,
                 reason=reason,
                 message=message,
             )
 
         return SnapshotRuntimeStatus(
             state=SnapshotState.CREATING,
+            format=snapshot_format,
             reason="snapshot_runtime_in_progress",
             message=f"Kubernetes SandboxSnapshot phase is {phase or 'Pending'}.",
         )
+
+    def _kata_status_from_cr(self, snapshot: dict, status: dict) -> SnapshotRuntimeStatus:
+        kata = status.get("kataVMState")
+        if not isinstance(kata, dict):
+            kata = {}
+        secret_name = kata.get("restorePlanSecretName")
+        metadata = snapshot.get("metadata") or {}
+        values = {
+            "source_node_name": status.get("sourceNodeName"),
+            "snapshot_name": kata.get("snapshotName"),
+            "runtime_version": kata.get("runtimeVersion"),
+            "runtime_class_name": "kata-vm-isolation-v2",
+            "restore_plan_secret_name": secret_name,
+            "restore_plan_owner_name": metadata.get("name"),
+            "restore_plan_owner_uid": metadata.get("uid"),
+        }
+        if (
+            any(
+                not isinstance(value, str) or not value.strip()
+                for value in (
+                    values["restore_plan_secret_name"],
+                    values["restore_plan_owner_name"],
+                    values["restore_plan_owner_uid"],
+                    values["source_node_name"],
+                    values["snapshot_name"],
+                    values["runtime_version"],
+                    values["runtime_class_name"],
+                )
+            )
+        ):
+            return SnapshotRuntimeStatus(
+                state=SnapshotState.FAILED,
+                format="kata-vmstate-v1",
+                reason="snapshot_runtime_incomplete_kata_vmstate",
+                message="Kubernetes snapshot succeeded without a complete status.kataVMState restore plan.",
+            )
+        return SnapshotRuntimeStatus(
+            state=SnapshotState.READY,
+            backend="kata-vmstate-v1",
+            format="kata-vmstate-v1",
+            source_node_name=values["source_node_name"],
+            snapshot_name=values["snapshot_name"],
+            runtime_version=values["runtime_version"],
+            runtime_class_name=values["runtime_class_name"],
+            restore_plan_secret_name=values["restore_plan_secret_name"],
+            restore_plan_owner_name=values["restore_plan_owner_name"],
+            restore_plan_owner_uid=values["restore_plan_owner_uid"],
+            reason="snapshot_runtime_ready",
+            message="Kata VM-state snapshot created successfully.",
+        )
+
 
     def _select_restore_image(self, containers: list[dict]) -> SnapshotRuntimeStatus:
         if not containers:

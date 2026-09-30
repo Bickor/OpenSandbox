@@ -27,6 +27,7 @@ from typing import Literal, cast
 
 from opensandbox.api.lifecycle.models import (
     CreateSandboxResponse,
+    CreateSnapshotRequestFormat,
     Endpoint,
     ListSandboxesResponse,
     ListSnapshotsResponse,
@@ -64,6 +65,7 @@ from opensandbox.models.sandboxes import (
     SandboxRenewResponse,
     SandboxStatus,
     SnapshotInfo,
+    SnapshotRestoreConstraints,
     SnapshotStatus,
     Volume,
 )
@@ -189,6 +191,7 @@ class SandboxModelConverter:
         credential_proxy: CredentialProxyConfig | None = None,
         resource_requests: dict[str, str] | None = None,
         lifecycle: SandboxLifecycle | None = None,
+        full_state_restore: bool = False,
     ) -> CreateSandboxRequest:
         """Convert domain parameters to API CreateSandboxRequest."""
         from opensandbox.api.lifecycle.models.create_sandbox_request import (
@@ -214,6 +217,19 @@ class SandboxModelConverter:
             SandboxLifecycle as ApiSandboxLifecycle,
         )
         from opensandbox.api.lifecycle.types import UNSET
+
+        if full_state_restore:
+            if snapshot_id is None:
+                raise ValueError("full_state_restore requires snapshot_id")
+            request = CreateSandboxRequest(
+                snapshot_id=snapshot_id,
+                metadata=CreateSandboxRequestMetadata.from_dict(metadata),
+                secure_access=UNSET,
+            )
+            request.timeout = (
+                None if timeout is None else int(timeout.total_seconds())
+            )
+            return request
 
         # Convert env dict to API model
         api_env = UNSET
@@ -410,7 +426,12 @@ class SandboxModelConverter:
         if request is None:
             return ApiCreateSnapshotRequest()
         return ApiCreateSnapshotRequest(
-            name=request.name if request.name is not None else UNSET
+            name=request.name if request.name is not None else UNSET,
+            format_=(
+                CreateSnapshotRequestFormat(request.format)
+                if request.format is not None
+                else UNSET
+            ),
         )
 
     @staticmethod
@@ -633,10 +654,26 @@ class SandboxModelConverter:
         if isinstance(name, Unset):
             name = None
 
+        format_ = api_snapshot.format_
+        if isinstance(format_, Unset):
+            format_ = None
+
+        restore_constraints = api_snapshot.restore_constraints
+        if isinstance(restore_constraints, Unset):
+            domain_restore_constraints = None
+        else:
+            domain_restore_constraints = SnapshotRestoreConstraints(
+                placement=restore_constraints.placement.value,
+                source_node=restore_constraints.source_node,
+                durable=restore_constraints.durable,
+            )
+
         return SnapshotInfo(
             id=api_snapshot.id,
             sandbox_id=api_snapshot.sandbox_id,
             name=name,
+            format=format_,
+            restore_constraints=domain_restore_constraints,
             status=SnapshotStatus(
                 state=api_snapshot.status.state,
                 reason=reason,

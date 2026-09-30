@@ -90,6 +90,8 @@ class CapturingExecutor:
 class StubSnapshotRuntime:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.preflight_formats: list[str | None] = []
+        self.create_formats: list[str | None] = []
         self.delete_calls: list[tuple[str, str | None]] = []
         self.inspect_status_by_snapshot_id: dict[str, SnapshotRuntimeStatus] = {}
         self.create_result: SnapshotRuntimeStatus | None = None
@@ -100,11 +102,26 @@ class StubSnapshotRuntime:
     def create_snapshot_unsupported_message(self) -> str:
         return ""
 
-    def preflight_create_snapshot(self, sandbox_id: str, *, namespace: str | None = None) -> None:
+    def preflight_create_snapshot(
+        self,
+        sandbox_id: str,
+        *,
+        namespace: str | None = None,
+        format: str | None = None,
+    ) -> None:
+        self.preflight_formats.append(format)
         return None
 
-    def create_snapshot(self, snapshot_id: str, sandbox_id: str, *, namespace: str | None = None):
+    def create_snapshot(
+        self,
+        snapshot_id: str,
+        sandbox_id: str,
+        *,
+        namespace: str | None = None,
+        format: str | None = None,
+    ):
         self.calls.append((snapshot_id, sandbox_id))
+        self.create_formats.append(format)
         return self.create_result
 
     def get_snapshot_status(self, snapshot_id: str):
@@ -170,6 +187,29 @@ def test_snapshot_service_persists_create_and_get(tmp_path) -> None:
     assert fetched.id == created.id
     assert fetched.sandbox_id == "sbx-001"
     assert runtime.calls == [(created.id, "sbx-001")]
+    assert runtime.preflight_formats == [None]
+    assert runtime.create_formats == [None]
+
+
+def test_snapshot_service_passes_and_persists_requested_format(tmp_path) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    runtime = StubSnapshotRuntime()
+    service = PersistedSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        snapshot_executor=CapturingExecutor(),
+    )
+
+    created = service.create_snapshot(
+        "sbx-001",
+        CreateSnapshotRequest(format="kata-vmstate-v1"),
+    )
+
+    stored = repo.get(created.id)
+    assert stored is not None
+    assert stored.restore_config.format == "kata-vmstate-v1"
+    assert runtime.preflight_formats == ["kata-vmstate-v1"]
 
 
 def test_snapshot_service_rejects_create_when_source_sandbox_not_running(tmp_path) -> None:
@@ -275,6 +315,65 @@ def test_snapshot_service_marks_snapshot_ready_from_worker(tmp_path) -> None:
     assert stored is not None
     assert stored.status.state == SnapshotState.READY
     assert stored.restore_config.image == "opensandbox-snapshots:snap-ready"
+
+
+def test_snapshot_service_accepts_image_less_ready_kata_plan(tmp_path) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    runtime = StubSnapshotRuntime()
+    runtime.create_result = SnapshotRuntimeStatus(
+        state=SnapshotState.READY,
+        backend="kata-vmstate-v1",
+        format="kata-vmstate-v1",
+        restore_plan_secret_name="kata-restore-plan",
+        restore_plan_owner_name="osb-snap-kata",
+        restore_plan_owner_uid="snapshot-uid",
+        source_node_name="node-a",
+        snapshot_name="kata-snapshot-a",
+        runtime_version="3.8.0",
+        runtime_class_name="kata-vm-isolation-v2",
+    )
+    service = PersistedSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        snapshot_executor=ImmediateExecutor(),
+    )
+
+    created = service.create_snapshot(
+        "sbx-001",
+        CreateSnapshotRequest(format="kata-vmstate-v1"),
+    )
+
+    stored = repo.get(created.id)
+    assert stored is not None
+    assert stored.status.state == SnapshotState.READY
+    assert stored.restore_config.image is None
+    assert stored.restore_config.is_complete_kata_plan()
+    assert stored.restore_config.restore_plan_secret_name == "kata-restore-plan"
+    assert "pod_template" not in stored.restore_config.to_dict()
+    response = service.get_snapshot(created.id)
+    assert response.format == "kata-vmstate-v1"
+    assert response.restore_constraints is not None
+    assert response.restore_constraints.source_node == "node-a"
+
+
+def test_snapshot_service_cleans_up_image_less_kata_artifact(tmp_path) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    runtime = StubSnapshotRuntime()
+    service = PersistedSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        snapshot_executor=ImmediateExecutor(),
+    )
+
+    assert service._cleanup_runtime_artifact(
+        "snap-kata",
+        None,
+        source_sandbox_id="sbx-001",
+        format="kata-vmstate-v1",
+    )
+    assert runtime.delete_calls == [("snap-kata", None)]
 
 
 def test_snapshot_service_marks_snapshot_failed_from_worker(tmp_path) -> None:

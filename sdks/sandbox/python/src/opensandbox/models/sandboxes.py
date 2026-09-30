@@ -691,6 +691,21 @@ class SnapshotStatus(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+class SnapshotRestoreConstraints(BaseModel):
+    """Placement and durability requirements for restoring a snapshot."""
+
+    placement: str = Field(description="Restore placement requirement")
+    source_node: str = Field(
+        description="Node on which this snapshot can be restored",
+        alias="source_node",
+    )
+    durable: bool = Field(
+        description="Whether restore is independent of the source node"
+    )
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class SnapshotInfo(BaseModel):
     """
     Detailed information about a snapshot instance.
@@ -702,6 +717,15 @@ class SnapshotInfo(BaseModel):
         alias="sandbox_id",
     )
     name: str | None = Field(default=None, description="Optional snapshot name")
+    format: str | None = Field(
+        default=None,
+        description="Snapshot representation format; future values are preserved",
+    )
+    restore_constraints: SnapshotRestoreConstraints | None = Field(
+        default=None,
+        description="Restore placement and durability constraints",
+        alias="restore_constraints",
+    )
     status: SnapshotStatus = Field(description="Current status of the snapshot")
     created_at: datetime = Field(description="Creation timestamp", alias="created_at")
 
@@ -761,12 +785,19 @@ class SandboxCreateResponse(BaseModel):
     )
 
 
+SnapshotFormat = Literal["rootfs-v1", "qemu-v1", "kata-vmstate-v1"]
+
+
 class CreateSnapshotRequest(BaseModel):
     """
     Request returned when creating a snapshot.
     """
 
     name: str | None = Field(default=None, description="Optional snapshot name")
+    format: SnapshotFormat | None = Field(
+        default=None,
+        description="Requested snapshot representation",
+    )
 
 
 class SandboxRenewResponse(BaseModel):

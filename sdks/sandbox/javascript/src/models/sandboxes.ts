@@ -516,7 +516,7 @@ export interface CreateSandboxRequest extends Record<string, unknown> {
    * Timeout in seconds (server semantics).
    */
   timeout?: number | null;
-  resourceLimits: ResourceLimits;
+  resourceLimits?: ResourceLimits;
   resourceRequests?: ResourceLimits;
   env?: Record<string, string>;
   metadata?: Record<string, string>;
@@ -586,16 +586,28 @@ export interface SnapshotStatus extends Record<string, unknown> {
   lastTransitionAt?: Date;
 }
 
+export interface SnapshotRestoreConstraints extends Record<string, unknown> {
+  placement: string;
+  sourceNode: string;
+  durable: boolean;
+}
+
 export interface SnapshotInfo extends Record<string, unknown> {
   id: string;
   sandboxId: SandboxId;
   name?: string;
+  /** Snapshot representation format. Future values are preserved. */
+  format?: string;
+  restoreConstraints?: SnapshotRestoreConstraints;
   status: SnapshotStatus;
   createdAt: Date;
 }
 
+export type SnapshotFormat = "rootfs-v1" | "qemu-v1" | "kata-vmstate-v1";
+
 export interface CreateSnapshotRequest extends Record<string, unknown> {
   name?: string;
+  format?: SnapshotFormat;
 }
 
 export interface ListSnapshotsResponse extends Record<string, unknown> {

@@ -88,6 +88,32 @@ class SnapshotRepositoryContract:
         assert loaded.updated_at == record.updated_at
         assert repository.get("missing") is None
 
+    def test_persists_complete_kata_restore_config(
+        self,
+        repository: SnapshotRepository,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        record = snapshot_record("snap-kata", "sbx-kata", now)
+        record.restore_config = SnapshotRestoreConfig(
+            backend="kata-vmstate-v1",
+            format="kata-vmstate-v1",
+            restore_plan_secret_name="kata-restore-plan",
+            restore_plan_owner_name="osb-snap-kata",
+            restore_plan_owner_uid="snapshot-uid",
+            source_node_name="node-a",
+            snapshot_name="kata-snapshot-a",
+            runtime_version="3.8.0",
+            runtime_class_name="kata-vm-isolation-v2",
+        )
+
+        repository.create(record)
+        loaded = repository.get(record.id)
+
+        assert loaded is not None
+        assert loaded.restore_config == record.restore_config
+        assert loaded.restore_config.is_complete_kata_plan()
+        assert "pod_template" not in loaded.restore_config.to_dict()
+
     def test_lists_and_updates_records(self, repository: SnapshotRepository) -> None:
         now = datetime.now(timezone.utc)
         first = snapshot_record("snap-001", "sbx-001", now, namespace="tenant-a")

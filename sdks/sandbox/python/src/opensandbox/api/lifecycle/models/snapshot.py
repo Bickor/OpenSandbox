@@ -26,6 +26,7 @@ from dateutil.parser import isoparse
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.snapshot_restore_constraints import SnapshotRestoreConstraints
     from ..models.snapshot_status import SnapshotStatus
 
 
@@ -42,6 +43,9 @@ class Snapshot:
         status (SnapshotStatus): Detailed snapshot status information with lifecycle state and transition details.
         created_at (datetime.datetime): Snapshot creation timestamp
         name (str | Unset): Optional human-readable snapshot name
+        format_ (str | Unset): Snapshot representation format. Known values include `rootfs-v1`,
+            `qemu-v1`, and `kata-vmstate-v1`. Clients should tolerate future values.
+        restore_constraints (SnapshotRestoreConstraints | Unset):
     """
 
     id: str
@@ -49,6 +53,8 @@ class Snapshot:
     status: SnapshotStatus
     created_at: datetime.datetime
     name: str | Unset = UNSET
+    format_: str | Unset = UNSET
+    restore_constraints: SnapshotRestoreConstraints | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         id = self.id
@@ -60,6 +66,12 @@ class Snapshot:
         created_at = self.created_at.isoformat()
 
         name = self.name
+
+        format_ = self.format_
+
+        restore_constraints: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.restore_constraints, Unset):
+            restore_constraints = self.restore_constraints.to_dict()
 
         field_dict: dict[str, Any] = {}
 
@@ -73,11 +85,16 @@ class Snapshot:
         )
         if name is not UNSET:
             field_dict["name"] = name
+        if format_ is not UNSET:
+            field_dict["format"] = format_
+        if restore_constraints is not UNSET:
+            field_dict["restoreConstraints"] = restore_constraints
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.snapshot_restore_constraints import SnapshotRestoreConstraints
         from ..models.snapshot_status import SnapshotStatus
 
         d = dict(src_dict)
@@ -91,12 +108,23 @@ class Snapshot:
 
         name = d.pop("name", UNSET)
 
+        format_ = d.pop("format", UNSET)
+
+        _restore_constraints = d.pop("restoreConstraints", UNSET)
+        restore_constraints: SnapshotRestoreConstraints | Unset
+        if isinstance(_restore_constraints, Unset):
+            restore_constraints = UNSET
+        else:
+            restore_constraints = SnapshotRestoreConstraints.from_dict(_restore_constraints)
+
         snapshot = cls(
             id=id,
             sandbox_id=sandbox_id,
             status=status,
             created_at=created_at,
             name=name,
+            format_=format_,
+            restore_constraints=restore_constraints,
         )
 
         return snapshot

@@ -27,6 +27,8 @@ import (
 	"github.com/stretchr/testify/require"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	nodev1 "k8s.io/api/node/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
@@ -45,6 +47,7 @@ func newTestSnapshotReconciler(objs ...client.Object) *SandboxSnapshotReconciler
 	scheme := k8sruntime.NewScheme()
 	utilruntime.Must(corev1.AddToScheme(scheme))
 	utilruntime.Must(batchv1.AddToScheme(scheme))
+	utilruntime.Must(nodev1.AddToScheme(scheme))
 	utilruntime.Must(sandboxv1alpha1.AddToScheme(scheme))
 
 	fakeClient := fake.NewClientBuilder().
@@ -688,4 +691,480 @@ func TestBuildCommitJob_InternalQEMUSnapshotLeavesSourceFrozen(t *testing.T) {
 	var request snapshotcontract.Request
 	require.NoError(t, json.Unmarshal(requestData, &request))
 	assert.True(t, request.LeaveSourceFrozen)
+}
+
+func TestResolveSnapshotFormat_ExplicitFormatsFailClosed(t *testing.T) {
+	runtimeClassName := kataRuntimeClassName
+	pod := &corev1.Pod{Spec: corev1.PodSpec{RuntimeClassName: &runtimeClassName}}
+	snapshotObject := &sandboxv1alpha1.SandboxSnapshot{
+		Spec: sandboxv1alpha1.SandboxSnapshotSpec{Format: sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1},
+	}
+	r := newTestSnapshotReconciler(&nodev1.RuntimeClass{
+		ObjectMeta: metav1.ObjectMeta{Name: kataRuntimeClassName},
+		Handler:    kataRuntimeHandler,
+	})
+	r.KataVMStateEnabled = true
+
+	format, err := r.resolveSnapshotFormat(context.Background(), snapshotObject, pod, snapshotcontract.WorkloadContract{Provider: snapshotcontract.ProviderRootfs})
+	require.NoError(t, err)
+	assert.Equal(t, sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1, format)
+
+	snapshotObject.Spec.Format = sandboxv1alpha1.SandboxSnapshotFormatRootfsV1
+	format, err = r.resolveSnapshotFormat(context.Background(), snapshotObject, pod, snapshotcontract.WorkloadContract{Provider: snapshotcontract.ProviderRootfs})
+	require.NoError(t, err)
+	assert.Equal(t, sandboxv1alpha1.SandboxSnapshotFormatRootfsV1, format)
+
+	snapshotObject.Spec.Format = sandboxv1alpha1.SandboxSnapshotFormatQEMUV1
+	_, err = r.resolveSnapshotFormat(context.Background(), snapshotObject, pod, snapshotcontract.WorkloadContract{Provider: snapshotcontract.ProviderRootfs})
+	require.Error(t, err)
+
+	controllerOwner := true
+	snapshotObject.Spec.Format = sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1
+	snapshotObject.OwnerReferences = []metav1.OwnerReference{{Kind: "BatchSandbox", Controller: &controllerOwner}}
+	_, err = r.resolveSnapshotFormat(context.Background(), snapshotObject, pod, snapshotcontract.WorkloadContract{Provider: snapshotcontract.ProviderRootfs})
+	require.ErrorContains(t, err, "public snapshots")
+}
+
+func TestResolveSnapshotFormat_KataRequiresFeatureRuntimeClassAndHandler(t *testing.T) {
+	runtimeClassName := kataRuntimeClassName
+	pod := &corev1.Pod{Spec: corev1.PodSpec{RuntimeClassName: &runtimeClassName}}
+	snapshotObject := &sandboxv1alpha1.SandboxSnapshot{Spec: sandboxv1alpha1.SandboxSnapshotSpec{Format: sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1}}
+	contract := snapshotcontract.WorkloadContract{Provider: snapshotcontract.ProviderRootfs}
+
+	r := newTestSnapshotReconciler(&nodev1.RuntimeClass{ObjectMeta: metav1.ObjectMeta{Name: kataRuntimeClassName}, Handler: kataRuntimeHandler})
+	_, err := r.resolveSnapshotFormat(context.Background(), snapshotObject, pod, contract)
+	require.ErrorContains(t, err, "disabled")
+
+	r.KataVMStateEnabled = true
+	otherRuntimeClass := "other"
+	pod.Spec.RuntimeClassName = &otherRuntimeClass
+	_, err = r.resolveSnapshotFormat(context.Background(), snapshotObject, pod, contract)
+	require.ErrorContains(t, err, kataRuntimeClassName)
+
+	pod.Spec.RuntimeClassName = &runtimeClassName
+	r = newTestSnapshotReconciler(&nodev1.RuntimeClass{ObjectMeta: metav1.ObjectMeta{Name: kataRuntimeClassName}, Handler: "wrong-handler"})
+	r.KataVMStateEnabled = true
+	_, err = r.resolveSnapshotFormat(context.Background(), snapshotObject, pod, contract)
+	require.ErrorContains(t, err, kataRuntimeHandler)
+}
+
+func TestResolveSnapshotFormat_KataRejectsSecureAccessSource(t *testing.T) {
+	runtimeClassName := kataRuntimeClassName
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			kataUnsupportedSecureAccessAnnotation: "signed-token",
+		}},
+		Spec: corev1.PodSpec{RuntimeClassName: &runtimeClassName},
+	}
+	snapshotObject := &sandboxv1alpha1.SandboxSnapshot{
+		Spec: sandboxv1alpha1.SandboxSnapshotSpec{
+			Format: sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1,
+		},
+	}
+	r := newTestSnapshotReconciler(&nodev1.RuntimeClass{
+		ObjectMeta: metav1.ObjectMeta{Name: kataRuntimeClassName},
+		Handler:    kataRuntimeHandler,
+	})
+	r.KataVMStateEnabled = true
+
+	_, err := r.resolveSnapshotFormat(
+		context.Background(),
+		snapshotObject,
+		pod,
+		snapshotcontract.WorkloadContract{Provider: snapshotcontract.ProviderRootfs},
+	)
+
+	require.ErrorContains(t, err, "secure-access-enabled")
+}
+
+func TestResolveSnapshotFormat_KataRejectsEgressPolicySource(t *testing.T) {
+	runtimeClassName := kataRuntimeClassName
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			kataUnsupportedEgressAuthAnnotation: "egress-token",
+		}},
+		Spec: corev1.PodSpec{RuntimeClassName: &runtimeClassName},
+	}
+	snapshotObject := &sandboxv1alpha1.SandboxSnapshot{
+		Spec: sandboxv1alpha1.SandboxSnapshotSpec{
+			Format: sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1,
+		},
+	}
+	r := newTestSnapshotReconciler(&nodev1.RuntimeClass{
+		ObjectMeta: metav1.ObjectMeta{Name: kataRuntimeClassName},
+		Handler:    kataRuntimeHandler,
+	})
+	r.KataVMStateEnabled = true
+
+	_, err := r.resolveSnapshotFormat(
+		context.Background(),
+		snapshotObject,
+		pod,
+		snapshotcontract.WorkloadContract{Provider: snapshotcontract.ProviderRootfs},
+	)
+	require.ErrorContains(t, err, "egress-policy-enabled")
+}
+
+func TestResolveSnapshotFormat_EmptyPreservesAutoSelection(t *testing.T) {
+	r := newTestSnapshotReconciler()
+	snapshotObject := &sandboxv1alpha1.SandboxSnapshot{}
+	pod := &corev1.Pod{}
+
+	format, err := r.resolveSnapshotFormat(context.Background(), snapshotObject, pod, snapshotcontract.WorkloadContract{Provider: snapshotcontract.ProviderRootfs})
+	require.NoError(t, err)
+	assert.Equal(t, sandboxv1alpha1.SandboxSnapshotFormatRootfsV1, format)
+	format, err = r.resolveSnapshotFormat(context.Background(), snapshotObject, pod, snapshotcontract.WorkloadContract{Provider: snapshotcontract.ProviderQEMU})
+	require.NoError(t, err)
+	assert.Equal(t, sandboxv1alpha1.SandboxSnapshotFormatQEMUV1, format)
+}
+
+func TestKataPodTemplateSanitizesSourceIdentityAndPreservesWorkload(t *testing.T) {
+	runtimeClassName := kataRuntimeClassName
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{
+				labelPoolName:                "pool-a",
+				labelPoolRevision:            "revision",
+				labelBatchSandboxNameKey:     "sandbox-a",
+				labelBatchSandboxPodIndexKey: "0",
+				labelSandboxIdentity:         "public-id",
+				labelSandboxSnapshotID:       "old-snapshot",
+				labelSourceSandboxIdentity:   "source-id",
+				labelSandboxSnapshotName:     "controller-snapshot",
+				"workload.example.com/shape": "gpu",
+			},
+			Annotations: map[string]string{
+				kataSnapshotAnnotation:        "old-name",
+				"workload.example.com/config": "keep",
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeName:         "node-a",
+			RuntimeClassName: &runtimeClassName,
+			InitContainers:   []corev1.Container{{Name: "init", Image: "init:1"}},
+			Containers:       []corev1.Container{{Name: "main", Image: "main:1"}, {Name: "sidecar", Image: "sidecar:1"}},
+			Volumes:          []corev1.Volume{{Name: "scratch", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}},
+		},
+	}
+
+	rawTemplate, err := kataPodTemplate(pod)
+	require.NoError(t, err)
+	var template corev1.PodTemplateSpec
+	require.NoError(t, json.Unmarshal(rawTemplate.Raw, &template))
+	assert.Empty(t, template.Spec.NodeName)
+	assert.Equal(t, runtimeClassName, *template.Spec.RuntimeClassName)
+	assert.Len(t, template.Spec.InitContainers, 1)
+	assert.Len(t, template.Spec.Containers, 2)
+	assert.Len(t, template.Spec.Volumes, 1)
+	assert.Equal(t, "gpu", template.Labels["workload.example.com/shape"])
+	assert.Equal(t, "keep", template.Annotations["workload.example.com/config"])
+	assert.NotContains(t, template.Annotations, kataSnapshotAnnotation)
+	for _, key := range []string{labelPoolName, labelPoolRevision, labelBatchSandboxNameKey, labelBatchSandboxPodIndexKey, labelSandboxIdentity, labelSandboxSnapshotID, labelSourceSandboxIdentity, labelSandboxSnapshotName} {
+		assert.NotContains(t, template.Labels, key)
+	}
+}
+
+func TestKataSnapshotNameIsDeterministicAndOpaque(t *testing.T) {
+	first, err := kataSnapshotName(types.UID("source-snapshot-uid"))
+	require.NoError(t, err)
+	second, err := kataSnapshotName(types.UID("source-snapshot-uid"))
+	require.NoError(t, err)
+	assert.Equal(t, first, second)
+	assert.Regexp(t, `^ks-[0-9a-f]{32}$`, first)
+	assert.NotContains(t, first, "source")
+	_, err = kataSnapshotName("")
+	require.Error(t, err)
+}
+
+func TestSandboxSnapshotHandlePending_KataDoesNotRequireRegistry(t *testing.T) {
+	runtimeClassName := kataRuntimeClassName
+	bs := &sandboxv1alpha1.BatchSandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-bs", Namespace: "default"},
+		Spec: sandboxv1alpha1.BatchSandboxSpec{Template: &corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			RuntimeClassName: &runtimeClassName,
+			Containers:       []corev1.Container{{Name: "main", Image: "main:1"}},
+		}}},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-bs-0", Namespace: "default", UID: types.UID("pod-uid"),
+			Labels:      map[string]string{labelBatchSandboxNameKey: "test-bs", labelSandboxIdentity: "source-id", "workload": "keep"},
+			Annotations: map[string]string{kataSnapshotAnnotation: "old-name", "workload": "keep"},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node-a", RuntimeClassName: &runtimeClassName,
+			Containers: []corev1.Container{{Name: "main", Image: "main:1"}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	snapshotObject := &sandboxv1alpha1.SandboxSnapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "public-snapshot", Namespace: "default", UID: types.UID("snapshot-uid")},
+		Spec:       sandboxv1alpha1.SandboxSnapshotSpec{SandboxName: bs.Name, Format: sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1},
+		Status:     sandboxv1alpha1.SandboxSnapshotStatus{Phase: sandboxv1alpha1.SandboxSnapshotPhasePending},
+	}
+	runtimeClass := &nodev1.RuntimeClass{ObjectMeta: metav1.ObjectMeta{Name: kataRuntimeClassName}, Handler: kataRuntimeHandler}
+	r := newTestSnapshotReconciler(bs, pod, snapshotObject, runtimeClass)
+	r.KataVMStateEnabled = true
+
+	result, err := r.handlePending(context.Background(), snapshotObject)
+	require.NoError(t, err)
+	assert.Equal(t, time.Second, result.RequeueAfter)
+	updated := &sandboxv1alpha1.SandboxSnapshot{}
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: snapshotObject.Name, Namespace: snapshotObject.Namespace}, updated))
+	assert.Equal(t, sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1, updated.Status.Format)
+	assert.Empty(t, updated.Status.Containers)
+	require.NotNil(t, updated.Status.KataVMState)
+	assert.Regexp(t, `^ks-[0-9a-f]{32}$`, updated.Status.KataVMState.SnapshotName)
+	assert.Regexp(t, `^ks-[0-9a-f]{32}-restore-plan$`, updated.Status.KataVMState.RestorePlanSecretName)
+	planSecret := &corev1.Secret{}
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: updated.Status.KataVMState.RestorePlanSecretName, Namespace: snapshotObject.Namespace}, planSecret))
+	assert.Equal(t, corev1.SecretTypeOpaque, planSecret.Type)
+	require.NotNil(t, planSecret.Immutable)
+	assert.True(t, *planSecret.Immutable)
+	require.Len(t, planSecret.Data, 1)
+	require.Len(t, planSecret.OwnerReferences, 1)
+	owner := planSecret.OwnerReferences[0]
+	assert.Equal(t, sandboxv1alpha1.GroupVersion.String(), owner.APIVersion)
+	assert.Equal(t, "SandboxSnapshot", owner.Kind)
+	assert.Equal(t, snapshotObject.Name, owner.Name)
+	assert.Equal(t, snapshotObject.UID, owner.UID)
+	require.NotNil(t, owner.Controller)
+	assert.True(t, *owner.Controller)
+	var capturedTemplate corev1.PodTemplateSpec
+	require.NoError(t, json.Unmarshal(planSecret.Data[kataRestorePlanSecretKey], &capturedTemplate))
+	assert.Empty(t, capturedTemplate.Spec.NodeName)
+	assert.NotContains(t, capturedTemplate.Labels, labelSandboxIdentity)
+	assert.NotContains(t, capturedTemplate.Annotations, kataSnapshotAnnotation)
+	assert.Equal(t, "keep", capturedTemplate.Labels["workload"])
+}
+
+func TestBuildCommitJob_KataUsesPrivilegedSameNodeHostWorker(t *testing.T) {
+	snapshotObject := &sandboxv1alpha1.SandboxSnapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-snapshot", Namespace: "tenant", UID: types.UID("snapshot-uid")},
+		Status: sandboxv1alpha1.SandboxSnapshotStatus{
+			Format:         sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1,
+			SourcePodName:  "source-pod",
+			SourceNodeName: "node-a",
+			KataVMState: &sandboxv1alpha1.KataVMStateSnapshot{
+				SnapshotName: "ks-0123456789abcdef0123456789abcdef",
+			},
+		},
+	}
+	r := newTestSnapshotReconciler(snapshotObject)
+	r.ImageCommitterImage = "image-committer-azure:test"
+	r.HostKataCtlPath = "/opt/custom/kata-ctl"
+
+	job, err := r.buildCommitJob(snapshotObject, "source-pod-uid")
+	require.NoError(t, err)
+	assert.Equal(t, "node-a", job.Spec.Template.Spec.NodeName)
+	assert.False(t, job.Spec.Template.Spec.HostPID)
+	require.Len(t, job.Spec.Template.Spec.Containers, 1)
+	container := job.Spec.Template.Spec.Containers[0]
+	assert.Equal(t, "image-committer-azure:test", container.Image)
+	var hostRootMount *corev1.VolumeMount
+	for i := range container.VolumeMounts {
+		if container.VolumeMounts[i].Name == kataHostRootVolumeName {
+			hostRootMount = &container.VolumeMounts[i]
+			break
+		}
+	}
+	require.NotNil(t, hostRootMount)
+	require.NotNil(t, hostRootMount.MountPropagation)
+	assert.Equal(t, corev1.MountPropagationHostToContainer, *hostRootMount.MountPropagation)
+	assert.Equal(t, []string{
+		"kata-vmstate", "create",
+		"--pod-name", "source-pod",
+		"--pod-namespace", "tenant",
+		"--pod-uid", "source-pod-uid",
+		"--snapshot-name", "ks-0123456789abcdef0123456789abcdef",
+		"--kata-ctl-path", "/opt/custom/kata-ctl",
+	}, container.Args)
+	require.NotNil(t, container.SecurityContext)
+	require.NotNil(t, container.SecurityContext.Privileged)
+	assert.True(t, *container.SecurityContext.Privileged)
+	assert.Contains(t, container.VolumeMounts, corev1.VolumeMount{Name: "containerd-sock", MountPath: ContainerdSocketPath})
+	assert.Empty(t, r.SnapshotRegistry, "Kata job must not require a snapshot registry")
+}
+
+func TestBuildCommitJob_KataRejectsUnsafeHostKataCtlPath(t *testing.T) {
+	snapshotObject := &sandboxv1alpha1.SandboxSnapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-snapshot", Namespace: "tenant"},
+		Status: sandboxv1alpha1.SandboxSnapshotStatus{
+			Format:         sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1,
+			SourcePodName:  "source-pod",
+			SourceNodeName: "node-a",
+			KataVMState:    &sandboxv1alpha1.KataVMStateSnapshot{SnapshotName: "ks-0123456789abcdef0123456789abcdef"},
+		},
+	}
+	r := newTestSnapshotReconciler(snapshotObject)
+	r.HostKataCtlPath = "../kata-ctl"
+	_, err := r.buildCommitJob(snapshotObject, "source-pod-uid")
+	require.ErrorContains(t, err, "clean absolute path")
+}
+
+func TestSandboxSnapshotHandleCommitting_KataPersistsRuntimeVersion(t *testing.T) {
+	snapshotObject := &sandboxv1alpha1.SandboxSnapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-snapshot", Namespace: "default"},
+		Status: sandboxv1alpha1.SandboxSnapshotStatus{
+			Phase:  sandboxv1alpha1.SandboxSnapshotPhaseCommitting,
+			Format: sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1,
+			KataVMState: &sandboxv1alpha1.KataVMStateSnapshot{
+				SnapshotName: "ks-0123456789abcdef0123456789abcdef",
+			},
+		},
+	}
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "test-snapshot-commit", Namespace: "default"}, Status: batchv1.JobStatus{Succeeded: 1}}
+	commitPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "worker", Namespace: "default", Labels: map[string]string{"job-name": job.Name}},
+		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
+			Name: commitJobContainerName,
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: 0,
+				Message:  `{"kataVMState":{"snapshotName":"ks-0123456789abcdef0123456789abcdef","runtimeVersion":"3.15.0-aks.1"}}`,
+			}},
+		}}},
+	}
+	r := newTestSnapshotReconciler(snapshotObject, job, commitPod)
+
+	_, err := r.handleCommitting(context.Background(), snapshotObject)
+	require.NoError(t, err)
+	updated := &sandboxv1alpha1.SandboxSnapshot{}
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: snapshotObject.Name, Namespace: snapshotObject.Namespace}, updated))
+	assert.Equal(t, sandboxv1alpha1.SandboxSnapshotPhaseSucceed, updated.Status.Phase)
+	require.NotNil(t, updated.Status.KataVMState)
+	assert.Equal(t, "3.15.0-aks.1", updated.Status.KataVMState.RuntimeVersion)
+}
+
+func TestSandboxSnapshotHandleCommitting_KataRejectsReturnedName(t *testing.T) {
+	snapshotObject := &sandboxv1alpha1.SandboxSnapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-snapshot", Namespace: "default"},
+		Status: sandboxv1alpha1.SandboxSnapshotStatus{
+			Format:      sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1,
+			KataVMState: &sandboxv1alpha1.KataVMStateSnapshot{SnapshotName: "ks-0123456789abcdef0123456789abcdef"},
+		},
+	}
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "test-snapshot-commit", Namespace: "default"}, Status: batchv1.JobStatus{Succeeded: 1}}
+	commitPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "worker", Namespace: "default", Labels: map[string]string{"job-name": job.Name}},
+		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
+			Name: commitJobContainerName,
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0,
+				Message: `{"containers":[],"kataVMState":{"snapshotName":"ks-ffffffffffffffffffffffffffffffff","runtimeVersion":"3.15.0"}}`}},
+		}}},
+	}
+	r := newTestSnapshotReconciler(snapshotObject, job, commitPod)
+	err := r.updateSnapshotStatusFromSucceededCommitJob(context.Background(), snapshotObject, job)
+	require.ErrorContains(t, err, "expected")
+}
+
+func TestSandboxSnapshotHandleCommitting_KataFailureDoesNotCreateUnpauseJob(t *testing.T) {
+	snapshotObject := &sandboxv1alpha1.SandboxSnapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-snapshot", Namespace: "default"},
+		Status: sandboxv1alpha1.SandboxSnapshotStatus{
+			Phase:          sandboxv1alpha1.SandboxSnapshotPhaseCommitting,
+			Format:         sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1,
+			SourcePodName:  "source-pod",
+			SourceNodeName: "node-a",
+			KataVMState:    &sandboxv1alpha1.KataVMStateSnapshot{SnapshotName: "ks-0123456789abcdef0123456789abcdef"},
+		},
+	}
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-snapshot-commit", Namespace: "default"},
+		Status:     batchv1.JobStatus{Conditions: []batchv1.JobCondition{{Type: batchv1.JobFailed, Status: corev1.ConditionTrue}}},
+	}
+	r := newTestSnapshotReconciler(snapshotObject, job)
+
+	_, err := r.handleCommitting(context.Background(), snapshotObject)
+	require.NoError(t, err)
+	unpauseJob := &batchv1.Job{}
+	err = r.Get(context.Background(), types.NamespacedName{Name: "test-snapshot-unpause", Namespace: "default"}, unpauseJob)
+	assert.Error(t, err)
+}
+
+func TestEnsureKataCleanupRequiresReadySourceNodeAndBuildsDeleteJob(t *testing.T) {
+	snapshotObject := &sandboxv1alpha1.SandboxSnapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-snapshot", Namespace: "default"},
+		Status: sandboxv1alpha1.SandboxSnapshotStatus{
+			Format:         sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1,
+			SourceNodeName: "node-a",
+			KataVMState:    &sandboxv1alpha1.KataVMStateSnapshot{SnapshotName: "ks-0123456789abcdef0123456789abcdef"},
+		},
+	}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}, Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionFalse}}}}
+	r := newTestSnapshotReconciler(snapshotObject, node)
+	complete, _, err := r.ensureKataCleanup(context.Background(), snapshotObject)
+	assert.False(t, complete)
+	require.ErrorContains(t, err, "not Ready")
+
+	node.Status.Conditions[0].Status = corev1.ConditionTrue
+	r = newTestSnapshotReconciler(snapshotObject, node)
+	complete, result, err := r.ensureKataCleanup(context.Background(), snapshotObject)
+	require.NoError(t, err)
+	assert.False(t, complete)
+	assert.Equal(t, time.Second, result.RequeueAfter)
+	cleanupJob := &batchv1.Job{}
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "test-snapshot-kata-cleanup", Namespace: "default"}, cleanupJob))
+	assert.Equal(t, "node-a", cleanupJob.Spec.Template.Spec.NodeName)
+	assert.Empty(t, cleanupJob.OwnerReferences)
+	assert.Equal(t, []string{"kata-vmstate", "delete", "--snapshot-name", "ks-0123456789abcdef0123456789abcdef"}, cleanupJob.Spec.Template.Spec.Containers[0].Args)
+	assert.NotContains(t, cleanupJob.Spec.Template.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: "containerd-sock", MountPath: ContainerdSocketPath})
+}
+
+func TestSandboxSnapshotHandleDeletion_KataReleasesFinalizerWhenSourceNodeIsGone(t *testing.T) {
+	now := metav1.Now()
+	snapshotObject := &sandboxv1alpha1.SandboxSnapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-snapshot", Namespace: "default", DeletionTimestamp: &now,
+			Finalizers: []string{sandboxSnapshotFinalizer},
+		},
+		Status: sandboxv1alpha1.SandboxSnapshotStatus{
+			Format:         sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1,
+			SourceNodeName: "node-a",
+			KataVMState:    &sandboxv1alpha1.KataVMStateSnapshot{SnapshotName: "ks-0123456789abcdef0123456789abcdef"},
+		},
+	}
+	r := newTestSnapshotReconciler(snapshotObject)
+
+	_, err := r.handleDeletion(context.Background(), snapshotObject)
+	require.NoError(t, err)
+	deleted := &sandboxv1alpha1.SandboxSnapshot{}
+	err = r.Get(context.Background(), types.NamespacedName{Name: snapshotObject.Name, Namespace: snapshotObject.Namespace}, deleted)
+	assert.True(t, apierrors.IsNotFound(err))
+}
+
+func TestSandboxSnapshotHandleDeletion_KataRemovesFinalizerAfterCleanupResult(t *testing.T) {
+	now := metav1.Now()
+	snapshotObject := &sandboxv1alpha1.SandboxSnapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-snapshot", Namespace: "default", DeletionTimestamp: &now,
+			Finalizers: []string{sandboxSnapshotFinalizer},
+		},
+		Status: sandboxv1alpha1.SandboxSnapshotStatus{
+			Format:         sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1,
+			SourceNodeName: "node-a",
+			KataVMState:    &sandboxv1alpha1.KataVMStateSnapshot{SnapshotName: "ks-0123456789abcdef0123456789abcdef"},
+		},
+	}
+	cleanupJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-snapshot-kata-cleanup", Namespace: "default"},
+		Status:     batchv1.JobStatus{Succeeded: 1},
+	}
+	cleanupPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "cleanup-worker", Namespace: "default", Labels: map[string]string{"job-name": cleanupJob.Name}},
+		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
+			Name: commitJobContainerName,
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0,
+				Message: `{"containers":[],"kataVMState":{"snapshotName":"ks-0123456789abcdef0123456789abcdef"}}`}},
+		}}},
+	}
+	r := newTestSnapshotReconciler(snapshotObject, cleanupJob, cleanupPod)
+
+	result, err := r.handleDeletion(context.Background(), snapshotObject)
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{}, result)
+	remaining := &sandboxv1alpha1.SandboxSnapshot{}
+	err = r.Get(context.Background(), types.NamespacedName{Name: snapshotObject.Name, Namespace: snapshotObject.Namespace}, remaining)
+	if err == nil {
+		assert.NotContains(t, remaining.Finalizers, sandboxSnapshotFinalizer)
+	}
 }

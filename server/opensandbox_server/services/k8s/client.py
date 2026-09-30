@@ -233,6 +233,7 @@ class K8sClient:
         plural: str,
         label_selector: str = "",
         ignore_not_found: bool = True,
+        use_cache: bool = True,
     ) -> List[Dict[str, Any]]:
         """List namespaced custom resources, returning the items list.
 
@@ -240,7 +241,7 @@ class K8sClient:
         selector falls within the supported in-memory grammar. Falls back to
         a direct API call (with rate limiting) otherwise.
         """
-        informer = self._get_informer(group, version, plural, namespace)
+        informer = self._get_informer(group, version, plural, namespace) if use_cache else None
         if informer:
             terms = parse_selector(label_selector)
             if terms is not None:
@@ -465,6 +466,20 @@ class K8sClient:
             body=body,
         )
 
+    def read_secret(self, namespace: str, name: str) -> Any | None:
+        """Read a Secret by name, returning None when it no longer exists."""
+        if self._read_limiter:
+            self._read_limiter.acquire()
+        try:
+            return self.get_core_v1_api().read_namespaced_secret(
+                name=name,
+                namespace=namespace,
+            )
+        except ApiException as e:
+            if e.status == 404:
+                return None
+            raise
+
 
     def list_pods(
         self,
@@ -499,3 +514,9 @@ class K8sClient:
         if self._read_limiter:
             self._read_limiter.acquire()
         return self.get_node_v1_api().read_runtime_class(name)
+
+    def read_node(self, name: str) -> Any:
+        """Read a Node from the cluster."""
+        if self._read_limiter:
+            self._read_limiter.acquire()
+        return self.get_core_v1_api().read_node(name)

@@ -190,6 +190,33 @@ type CreateSandboxRequest struct {
 	Volumes          []Volume               `json:"volumes,omitempty"`
 	Extensions       map[string]string      `json:"extensions,omitempty"`
 	Platform         *PlatformSpec          `json:"platform,omitempty"`
+	fullStateRestore bool
+}
+
+// MarshalJSON preserves legacy request serialization while making the
+// full-state restore timeout key explicit, including timeout:null.
+func (r CreateSandboxRequest) MarshalJSON() ([]byte, error) {
+	type createSandboxRequestAlias CreateSandboxRequest
+	if !r.fullStateRestore {
+		return json.Marshal(createSandboxRequestAlias(r))
+	}
+
+	return json.Marshal(struct {
+		SnapshotID string            `json:"snapshotId"`
+		Timeout    *int              `json:"timeout"`
+		Metadata   map[string]string `json:"metadata"`
+	}{
+		SnapshotID: r.SnapshotID,
+		Timeout:    r.Timeout,
+		Metadata:   nonNilStringMap(r.Metadata),
+	})
+}
+
+func nonNilStringMap(value map[string]string) map[string]string {
+	if value == nil {
+		return map[string]string{}
+	}
+	return value
 }
 
 // AllocationMode identifies how the runtime allocated a sandbox.
@@ -249,16 +276,33 @@ type SnapshotStatus struct {
 	LastTransitionAt *time.Time    `json:"lastTransitionAt,omitempty"`
 }
 
-type SnapshotInfo struct {
-	ID        string         `json:"id"`
-	SandboxID string         `json:"sandboxId"`
-	Name      string         `json:"name,omitempty"`
-	Status    SnapshotStatus `json:"status"`
-	CreatedAt time.Time      `json:"createdAt"`
+type SnapshotRestoreConstraints struct {
+	Placement  string `json:"placement"`
+	SourceNode string `json:"sourceNode"`
+	Durable    bool   `json:"durable"`
 }
 
+type SnapshotInfo struct {
+	ID                 string                      `json:"id"`
+	SandboxID          string                      `json:"sandboxId"`
+	Name               string                      `json:"name,omitempty"`
+	Format             string                      `json:"format,omitempty"`
+	RestoreConstraints *SnapshotRestoreConstraints `json:"restoreConstraints,omitempty"`
+	Status             SnapshotStatus              `json:"status"`
+	CreatedAt          time.Time                   `json:"createdAt"`
+}
+
+type SnapshotFormat string
+
+const (
+	SnapshotFormatRootFSV1      SnapshotFormat = "rootfs-v1"
+	SnapshotFormatQEMUV1        SnapshotFormat = "qemu-v1"
+	SnapshotFormatKataVMStateV1 SnapshotFormat = "kata-vmstate-v1"
+)
+
 type CreateSnapshotRequest struct {
-	Name string `json:"name,omitempty"`
+	Name   string         `json:"name,omitempty"`
+	Format SnapshotFormat `json:"format,omitempty"`
 }
 
 // PaginationInfo contains pagination metadata for list responses.

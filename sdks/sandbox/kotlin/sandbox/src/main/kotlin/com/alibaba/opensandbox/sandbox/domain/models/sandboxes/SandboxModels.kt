@@ -828,12 +828,26 @@ class SnapshotStatus(
     val lastTransitionAt: OffsetDateTime?,
 )
 
+object SnapshotFormat {
+    const val ROOTFS_V1 = "rootfs-v1"
+    const val QEMU_V1 = "qemu-v1"
+    const val KATA_VMSTATE_V1 = "kata-vmstate-v1"
+}
+
+class SnapshotRestoreConstraints(
+    val placement: String,
+    val sourceNode: String,
+    val durable: Boolean,
+)
+
 class SnapshotInfo(
     val id: String,
     val sandboxId: String,
     val name: String? = null,
     val status: SnapshotStatus,
     val createdAt: OffsetDateTime,
+    val format: String? = null,
+    val restoreConstraints: SnapshotRestoreConstraints? = null,
 )
 
 class SnapshotFilter private constructor(

@@ -93,6 +93,12 @@ spec:
         {{- if .Values.controller.snapshot.resumePullSecret }}
         - --resume-pull-secret={{ .Values.controller.snapshot.resumePullSecret }}
         {{- end }}
+        - --kata-vmstate-enabled={{ .Values.controller.snapshot.kataVMState.enabled | default false }}
+        - {{ printf "--host-kata-ctl-path=%s" .Values.controller.snapshot.kataVMState.hostKataCtlPath | quote }}
+        {{- if .Values.controller.snapshot.kataVMState.blobAccountURL }}
+        - {{ printf "--kata-snapshot-blob-account-url=%s" .Values.controller.snapshot.kataVMState.blobAccountURL | quote }}
+        - {{ printf "--kata-snapshot-blob-container=%s" (required "kataVMState.blobContainer is required" .Values.controller.snapshot.kataVMState.blobContainer) | quote }}
+        {{- end }}
         ports:
         - name: health
           containerPort: 8081

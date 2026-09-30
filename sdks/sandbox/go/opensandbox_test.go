@@ -422,10 +422,19 @@ func TestSnapshotLifecycle(t *testing.T) {
 			if req.Name != "before-upgrade" {
 				assert.Fail(t, fmt.Sprintf("Name = %q, want %q", req.Name, "before-upgrade"))
 			}
+			if req.Format != SnapshotFormatKataVMStateV1 {
+				assert.Fail(t, fmt.Sprintf("Format = %q, want %q", req.Format, SnapshotFormatKataVMStateV1))
+			}
 			jsonResponse(w, http.StatusAccepted, SnapshotInfo{
 				ID:        "snap-1",
 				SandboxID: "sbx-1",
 				Name:      "before-upgrade",
+				Format:    "future-v2",
+				RestoreConstraints: &SnapshotRestoreConstraints{
+					Placement:  "same-node",
+					SourceNode: "node-1",
+					Durable:    false,
+				},
 				Status:    SnapshotStatus{State: SnapshotStateCreating},
 				CreatedAt: now,
 			})
@@ -459,9 +468,15 @@ func TestSnapshotLifecycle(t *testing.T) {
 		}
 	})
 
-	created, err := client.CreateSnapshot(context.Background(), "sbx-1", CreateSnapshotRequest{Name: "before-upgrade"})
+	created, err := client.CreateSnapshot(context.Background(), "sbx-1", CreateSnapshotRequest{
+		Name:   "before-upgrade",
+		Format: SnapshotFormatKataVMStateV1,
+	})
 	require.NoErrorf(t, err, "CreateSnapshot")
 	require.Equal(t, "snap-1", created.ID)
+	require.Equal(t, "future-v2", created.Format)
+	require.Equal(t, "node-1", created.RestoreConstraints.SourceNode)
+	require.Equal(t, false, created.RestoreConstraints.Durable)
 
 	got, err := client.GetSnapshot(context.Background(), "snap-1")
 	require.NoErrorf(t, err, "GetSnapshot")
@@ -479,6 +494,12 @@ func TestSnapshotLifecycle(t *testing.T) {
 
 	err = client.DeleteSnapshot(context.Background(), "snap-1")
 	require.NoErrorf(t, err, "DeleteSnapshot")
+}
+
+func TestCreateSnapshotRequestOmitsFormat(t *testing.T) {
+	body, err := json.Marshal(CreateSnapshotRequest{Name: "baseline"})
+	require.NoErrorf(t, err, "Marshal")
+	require.Equal(t, `{"name":"baseline"}`, string(body))
 }
 
 func TestResumeSandbox(t *testing.T) {

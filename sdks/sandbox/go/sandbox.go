@@ -29,6 +29,9 @@ type SandboxCreateOptions struct {
 	Image string
 	// SnapshotID restores the sandbox from a previously created snapshot.
 	SnapshotID string
+	// FullStateRestore sends only snapshotId, timeout, and metadata. Use it for
+	// snapshot formats such as kata-vmstate-v1 that resume the captured process.
+	FullStateRestore bool
 
 	// Entrypoint is the command to run. Defaults to DefaultEntrypoint.
 	Entrypoint []string
@@ -141,16 +144,22 @@ func CreateSandbox(ctx context.Context, config ConnectionConfig, opts SandboxCre
 	}
 
 	entrypoint := opts.Entrypoint
-	if len(entrypoint) == 0 {
-		entrypoint = DefaultEntrypoint
-	}
 	limits := opts.ResourceLimits
-	if limits == nil {
-		limits = DefaultResourceLimits
+	if opts.FullStateRestore {
+		if opts.SnapshotID == "" {
+			return nil, &InvalidArgumentError{Field: "FullStateRestore", Message: "full-state restore requires snapshotID"}
+		}
+	} else {
+		if len(entrypoint) == 0 {
+			entrypoint = DefaultEntrypoint
+		}
+		if limits == nil {
+			limits = DefaultResourceLimits
+		}
 	}
 	var timeout *int
 	if opts.ManualCleanup {
-		// nil timeout — omitted from JSON via omitempty, server treats as no TTL.
+		// Legacy creates omit timeout; full-state restores serialize it as null.
 	} else if opts.TimeoutSeconds != nil {
 		timeout = opts.TimeoutSeconds
 	} else {
@@ -182,7 +191,15 @@ func CreateSandbox(ctx context.Context, config ConnectionConfig, opts SandboxCre
 		Extensions:       opts.Extensions,
 		Platform:         opts.Platform,
 	}
-	if opts.Image != "" {
+	if opts.FullStateRestore {
+		req = CreateSandboxRequest{
+			SnapshotID:       opts.SnapshotID,
+			Timeout:          timeout,
+			Metadata:         opts.Metadata,
+			fullStateRestore: true,
+		}
+	}
+	if !opts.FullStateRestore && opts.Image != "" {
 		req.Image = &ImageSpec{URI: opts.Image, Auth: opts.ImageAuth}
 	}
 

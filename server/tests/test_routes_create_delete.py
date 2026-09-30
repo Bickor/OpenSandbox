@@ -156,7 +156,7 @@ def test_create_sandbox_accepts_snapshot_id_without_entrypoint(
                 metadata=None,
                 expiresAt=now + timedelta(hours=1),
                 createdAt=now,
-                entrypoint=None,
+                entrypoint=[],
             )
 
     monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
@@ -171,6 +171,7 @@ def test_create_sandbox_accepts_snapshot_id_without_entrypoint(
     )
 
     assert response.status_code == 202
+    assert response.json()["entrypoint"] == []
     assert calls[0].snapshot_id == "snap-001"
     assert calls[0].entrypoint is None
 
@@ -271,7 +272,7 @@ def test_create_sandbox_pool_only_passes_resolution_untouched(
                 metadata=None,
                 expiresAt=now + timedelta(hours=1),
                 createdAt=now,
-                entrypoint=None,
+                entrypoint=[],
             )
 
     monkeypatch.setattr(lifecycle, "sandbox_service", StubService())

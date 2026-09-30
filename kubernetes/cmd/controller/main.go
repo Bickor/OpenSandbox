@@ -231,6 +231,15 @@ func main() {
 	var resumePullSecret string
 	flag.StringVar(&resumePullSecret, "resume-pull-secret", "", "K8s Secret name for pulling snapshot images during resume.")
 
+	var kataVMStateEnabled bool
+	var kataBlobAccountURL, kataBlobContainer string
+	flag.StringVar(&kataBlobAccountURL, "kata-snapshot-blob-account-url", "", "Azure Blob account URL for Kata snapshots (Workload Identity).")
+	flag.StringVar(&kataBlobContainer, "kata-snapshot-blob-container", "", "Private Blob container for Kata snapshots.")
+	flag.BoolVar(&kataVMStateEnabled, "kata-vmstate-enabled", false, "Enable public kata-vmstate-v1 snapshots.")
+
+	var hostKataCtlPath string
+	flag.StringVar(&hostKataCtlPath, "host-kata-ctl-path", "/opt/aks-sandbox-demo/kata-v2/bin/kata-ctl", "Absolute kata-ctl path on Kata worker nodes.")
+
 	opts := zap.Options{}
 	opts.BindFlags(flag.CommandLine)
 
@@ -450,11 +459,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	if (kataBlobAccountURL == "") != (kataBlobContainer == "") {
+		setupLog.Error(fmt.Errorf("both Blob account URL and container are required"), "invalid Kata snapshot storage")
+		os.Exit(1)
+	}
+	kataSnapshotJobs := &controller.SandboxSnapshotReconciler{
+		Client: mgr.GetClient(), Scheme: mgr.GetScheme(),
+		ImageCommitterImage: imageCommitterImage, ImageCommitterPullSecret: imageCommitterPullSecret,
+		ImageCommitterPodTemplate: imageCommitterPodTemplate, CommitJobTimeout: commitJobTimeout, HostKataCtlPath: hostKataCtlPath,
+	}
 	if err := (&controller.BatchSandboxReconciler{
 		Client:              mgr.GetClient(),
 		Scheme:              mgr.GetScheme(),
 		Recorder:            mgr.GetEventRecorderFor("batchsandbox-controller"),
 		ResumePullSecret:    resumePullSecret,
+		KataSnapshotJobs:    kataSnapshotJobs,
 		ProfileStore:        profileStore,
 		StatusRVExpectation: expectations.NewResourceVersionExpectation(),
 	}).SetupWithManager(mgr, batchSandboxConcurrency); err != nil {
@@ -484,6 +503,10 @@ func main() {
 		SnapshotPushSecret:        snapshotPushSecret,
 		ImageCommitterPullSecret:  imageCommitterPullSecret,
 		ImageCommitterPodTemplate: imageCommitterPodTemplate,
+		KataVMStateEnabled:        kataVMStateEnabled,
+		HostKataCtlPath:           hostKataCtlPath,
+		KataBlobAccountURL:        kataBlobAccountURL,
+		KataBlobContainer:         kataBlobContainer,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "SandboxSnapshot")
 		os.Exit(1)

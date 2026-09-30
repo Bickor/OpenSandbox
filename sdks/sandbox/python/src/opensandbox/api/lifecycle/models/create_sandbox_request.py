@@ -46,11 +46,14 @@ class CreateSandboxRequest:
     or a pre-configured pool (via `extensions.poolRef`).
 
     **Standard mode**: Exactly one of `image` or `snapshotId` must be provided,
-    and `resourceLimits` is required.
+    and `resourceLimits` is required for image-backed creates. Snapshot restores
+    may omit it; the restore plan determines whether resources are captured.
 
     When `image` is provided, `entrypoint` is required. When `snapshotId` is
-    provided, `entrypoint` is optional. If omitted, the server defaults the
-    sandbox entrypoint to `["tail", "-f", "/dev/null"]`.
+    provided for an image-backed snapshot, `entrypoint` is optional. If omitted,
+    the server defaults the sandbox entrypoint to `["tail", "-f", "/dev/null"]`.
+    A `kata-vmstate-v1` snapshot restore accepts only `snapshotId`, `timeout`,
+    and `metadata` and does not inject an image or default entrypoint.
 
     **Pool mode**: When `extensions.poolRef` is set, the sandbox is created from
     a pre-configured on-demand Pool. In this case `image` and `resourceLimits`
