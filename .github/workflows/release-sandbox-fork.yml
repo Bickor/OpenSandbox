@@ -2,38 +2,43 @@ name: Release Sandbox Fork
 
 on:
   push:
+    branches: [aks-dev]
     tags: ['sandbox-v*']
   workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: sandbox-release-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   validate:
+    if: github.repository == 'Bickor/OpenSandbox'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.release.outputs.version }}
       registry: ${{ steps.release.outputs.registry }}
+      tag: ${{ steps.release.outputs.tag }}
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - name: Validate immutable release tag
+      - name: Resolve immutable release version
         id: release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          [[ "$GITHUB_REF_TYPE" == tag ]]
-          [[ "$GITHUB_REF_NAME" =~ ^sandbox-v([0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+)$ ]]
-          echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            [[ "$GITHUB_REF_NAME" =~ ^sandbox-v([0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+)$ ]]
+            version="${BASH_REMATCH[1]}"
+          else
+            version="1.1.0-rc.$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+          fi
+          tag="sandbox-v$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "registry=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/opensandbox" >> "$GITHUB_OUTPUT"
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+          if gh release view "$tag" >/dev/null 2>&1; then
             echo 'Release already exists. Use a new tag; published releases are never overwritten.' >&2
             exit 1
           fi
@@ -56,24 +61,37 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        component: [controller, image-committer-azure, server]
+        component: [controller, image-committer-azure, image-committer, task-executor, server, execd, ingress, egress, osb-dashboard]
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
       - uses: actions/setup-go@v6
-        if: matrix.component != 'server'
+        if: contains(fromJSON('["controller","image-committer-azure","image-committer","task-executor"]'), matrix.component)
         with:
           go-version-file: kubernetes/go.mod
           cache-dependency-path: kubernetes/go.sum
       - uses: docker/setup-buildx-action@v3
+      - name: Resolve pinned dashboard source
+        if: matrix.component == 'osb-dashboard'
+        id: dashboard
+        run: |
+          echo "repository=$(jq -er .repository manifests/release/dashboard-source.json)" >> "$GITHUB_OUTPUT"
+          echo "commit=$(jq -er .commit manifests/release/dashboard-source.json)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v6
+        if: matrix.component == 'osb-dashboard'
+        with:
+          repository: ${{ steps.dashboard.outputs.repository }}
+          ref: ${{ steps.dashboard.outputs.commit }}
+          path: .build/dashboard
+          persist-credentials: false
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Compile Go component
-        if: matrix.component != 'server'
+        if: contains(fromJSON('["controller","image-committer-azure","image-committer","task-executor"]'), matrix.component)
         working-directory: kubernetes
         env:
           COMPONENT: ${{ matrix.component }}
@@ -89,19 +107,33 @@ jobs:
           COMPONENT: ${{ matrix.component }}
           REGISTRY: ${{ needs.validate.outputs.registry }}
           VERSION: ${{ needs.validate.outputs.version }}
+          TAG: ${{ needs.validate.outputs.tag }}
         run: |
           set -euo pipefail
           # Attempt-specific tags prevent re-runs from mutating an earlier build.
-          image="$REGISTRY/$COMPONENT:$GITHUB_REF_NAME-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          if [[ "$COMPONENT" == server ]]; then
-            context=server
-            dockerfile=server/Dockerfile
-            args=(--build-arg "SETUPTOOLS_SCM_PRETEND_VERSION=${VERSION/-rc./rc}")
-          else
-            context=.build/fork
-            dockerfile=manifests/release/Dockerfile.fork-component
-            args=()
-          fi
+          image="$REGISTRY/$COMPONENT:$TAG-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          args=()
+          case "$COMPONENT" in
+            server)
+              context=server
+              dockerfile=server/Dockerfile
+              args=(--build-arg "SETUPTOOLS_SCM_PRETEND_VERSION=1.1.0.dev$GITHUB_RUN_ID")
+              ;;
+            execd|ingress|egress)
+              context=.
+              dockerfile="components/$COMPONENT/Dockerfile"
+              args=(--build-arg "VERSION=$VERSION" --build-arg "GIT_COMMIT=$GITHUB_SHA")
+              ;;
+            osb-dashboard)
+              context=.build/dashboard
+              dockerfile=.build/dashboard/Dockerfile
+              ;;
+            *)
+              context=.build/fork
+              dockerfile=manifests/release/Dockerfile.fork-component
+              if [[ "$COMPONENT" == task-executor ]]; then args=(--build-arg USERID=0); fi
+              ;;
+          esac
           docker buildx build --platform linux/amd64 \
             --file "$dockerfile" --tag "$image" \
             --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
@@ -121,8 +153,50 @@ jobs:
           path: release-metadata/*.json
           if-no-files-found: error
 
-  release:
+  demo-image:
     needs: [validate, images]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: fork-image-execd
+          path: release-metadata
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build demo with this release's execd
+        env:
+          REGISTRY: ${{ needs.validate.outputs.registry }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          image="$REGISTRY/code-server-execd:$TAG-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker buildx build --platform linux/amd64 --file manifests/release/Dockerfile.code-server \
+            --build-arg "EXECD_IMAGE=$(jq -er .image release-metadata/execd.json)" \
+            --tag "$image" --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --metadata-file "$RUNNER_TEMP/image.json" --push .
+          digest=$(jq -er '."containerimage.digest"' "$RUNNER_TEMP/image.json")
+          jq -n --arg image "$REGISTRY/code-server-execd@$digest" --arg digest "$digest" --arg commit "$GITHUB_SHA" \
+            '{component:"code-server-execd",image:$image,digest:$digest,commit:$commit,platform:"linux/amd64"}' \
+            > release-metadata/code-server-execd.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fork-image-code-server-execd
+          path: release-metadata/code-server-execd.json
+          if-no-files-found: error
+
+  release:
+    needs: [validate, images, demo-image]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -148,6 +222,7 @@ jobs:
           mkdir -p dist/fork
           helm package manifests/charts/opensandbox --destination dist/fork \
             --version "$VERSION" --app-version "$VERSION"
+          cp manifests/charts/base/files/crds.yaml dist/fork/crds.yaml
           features=()
           if [[ -f kubernetes/pkg/imagecommitter/katavmstate/remote.go ]]; then
             features+=(--remote-snapshots)
@@ -161,9 +236,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.validate.outputs.tag }}
         run: |
           set -euo pipefail
-          gh release create "$GITHUB_REF_NAME" dist/fork/* \
-            --verify-tag --prerelease --latest=false \
-            --title "Sandbox fork $GITHUB_REF_NAME" --notes-file manifests/release/fork-release-notes.md
-          echo "Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$GITHUB_REF_NAME" >> "$GITHUB_STEP_SUMMARY"
+          gh release create "$TAG" dist/fork/* \
+            --target "$GITHUB_SHA" --prerelease --latest=false \
+            --title "Sandbox fork $TAG" --notes-file manifests/release/fork-release-notes.md
+          echo "Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"

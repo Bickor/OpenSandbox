@@ -1,0 +1,12 @@
+ARG EXECD_IMAGE
+FROM ${EXECD_IMAGE} AS execd
+FROM codercom/code-server:4.96.4
+USER root
+COPY --from=execd /execd /opt/opensandbox/execd
+COPY --from=execd /bootstrap.sh /opt/opensandbox/bootstrap.sh
+COPY --from=execd /opensandbox-supervisor /opt/opensandbox/opensandbox-supervisor
+COPY --from=execd /usr/local/bin/bwrap /usr/local/bin/bwrap
+COPY --from=execd /opt/opensandbox/opensandbox-session-gate /opt/opensandbox/opensandbox-session-gate
+COPY --from=execd /opt/opensandbox/opensandbox-launcher /opt/opensandbox/opensandbox-launcher
+RUN chmod 0755 /opt/opensandbox/* && mkdir -p /home/coder/project && chown -R coder:coder /home/coder/project
+USER coder

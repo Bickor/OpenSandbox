@@ -18,6 +18,7 @@ class ReleaseTests(unittest.TestCase):
         self.version = "0.1.0-rc.1"
         self.commit = "a" * 40
         (self.output / f"opensandbox-{self.version}.tgz").write_bytes(b"chart")
+        (self.output / "crds.yaml").write_text("kind: CustomResourceDefinition\n")
         for component in COMPONENTS:
             self.write(component)
 
@@ -36,17 +37,30 @@ class ReleaseTests(unittest.TestCase):
         release = json.loads((self.output / "release.json").read_text())
         self.assertEqual(set(release["images"]), COMPONENTS)
         self.assertEqual(release["commit"], self.commit)
-        self.assertEqual(len((self.output / "SHA256SUMS").read_text().splitlines()), 3)
+        self.assertEqual(len((self.output / "SHA256SUMS").read_text().splitlines()), 4)
         self.assertFalse(release["capabilities"]["remoteSnapshots"])
         self.assertFalse((self.output / "demo-remote-snapshots.json").exists())
         values = json.loads((self.output / "release-values.json").read_text())
         self.assertEqual(values["opensandbox-server"]["server"]["image"]["digest"], "sha256:" + "b" * 64)
+        self.assertIn(release["images"]["execd"], values["opensandbox-server"]["configToml"])
+        self.assertIn(release["images"]["egress"], values["opensandbox-server"]["configToml"])
+        self.assertEqual(values["ingress-gateway"]["gateway"]["image"]["digest"], "sha256:" + "b" * 64)
 
     def test_remote_bundle(self):
         self.assemble(remote_snapshots=True)
         self.assertTrue(json.loads((self.output / "release.json").read_text())["capabilities"]["remoteSnapshots"])
         self.assertTrue((self.output / "demo-remote-snapshots.json").exists())
-        self.assertEqual(len((self.output / "SHA256SUMS").read_text().splitlines()), 4)
+        self.assertEqual(len((self.output / "SHA256SUMS").read_text().splitlines()), 5)
+
+    def test_automatic_version(self):
+        self.version = "1.1.0-rc.123456.1"
+        (self.output / f"opensandbox-{self.version}.tgz").write_bytes(b"chart")
+        self.assemble()
+
+    def test_missing_crds(self):
+        (self.output / "crds.yaml").unlink()
+        with self.assertRaises(ValueError):
+            self.assemble()
 
     def test_rejects_mixed_commits(self):
         self.write("server", commit="c" * 40)

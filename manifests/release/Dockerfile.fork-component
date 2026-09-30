@@ -1,4 +1,6 @@
 FROM gcr.io/distroless/static-debian12:nonroot
+ARG USERID=65532
+USER ${USERID}
 COPY component /workspace/server
 # Controller expects /workspace/server; snapshot Jobs invoke image-committer.
 COPY component /usr/local/bin/image-committer
