@@ -168,6 +168,10 @@ type SandboxSnapshotSpec struct {
 // SandboxSnapshotStatus defines the observed state of SandboxSnapshot.
 // Status is written by Controller, read-only for callers.
 type SandboxSnapshotStatus struct {
+	// RestorePlanSecretName identifies the immutable prepared QEMU PodTemplate.
+	// +optional
+	RestorePlanSecretName string `json:"restorePlanSecretName,omitempty"`
+
 	// Phase indicates the current phase of the snapshot.
 	Phase SandboxSnapshotPhase `json:"phase,omitempty"`
 

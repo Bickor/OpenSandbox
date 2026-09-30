@@ -14,11 +14,18 @@ This mode is experimental. It restores the QEMU Guest memory, vCPU, and
 migratable device state. Other processes in the outer runc container restart
 from the `BatchSandbox` Pod template.
 
-The initial `qemu-v1` implementation supports pause and resume of the same
-`BatchSandbox`. The public snapshot clone API does not yet restore QEMU VMState
-because its snapshot record does not persist the complete Pod template and
-QEMU launch plan. A standalone public snapshot operation resumes its source VM
-after publishing the artifacts.
+The `qemu-v1` implementation supports pause and resume of the same
+`BatchSandbox` and public snapshot restore into a new sandbox. Public snapshots
+retain an immutable, controller-owned Pod restore template alongside the rootfs
+and VMState image digests. Restore accepts `snapshotId`, `timeout`, and `metadata`;
+workload settings come from the captured template. A standalone public snapshot
+operation resumes its source VM after publishing the artifacts.
+
+Public restore initially stays on the source node to preserve the validated CPU
+compatibility profile. The source sandbox may be deleted once the snapshot is
+Ready. Guest processes continue; outer container processes start afresh. Clients
+must reconnect to the new sandbox endpoint. This does not promise continuity of
+external TCP sessions or snapshot contents of mounted Kubernetes volumes.
 
 ## State and artifact model
 
@@ -33,6 +40,12 @@ after publishing the artifacts.
 Both images are pushed to the configured image Registry and recorded by manifest digest in one `SandboxSnapshot.status`. Resume never relies on mutable tags.
 
 ## Prepare the QEMU workload image
+
+For a server hosting both Kata and QEMU workloads, configure
+`[kubernetes.runtime_class_templates]` with approved RuntimeClass names mapped
+to template paths. `extensions.runtimeClassName` selects one of those templates
+per create request. Unlisted names are rejected; requests without this extension
+retain the default template. Restores use their captured template.
 
 QEMU support is a contract between the workload image and OpenSandbox. The
 image must:

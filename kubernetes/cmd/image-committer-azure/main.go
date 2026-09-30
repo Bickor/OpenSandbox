@@ -31,6 +31,13 @@ const terminationMessagePath = "/dev/termination-log"
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if len(os.Args) > 1 && (os.Args[1] == "snapshot" || os.Args[1] == "recover-qemu") {
+		if err := runQEMUWorker(ctx, os.Args[1:]); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "kata-vmstate" {
 		if err := katavmstate.Run(ctx, os.Args[1:], terminationMessagePath, os.Stdout); err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)

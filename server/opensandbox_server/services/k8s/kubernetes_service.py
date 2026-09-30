@@ -826,7 +826,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         if not has_pool_ref:
             request = await resolve_sandbox_from_request(request)
             if request.snapshot_restore_config is None or (
-                request.snapshot_restore_config.format != "kata-vmstate-v1"
+                request.snapshot_restore_config.format not in {"kata-vmstate-v1", "qemu-v1"}
             ):
                 ensure_entrypoint(request.entrypoint or [])
         ensure_metadata_labels(request.metadata)
@@ -917,11 +917,11 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
             #      sweeping (the existing inner try/except handles that).
             try:
                 if request.snapshot_restore_config is not None and (
-                    request.snapshot_restore_config.format == "kata-vmstate-v1"
+                    request.snapshot_restore_config.format in {"kata-vmstate-v1", "qemu-v1"}
                 ):
                     create_from_kata_snapshot = getattr(
                         self.workload_provider,
-                        "create_workload_from_kata_snapshot",
+                        "create_workload_from_qemu_snapshot" if request.snapshot_restore_config.format == "qemu-v1" else "create_workload_from_kata_snapshot",
                         None,
                     )
                     if create_from_kata_snapshot is None:

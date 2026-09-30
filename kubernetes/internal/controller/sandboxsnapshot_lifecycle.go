@@ -149,6 +149,15 @@ func (r *SandboxSnapshotReconciler) handlePending(ctx context.Context, snapshot 
 	snapshot.Status.Format = snapshotFormat
 	snapshot.Status.Containers = containers
 	snapshot.Status.KataVMState = kataVMState
+	if snapshotFormat == sandboxv1alpha1.SandboxSnapshotFormatQEMUV1 && !hasBatchSandboxControllerOwner(snapshot) {
+		template, err := kataPodTemplate(pod)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if _, err := r.ensureKataRestorePlanSecret(ctx, snapshot, snapshot.Name+"-source", template.Raw); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 
 	job, err := r.buildCommitJob(snapshot, string(pod.UID), workloadContract)
 	if err != nil {
@@ -1234,6 +1243,13 @@ func (r *SandboxSnapshotReconciler) updateSnapshotStatusFromSucceededCommitJob(c
 					QEMUConfigDigest:  vm.Compatibility.QEMUConfigDigest,
 					RequiredNodeClass: vm.Compatibility.RequiredNodeClass,
 				},
+			}
+			if !hasBatchSandboxControllerOwner(latest) {
+				secretName, err := r.prepareQEMUPublicRestore(ctx, latest)
+				if err != nil {
+					return err
+				}
+				latest.Status.RestorePlanSecretName = secretName
 			}
 		}
 		if latest.Status.Format == sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1 {
