@@ -66,6 +66,9 @@ func newDelegatedBlobStore(account, container, token string, now time.Time) (obj
 		}
 	}
 	expires, err := time.Parse(time.RFC3339, values.Get("se"))
+	if err != nil {
+		expires, err = time.Parse("2006-01-02T15:04Z", values.Get("se"))
+	}
 	if err != nil || !expires.After(now) || expires.After(now.Add(24*time.Hour)) || values.Get("sr") != "c" || values.Get("spr") != "https" || values.Get("ss") != "" || values.Get("srt") != "" {
 		return nil, errors.New("delegated SAS must be HTTPS, container-scoped, and expire within 24 hours")
 	}

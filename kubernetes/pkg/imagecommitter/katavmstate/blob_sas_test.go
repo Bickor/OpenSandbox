@@ -15,6 +15,10 @@ func TestDelegatedBlobSASValidation(t *testing.T) {
 	valid := url.Values{"skoid": {"id"}, "sktid": {"tenant"}, "skt": {"start"}, "ske": {"end"}, "sks": {"b"}, "skv": {"version"}, "sig": {"secret"}, "se": {now.Add(time.Hour).Format(time.RFC3339)}, "sr": {"c"}, "spr": {"https"}}
 	_, err := newDelegatedBlobStore("https://example.blob.core.windows.net", "test", valid.Encode(), now)
 	require.NoError(t, err)
+	minutePrecision, _ := url.ParseQuery(valid.Encode())
+	minutePrecision.Set("se", now.Add(time.Hour).Format("2006-01-02T15:04Z"))
+	_, err = newDelegatedBlobStore("https://example.blob.core.windows.net", "test", minutePrecision.Encode(), now)
+	require.NoError(t, err)
 	for _, test := range []struct{ key, value string }{{"skoid", ""}, {"sr", "b"}, {"spr", "https,http"}, {"se", now.Add(-time.Hour).Format(time.RFC3339)}, {"se", now.Add(48 * time.Hour).Format(time.RFC3339)}, {"ss", "b"}} {
 		copy, _ := url.ParseQuery(valid.Encode())
 		copy.Set(test.key, test.value)
