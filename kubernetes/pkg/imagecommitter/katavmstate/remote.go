@@ -164,7 +164,7 @@ func validateManifest(m remoteManifest, complete bool) error {
 		seen[f.Path] = true
 	}
 	if complete {
-		for _, required := range []string{SnapshotMetadataFile, "config.json", "memory-ranges", restorePlanFile} {
+		for _, required := range []string{SnapshotMetadataFile, "runtime-state.json", "clh/config.json", "clh/state.json", "clh/memory-ranges", restorePlanFile} {
 			if !seen[required] {
 				return fmt.Errorf("snapshot missing %s", required)
 			}
