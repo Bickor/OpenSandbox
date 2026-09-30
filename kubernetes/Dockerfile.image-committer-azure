@@ -25,15 +25,26 @@ RUN GOPROXY=https://goproxy.cn,direct go mod download
 
 COPY cmd/image-committer-azure/ cmd/image-committer-azure/
 COPY pkg/imagecommitter/ pkg/imagecommitter/
+COPY internal/snapshot/ internal/snapshot/
+COPY cmd/image-committer/ cmd/image-committer/
+COPY cmd/qemu-checkpoint-helper/ cmd/qemu-checkpoint-helper/
+COPY cmd/vmstate-loader/ cmd/vmstate-loader/
 
 RUN CGO_ENABLED=0 GOOS=linux go build -o /usr/local/bin/image-committer ./cmd/image-committer-azure/
+RUN CGO_ENABLED=0 GOOS=linux go build -o /usr/local/bin/image-committer-qemu ./cmd/image-committer/ && \
+    CGO_ENABLED=0 GOOS=linux go build -o /usr/local/bin/qemu-checkpoint-helper ./cmd/qemu-checkpoint-helper/ && \
+    CGO_ENABLED=0 GOOS=linux go build -o /usr/local/bin/vmstate-loader ./cmd/vmstate-loader/
 
-# The static distroless image includes the CA bundle required for Azure and ACR
-# HTTPS endpoints. The commit Job security context overrides the image's
-# nonroot default and runs as UID 0 to access the host containerd socket.
-FROM gcr.io/distroless/static-debian12:nonroot
+# QEMU uses the standard worker and nerdctl. The commit Job security context
+# overrides the image's nonroot default to access the host containerd socket.
+FROM alpine:3.22
+RUN apk add --no-cache ca-certificates nerdctl
 
 COPY --from=builder /usr/local/bin/image-committer /usr/local/bin/image-committer
+COPY --from=builder /usr/local/bin/image-committer-qemu /usr/local/bin/image-committer-qemu
+COPY --from=builder /usr/local/bin/qemu-checkpoint-helper /usr/local/bin/qemu-checkpoint-helper
+COPY --from=builder /usr/local/bin/vmstate-loader /usr/local/bin/vmstate-loader
+USER 65532:65532
 
 WORKDIR /workspace
 

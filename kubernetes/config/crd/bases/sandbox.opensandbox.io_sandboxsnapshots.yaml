@@ -189,6 +189,10 @@ spec:
                 - Succeed
                 - Failed
                 type: string
+              restorePlanSecretName:
+                description: RestorePlanSecretName identifies the immutable prepared
+                  QEMU PodTemplate.
+                type: string
               sourceNodeName:
                 description: SourceNodeName is the node where the source Pod runs
                   (for Job scheduling).

@@ -60,20 +60,28 @@ class SnapshotRestoreConfig:
     runtime_version: str | None = None
     runtime_class_name: str | None = None
 
+    def is_complete_qemu_plan(self) -> bool:
+        return self.format == "qemu-v1" and all(
+            isinstance(value, str) and bool(value.strip())
+            for value in (
+                self.restore_plan_secret_name,
+                self.restore_plan_owner_name,
+                self.restore_plan_owner_uid,
+                self.source_node_name,
+            )
+        )
+
     def is_complete_kata_plan(self) -> bool:
-        return (
-            self.format == "kata-vmstate-v1"
-            and all(
-                isinstance(value, str) and bool(value.strip())
-                for value in (
-                    self.restore_plan_secret_name,
-                    self.restore_plan_owner_name,
-                    self.restore_plan_owner_uid,
-                    self.source_node_name,
-                    self.snapshot_name,
-                    self.runtime_version,
-                    self.runtime_class_name,
-                )
+        return self.format == "kata-vmstate-v1" and all(
+            isinstance(value, str) and bool(value.strip())
+            for value in (
+                self.restore_plan_secret_name,
+                self.restore_plan_owner_name,
+                self.restore_plan_owner_uid,
+                self.source_node_name,
+                self.snapshot_name,
+                self.runtime_version,
+                self.runtime_class_name,
             )
         )
 

@@ -415,8 +415,15 @@ func runRecoverQEMU(args []string) {
 }
 
 func copyIntoContainer(containerID, sourcePath, targetPath string) error {
-	args := append(nerdctlBaseArgs(), "cp", sourcePath, containerID+":"+targetPath)
-	output, err := commandCombinedOutput("nerdctl", args...)
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	args := append(nerdctlBaseArgs(), "exec", "-i", containerID, "sh", "-c", `cat > "$1" && chmod 0755 "$1"`, "sh", targetPath)
+	cmd := exec.Command("nerdctl", args...)
+	cmd.Stdin = source
+	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("copy checkpoint helper into container: %w, output: %s", err, strings.TrimSpace(string(output)))
 	}
@@ -424,12 +431,12 @@ func copyIntoContainer(containerID, sourcePath, targetPath string) error {
 }
 
 func copyFromContainer(containerID, sourcePath, targetPath string) error {
-	args := append(nerdctlBaseArgs(), "cp", containerID+":"+sourcePath, targetPath)
+	args := append(nerdctlBaseArgs(), "exec", containerID, "cat", sourcePath)
 	output, err := commandCombinedOutput("nerdctl", args...)
 	if err != nil {
 		return fmt.Errorf("copy QEMU launch manifest from container: %w, output: %s", err, strings.TrimSpace(string(output)))
 	}
-	return nil
+	return os.WriteFile(targetPath, output, 0600)
 }
 
 func removeContainerFile(containerID, path string) {
