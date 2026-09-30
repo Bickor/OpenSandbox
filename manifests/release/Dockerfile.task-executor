@@ -1,0 +1,8 @@
+# Task execution requires a shell and nsenter; the controller's distroless base
+# cannot execute the commands accepted by the task-executor API.
+FROM alpine:3.23
+RUN apk add --no-cache ca-certificates util-linux
+WORKDIR /workspace
+COPY component /workspace/server
+USER 0
+ENTRYPOINT ["/workspace/server"]

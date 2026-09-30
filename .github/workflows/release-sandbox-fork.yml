@@ -131,7 +131,9 @@ jobs:
             *)
               context=.build/fork
               dockerfile=manifests/release/Dockerfile.fork-component
-              if [[ "$COMPONENT" == task-executor ]]; then args=(--build-arg USERID=0); fi
+              if [[ "$COMPONENT" == task-executor ]]; then
+                dockerfile=manifests/release/Dockerfile.task-executor
+              fi
               ;;
           esac
           docker buildx build --platform linux/amd64 \
