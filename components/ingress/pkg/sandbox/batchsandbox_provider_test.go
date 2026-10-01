@@ -16,13 +16,17 @@ package sandbox
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	sandboxv1alpha1 "github.com/alibaba/OpenSandbox/sandbox-k8s/apis/sandbox/v1alpha1"
 	fakeclientset "github.com/alibaba/OpenSandbox/sandbox-k8s/pkg/client/clientset/versioned/fake"
@@ -448,6 +452,75 @@ func TestBatchSandboxProvider_GetEndpoint_AmbiguousAcrossNamespaces(t *testing.T
 	_, err = provider.GetEndpoint(sandboxName)
 	assert.Error(t, err)
 	assert.True(t, strings.Contains(err.Error(), "ambiguous sandbox id"))
+}
+
+func TestBatchSandboxProvider_UIDBoundEndpoints(t *testing.T) {
+	for _, scenario := range []string{"valid", "missing binding", "missing intent", "removed marker", "replaced Pool", "replaced Pod"} {
+		t.Run(scenario, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			assert.NoError(t, corev1.AddToScheme(scheme))
+			assert.NoError(t, sandboxv1alpha1.AddToScheme(scheme))
+			pool := &sandboxv1alpha1.Pool{ObjectMeta: metav1.ObjectMeta{
+				Name: "pool", Namespace: "test", UID: "pool-uid",
+				Annotations: map[string]string{utils.AnnotationAllocationMode: utils.AllocationModeUIDBoundV1},
+			}}
+			bs := &sandboxv1alpha1.BatchSandbox{
+				ObjectMeta: metav1.ObjectMeta{Name: "batch", Namespace: "test", UID: "batch-uid", Annotations: map[string]string{
+					utils.AnnotationAllocationMode:   utils.AllocationModeUIDBoundV1,
+					utils.AnnotationEndpoints:        `["10.0.0.1"]`,
+					utils.AnnotationAllocationStatus: `{"pods":["pod"],"poolRef":"pool","generation":1}`,
+				}},
+				Spec:   sandboxv1alpha1.BatchSandboxSpec{PoolRef: pool.Name, Replicas: ptr(1)},
+				Status: sandboxv1alpha1.BatchSandboxStatus{Replicas: 1, Ready: 1},
+			}
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "pod", Namespace: "test", UID: "pod-uid",
+					Annotations:     map[string]string{utils.AnnotationAllocationMode: utils.AllocationModeUIDBoundV1},
+					OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(pool, sandboxv1alpha1.GroupVersion.WithKind("Pool"))},
+				},
+				Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.1",
+					Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+				},
+			}
+			identity := utils.AllocationIdentity{
+				Version: utils.AllocationModeUIDBoundV1, BatchSandbox: utils.ObjectIdentity{Name: bs.Name, UID: bs.UID},
+				Pool: utils.ObjectIdentity{Name: pool.Name, UID: pool.UID}, Pod: utils.ObjectIdentity{Name: pod.Name, UID: pod.UID},
+			}
+			raw, err := json.Marshal(identity)
+			assert.NoError(t, err)
+			bs.Annotations[utils.AnnotationAllocationIdentity] = string(raw)
+			bs.Annotations[utils.AnnotationAllocationIntent] = string(raw)
+			pod.Annotations[utils.AnnotationAllocationIdentity] = string(raw)
+			switch scenario {
+			case "missing binding":
+				delete(bs.Annotations, utils.AnnotationAllocationIdentity)
+			case "missing intent":
+				delete(bs.Annotations, utils.AnnotationAllocationIntent)
+			case "removed marker":
+				delete(bs.Annotations, utils.AnnotationAllocationMode)
+			case "replaced Pool":
+				pool.UID = "new-pool"
+			case "replaced Pod":
+				pod.UID = "new-pod"
+			}
+			factory := informers.NewSharedInformerFactory(fakeclientset.NewSimpleClientset(bs), 0)
+			informer := factory.Sandbox().V1alpha1().BatchSandboxes()
+			assert.NoError(t, informer.Informer().GetStore().Add(bs))
+			provider := &BatchSandboxProvider{
+				lister:           informer.Lister(),
+				allocationReader: fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool, bs, pod).Build(),
+			}
+			endpoint, err := provider.GetEndpoint(bs.Name)
+			if scenario == "valid" {
+				if assert.NoError(t, err) {
+					assert.Equal(t, pod.Status.PodIP, endpoint.Endpoint)
+				}
+			} else {
+				assert.Error(t, err)
+				assert.Nil(t, endpoint)
+			}
+		})
+	}
 }
 
 // ptr is a helper function to create int32 pointer

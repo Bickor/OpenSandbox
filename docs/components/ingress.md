@@ -14,6 +14,14 @@ description: HTTP/WebSocket reverse proxy that routes traffic to OpenSandbox ins
 - Fast Sandbox routes lazily call FastPath v2 `ResolveEndpoint` when traffic arrives.
 - Exposes `/status.ok` health check and a shadow-only network readiness assessment at `/status.ok/network-readiness`; prints build metadata (version, commit, time, Go/platform) at startup.
 
+For [UID-bound pool allocations](/kubernetes/uid-bound-allocation), the
+BatchSandbox provider additionally validates the live BatchSandbox, Pool, Pod,
+and Pod reservation before returning an endpoint. It needs `get` access to
+Pools as well as Pods and BatchSandboxes; the ingress Helm role includes this
+permission. Missing or invalid protected identity fails closed. Markerless
+native endpoints still use the existing annotation-only path without extra API
+reads. This is identity validation, not network policy enforcement.
+
 ## Quick Start
 ```bash
 cd components/ingress

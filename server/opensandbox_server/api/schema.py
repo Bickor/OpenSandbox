@@ -22,7 +22,14 @@ for request/response validation and serialization.
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, PrivateAttr, RootModel, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    ModelWrapValidatorHandler,
+    PrivateAttr,
+    RootModel,
+    model_validator,
+)
 
 from opensandbox_server.constants import OPENSANDBOX_LIFECYCLE
 
@@ -458,6 +465,31 @@ class CreateSandboxRequest(BaseModel):
     # that produced the snapshot (e.g. "fsb"); never serialized on the wire.
     _resolved_snapshot_backend: Optional[str] = PrivateAttr(default=None)
     _snapshot_restore_config: Any = PrivateAttr(default=None)
+    _extra_request_fields: frozenset[str] = PrivateAttr(default_factory=frozenset)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def remember_extra_request_fields(
+        cls, value: Any, handler: ModelWrapValidatorHandler["CreateSandboxRequest"]
+    ) -> "CreateSandboxRequest":
+        result = handler(value)
+        if isinstance(value, dict):
+            # Preserve native extra-field acceptance and wire serialization.
+            # The opt-in passive path must reject otherwise silently dropped overrides.
+            known = set(cls.model_fields)
+            known.update(field.alias for field in cls.model_fields.values() if field.alias)
+            ignored = value.keys() - known
+            ignored.update(
+                name for name, field in cls.model_fields.items()
+                if field.alias and field.alias != name
+                and name in value and field.alias in value
+            )
+            result._extra_request_fields = frozenset(ignored)
+        return result
+
+    @property
+    def extra_request_fields(self) -> frozenset[str]:
+        return self._extra_request_fields
 
     image: Optional[ImageSpec] = Field(
         None,

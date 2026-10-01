@@ -60,6 +60,7 @@ import (
 	controllerutils "github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/controller"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/expectations"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/fieldindex"
+	pkgutils "github.com/alibaba/OpenSandbox/sandbox-k8s/pkg/utils"
 )
 
 const (
@@ -210,7 +211,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (resul
 	batchSandboxes := make([]*sandboxv1alpha1.BatchSandbox, 0, len(batchSandboxList.Items))
 	for i := range batchSandboxList.Items {
 		batchSandbox := batchSandboxList.Items[i]
-		if batchSandbox.Spec.Template != nil {
+		if batchSandbox.Spec.Template != nil && !hasAllocationIdentityContract(pool) && !hasAllocationIdentityContract(&batchSandbox) {
 			continue
 		}
 		batchSandboxes = append(batchSandboxes, &batchSandbox)
@@ -336,9 +337,16 @@ func (r *PoolReconciler) removePoolAllocationFinalizerIfUnavailable(
 
 // reconcilePool contains the main reconciliation logic
 func (r *PoolReconciler) reconcilePool(ctx context.Context, pool *sandboxv1alpha1.Pool, batchSandboxes []*sandboxv1alpha1.BatchSandbox, pods []*corev1.Pod, totalPodCnt int32) (ctrl.Result, error) {
+	protected, err := validateAllocationModes(pool, batchSandboxes)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if protected {
+		return r.reconcileUIDBoundPool(ctx, pool)
+	}
 	var result ctrl.Result
 
-	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+	err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		// 1. Get latest Pool CR
 		latestPool := &sandboxv1alpha1.Pool{}
 		if err := r.Get(ctx, client.ObjectKeyFromObject(pool), latestPool); err != nil {
@@ -418,6 +426,9 @@ func (r *PoolReconciler) reconcilePool(ctx context.Context, pool *sandboxv1alpha
 // allocation annotation. It intentionally leaves all newer or ambiguous records
 // untouched.
 func (r *PoolReconciler) backfillLegacyPoolAllocation(ctx context.Context, pool *sandboxv1alpha1.Pool, sandbox *sandboxv1alpha1.BatchSandbox, pods []*corev1.Pod, latestAllocation map[string]string) error {
+	if hasAllocationIdentityContract(pool) || hasAllocationIdentityContract(sandbox) {
+		return nil
+	}
 	if sandbox.Spec.PoolRef == "" || sandbox.Spec.PoolRef != pool.Name ||
 		!sandbox.DeletionTimestamp.IsZero() ||
 		!controllerutil.ContainsFinalizer(sandbox, finalizerPoolAllocation) {
@@ -695,6 +706,13 @@ func (r *PoolReconciler) SetupWithManager(mgr ctrl.Manager, maxConcurrentReconci
 }
 
 func (r *PoolReconciler) doAllocate(ctx context.Context, pool *sandboxv1alpha1.Pool, batchSandboxes []*sandboxv1alpha1.BatchSandbox, pods []*corev1.Pod, toAllocate map[string][]string) error {
+	protected, err := validateAllocationModes(pool, batchSandboxes)
+	if err != nil {
+		return err
+	}
+	if protected {
+		return fmt.Errorf("UID-bound allocation requires the identity-aware scheduling path")
+	}
 	// 1. Compute latest allocated pods per sandbox (merge current + newly allocated).
 	toSyncMap := r.getLatestAllocated(ctx, pool, batchSandboxes, toAllocate)
 
@@ -770,6 +788,13 @@ func (r *PoolReconciler) syncSandboxConcurrently(ctx context.Context, batchSandb
 }
 
 func (r *PoolReconciler) doRecycle(ctx context.Context, pool *sandboxv1alpha1.Pool, batchSandboxes []*sandboxv1alpha1.BatchSandbox, pods []*corev1.Pod, toRecycle map[string][]string) (map[string][]string, []string, error) {
+	protected, modeErr := validateAllocationModes(pool, batchSandboxes)
+	if modeErr != nil {
+		return nil, nil, modeErr
+	}
+	if protected {
+		return nil, nil, fmt.Errorf("UID-bound recycling requires the identity-aware scheduling path")
+	}
 	if len(toRecycle) == 0 {
 		return nil, nil, nil
 	}
@@ -989,6 +1014,13 @@ func (r *PoolReconciler) getLatestReleased(ctx context.Context, batchSandboxes [
 }
 
 func (r *PoolReconciler) scheduleSandbox(ctx context.Context, pool *sandboxv1alpha1.Pool, batchSandboxes []*sandboxv1alpha1.BatchSandbox, pods []*corev1.Pod) (*scheduleResult, error) {
+	protected, modeErr := validateAllocationModes(pool, batchSandboxes)
+	if modeErr != nil {
+		return nil, modeErr
+	}
+	if protected {
+		return r.scheduleUIDBoundPool(ctx, pool, batchSandboxes, pods)
+	}
 	log := logf.FromContext(ctx)
 	// 1. Compute scheduling actions.
 	spec := &allocSpec{
@@ -1174,7 +1206,13 @@ func (r *PoolReconciler) scalePool(ctx context.Context, pool *sandboxv1alpha1.Po
 			log.Info("Deleting pool pod", "pool", pool.Name, "pod", pod.Name)
 			controllerKey := controllerutils.GetControllerKey(pool)
 			poolScaleExpectations.ExpectScale(controllerKey, expectations.Delete, pod.Name)
-			if err := r.Delete(ctx, pod); err != nil {
+			var deleteErr error
+			if hasAllocationIdentityContract(pool) {
+				deleteErr = r.deleteUIDBoundPod(ctx, pool, pod)
+			} else {
+				deleteErr = r.Delete(ctx, pod)
+			}
+			if err := deleteErr; err != nil {
 				poolScaleExpectations.ObserveScale(controllerKey, expectations.Delete, pod.Name)
 				if errors.IsNotFound(err) {
 					continue
@@ -1340,6 +1378,18 @@ func (r *PoolReconciler) createPoolPod(ctx context.Context, pool *sandboxv1alpha
 	pod, err := utils.GetPodFromTemplate(pool.Spec.Template, pool, metav1.NewControllerRef(pool, sandboxv1alpha1.SchemeBuilder.GroupVersion.WithKind("Pool")))
 	if err != nil {
 		return err
+	}
+	if hasAllocationIdentityContract(pool) {
+		if err := pkgutils.ValidateUIDBoundPool(pool); err != nil {
+			return err
+		}
+		if _, exists := pod.Annotations[pkgutils.AnnotationAllocationIdentity]; exists {
+			return fmt.Errorf("Pool template must not contain an allocation reservation")
+		}
+		if pod.Annotations == nil {
+			pod.Annotations = map[string]string{}
+		}
+		pod.Annotations[pkgutils.AnnotationAllocationMode] = pkgutils.AllocationModeUIDBoundV1
 	}
 	pod.Namespace = pool.Namespace
 	pod.Name = ""

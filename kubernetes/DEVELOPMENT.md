@@ -405,6 +405,12 @@ mockStore.EXPECT().GetAllocation(gomock.Any(), gomock.Any()).Return(&PoolAllocat
 
 ### Changing Annotation Contracts
 
+The opt-in UID-bound allocation contract and its required external admission
+boundary are documented in [UID-bound pool allocation](../docs/kubernetes/uid-bound-allocation.md).
+Its protected scheduling path recovers from immutable BatchSandbox intents and
+Pod reservations, not the native allocation store. Endpoint readers must use
+`pkg/utils.GetEndpointsWithReader` with an uncached reader for protected allocations.
+
 The controller communicates allocation state through annotations on BatchSandbox objects. These are stability-sensitive:
 
 | Annotation Key | JSON Shape | Writer | Reader |

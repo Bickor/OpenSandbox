@@ -26,17 +26,21 @@ import (
 	informers "github.com/alibaba/OpenSandbox/sandbox-k8s/pkg/client/informers/externalversions"
 	listers "github.com/alibaba/OpenSandbox/sandbox-k8s/pkg/client/listers/sandbox/v1alpha1"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/pkg/utils"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 type BatchSandboxProvider struct {
-	informerFactory informers.SharedInformerFactory
-	lister          listers.BatchSandboxLister
-	informer        cache.SharedIndexInformer
-	informerSynced  cache.InformerSynced
+	informerFactory  informers.SharedInformerFactory
+	lister           listers.BatchSandboxLister
+	informer         cache.SharedIndexInformer
+	informerSynced   cache.InformerSynced
+	allocationReader client.Reader
 }
 
 func NewBatchSandboxProvider(
@@ -55,6 +59,17 @@ func NewBatchSandboxProvider(
 	)
 
 	batchSandboxInformer := informerFactory.Sandbox().V1alpha1().BatchSandboxes()
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		panic(err)
+	}
+	if err := sandboxv1alpha1.AddToScheme(scheme); err != nil {
+		panic(err)
+	}
+	allocationReader, err := client.New(config, client.Options{Scheme: scheme})
+	if err != nil {
+		panic(fmt.Sprintf("failed to create allocation reader: %v", err))
+	}
 	if err := batchSandboxInformer.Informer().AddIndexers(cache.Indexers{
 		sandboxNameIndex: func(obj any) ([]string, error) {
 			bs, ok := obj.(*sandboxv1alpha1.BatchSandbox)
@@ -68,10 +83,11 @@ func NewBatchSandboxProvider(
 	}
 
 	return &BatchSandboxProvider{
-		informerFactory: informerFactory,
-		lister:          batchSandboxInformer.Lister(),
-		informer:        batchSandboxInformer.Informer(),
-		informerSynced:  batchSandboxInformer.Informer().HasSynced,
+		informerFactory:  informerFactory,
+		lister:           batchSandboxInformer.Lister(),
+		informer:         batchSandboxInformer.Informer(),
+		informerSynced:   batchSandboxInformer.Informer().HasSynced,
+		allocationReader: allocationReader,
 	}
 }
 
@@ -148,7 +164,7 @@ func (p *BatchSandboxProvider) GetEndpoint(sandboxId string) (*EndpointInfo, err
 	}
 
 	// Get endpoints from BatchSandbox using kubernetes utils
-	endpoints, err := utils.GetEndpoints(batchSandbox)
+	endpoints, err := utils.GetEndpointsWithReader(context.Background(), p.allocationReader, batchSandbox)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s/%s: %w", ErrSandboxNotReady, batchSandbox.Namespace, sandboxId, err)
 	}

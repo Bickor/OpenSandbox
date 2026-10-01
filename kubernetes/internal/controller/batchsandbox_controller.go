@@ -53,6 +53,7 @@ import (
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/expectations"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/fieldindex"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/requeueduration"
+	pkgutils "github.com/alibaba/OpenSandbox/sandbox-k8s/pkg/utils"
 )
 
 var (
@@ -76,6 +77,7 @@ type taskScheduleResult struct {
 // BatchSandboxReconciler reconciles a BatchSandbox object
 type BatchSandboxReconciler struct {
 	client.Client
+	APIReader           client.Reader
 	Scheme              *runtime.Scheme
 	Recorder            record.EventRecorder
 	ProfileStore        *poolassign.ProfileStore
@@ -120,12 +122,30 @@ func (r *BatchSandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 		return ctrl.Result{}, err
 	}
+	if hasAllocationIdentityContract(batchSbx) {
+		if err := pkgutils.ValidateUIDBoundBatch(batchSbx); err != nil {
+			return ctrl.Result{}, err
+		}
+		if !batchSbx.DeletionTimestamp.IsZero() {
+			// The Pool finalizes protected tasks only after the pinned Pod is
+			// confirmed gone; no task can survive deletion of that Pod.
+			r.deleteTaskScheduler(ctx, batchSbx)
+			return ctrl.Result{}, nil
+		}
+		if _, err := pkgutils.ReadUIDBoundAllocation(ctx, r.APIReader, batchSbx); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	if expireAt := batchSbx.Spec.ExpireTime; expireAt != nil {
 		now := time.Now()
 		if expireAt.Time.Before(now) {
 			if batchSbx.DeletionTimestamp == nil {
 				log.Info("batch sandbox expired, delete", "expireAt", expireAt)
-				if err := r.Delete(ctx, batchSbx); err != nil {
+				var opts []client.DeleteOption
+				if hasAllocationIdentityContract(batchSbx) {
+					opts = append(opts, client.Preconditions{UID: &batchSbx.UID, ResourceVersion: &batchSbx.ResourceVersion})
+				}
+				if err := r.Delete(ctx, batchSbx, opts...); err != nil {
 					if errors.IsNotFound(err) {
 						return ctrl.Result{}, nil
 					}
@@ -503,6 +523,13 @@ func (r *BatchSandboxReconciler) reconcileTasks(
 }
 
 func (r *BatchSandboxReconciler) listPods(ctx context.Context, poolStrategy strategy.PoolStrategy, batchSbx *sandboxv1alpha1.BatchSandbox) ([]*corev1.Pod, error) {
+	if hasAllocationIdentityContract(batchSbx) {
+		pod, err := pkgutils.ReadUIDBoundAllocation(ctx, r.APIReader, batchSbx)
+		if err != nil {
+			return nil, err
+		}
+		return []*corev1.Pod{pod}, nil
+	}
 	var ret []*corev1.Pod
 	if poolStrategy.IsPooledMode() {
 		var (
@@ -552,6 +579,16 @@ func (r *BatchSandboxReconciler) getTaskScheduler(ctx context.Context, batchSbx 
 	log := logf.FromContext(ctx)
 	var tSch taskscheduler.TaskScheduler
 	key := types.NamespacedName{Namespace: batchSbx.Namespace, Name: batchSbx.Name}.String()
+	if hasAllocationIdentityContract(batchSbx) {
+		pod, err := pkgutils.ReadUIDBoundAllocation(ctx, r.APIReader, batchSbx)
+		if err != nil {
+			return nil, err
+		}
+		if len(pods) != 1 || pods[0].UID != pod.UID || pods[0].Name != pod.Name {
+			return nil, fmt.Errorf("scheduler Pods do not match allocation identity")
+		}
+		key += "/" + string(batchSbx.UID)
+	}
 	val, ok := r.taskSchedulers.Load(key)
 	// The reconciler guarantees that it will not concurrently reconcile the same BatchSandbox.
 	if !ok {
@@ -594,6 +631,9 @@ func (r *BatchSandboxReconciler) getTaskScheduler(ctx context.Context, batchSbx 
 
 func (r *BatchSandboxReconciler) deleteTaskScheduler(ctx context.Context, batchSbx *sandboxv1alpha1.BatchSandbox) {
 	key := types.NamespacedName{Namespace: batchSbx.Namespace, Name: batchSbx.Name}.String()
+	if hasAllocationIdentityContract(batchSbx) {
+		key += "/" + string(batchSbx.UID)
+	}
 	if _, ok := r.taskSchedulers.LoadAndDelete(key); ok {
 		log := logf.FromContext(ctx)
 		log.Info("delete task scheduler")
@@ -602,6 +642,11 @@ func (r *BatchSandboxReconciler) deleteTaskScheduler(ctx context.Context, batchS
 
 func (r *BatchSandboxReconciler) scheduleTasks(ctx context.Context, tSch taskscheduler.TaskScheduler, batchSbx *sandboxv1alpha1.BatchSandbox) (*taskScheduleResult, error) {
 	log := logf.FromContext(ctx)
+	if batchSbx != nil && hasAllocationIdentityContract(batchSbx) {
+		if _, err := pkgutils.ReadUIDBoundAllocation(ctx, r.APIReader, batchSbx); err != nil {
+			return nil, err
+		}
+	}
 	if err := tSch.Schedule(); err != nil {
 		return nil, err
 	}
@@ -665,6 +710,20 @@ func (r *BatchSandboxReconciler) getTasksCleanupUnfinished(batchSbx *sandboxv1al
 }
 
 func (r *BatchSandboxReconciler) releasePods(ctx context.Context, batchSbx *sandboxv1alpha1.BatchSandbox, toReleasePods []string) error {
+	if hasAllocationIdentityContract(batchSbx) {
+		pod, err := pkgutils.ReadUIDBoundAllocation(ctx, r.APIReader, batchSbx)
+		if err != nil {
+			return err
+		}
+		if len(toReleasePods) != 1 || toReleasePods[0] != pod.Name {
+			return fmt.Errorf("release does not match UID-bound Pod")
+		}
+		raw, err := json.Marshal(allocationRelease{Pods: toReleasePods})
+		if err != nil {
+			return err
+		}
+		return fencedAnnotationPatch(ctx, r.Client, batchSbx, map[string]string{annoAllocReleaseKey: string(raw)}, nil)
+	}
 	releasedSet := make(sets.Set[string])
 	released, err := parseSandboxReleased(batchSbx)
 	if err != nil {
@@ -821,6 +880,9 @@ func (r *BatchSandboxReconciler) assignPool(ctx context.Context, batchSbx *sandb
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *BatchSandboxReconciler) SetupWithManager(mgr ctrl.Manager, maxConcurrentReconciles int) error {
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&sandboxv1alpha1.BatchSandbox{}).
 		Named("batchsandbox").

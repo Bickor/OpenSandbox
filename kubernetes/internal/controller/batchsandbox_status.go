@@ -30,6 +30,7 @@ import (
 
 	sandboxv1alpha1 "github.com/alibaba/OpenSandbox/sandbox-k8s/apis/sandbox/v1alpha1"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils"
+	pkgutils "github.com/alibaba/OpenSandbox/sandbox-k8s/pkg/utils"
 )
 
 type runtimeView struct {
@@ -455,6 +456,19 @@ func (r *BatchSandboxReconciler) persistRuntimeView(
 
 func (r *BatchSandboxReconciler) patchBatchSandboxEndpoints(ctx context.Context, batchSbx *sandboxv1alpha1.BatchSandbox, endpointIPs []string) error {
 	raw, _ := json.Marshal(endpointIPs)
+	if hasAllocationIdentityContract(batchSbx) {
+		pod, err := pkgutils.ReadUIDBoundAllocation(ctx, r.APIReader, batchSbx)
+		if err != nil {
+			return err
+		}
+		if len(endpointIPs) != 1 || endpointIPs[0] != pod.Status.PodIP {
+			return fmt.Errorf("endpoints do not match the UID-bound Pod")
+		}
+		if batchSbx.Annotations[annotationSandboxEndpoints] == string(raw) {
+			return nil
+		}
+		return fencedAnnotationPatch(ctx, r.Client, batchSbx, map[string]string{annotationSandboxEndpoints: string(raw)}, nil)
+	}
 	if batchSbx.Annotations[annotationSandboxEndpoints] == string(raw) {
 		return nil
 	}

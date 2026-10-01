@@ -15,8 +15,12 @@
 package utils
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+
+	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	sandboxv1alpha1 "github.com/alibaba/OpenSandbox/sandbox-k8s/apis/sandbox/v1alpha1"
 )
@@ -33,7 +37,17 @@ func GetEndpoints(bs *sandboxv1alpha1.BatchSandbox) ([]string, error) {
 	if bs == nil {
 		return nil, fmt.Errorf("BatchSandbox is nil")
 	}
+	bound, err := AllocationMode(bs)
+	if err != nil {
+		return nil, err
+	}
+	if bound {
+		return nil, fmt.Errorf("UID-bound endpoints require GetEndpointsWithReader")
+	}
+	return parseEndpoints(bs)
+}
 
+func parseEndpoints(bs *sandboxv1alpha1.BatchSandbox) ([]string, error) {
 	if bs.Annotations == nil {
 		return nil, fmt.Errorf("BatchSandbox has no annotations")
 	}
@@ -52,5 +66,39 @@ func GetEndpoints(bs *sandboxv1alpha1.BatchSandbox) ([]string, error) {
 		return nil, fmt.Errorf("endpoints annotation contains no IPs")
 	}
 
+	return endpoints, nil
+}
+
+// GetEndpointsWithReader preserves native parsing without reads. Protected
+// endpoints require an uncached reader and the live, ready, UID-pinned Pod.
+func GetEndpointsWithReader(ctx context.Context, reader client.Reader, bs *sandboxv1alpha1.BatchSandbox) ([]string, error) {
+	if bs == nil {
+		return nil, fmt.Errorf("BatchSandbox is nil")
+	}
+	bound, err := AllocationMode(bs)
+	if err != nil {
+		return nil, err
+	}
+	if !bound {
+		return GetEndpoints(bs)
+	}
+	pod, err := ReadUIDBoundAllocation(ctx, reader, bs)
+	if err != nil {
+		return nil, err
+	}
+	ready := false
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+			ready = true
+		}
+	}
+	endpoints, err := parseEndpoints(bs)
+	if err != nil {
+		return nil, err
+	}
+	if !ready || pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" ||
+		len(endpoints) != 1 || endpoints[0] != pod.Status.PodIP {
+		return nil, fmt.Errorf("endpoints do not match the ready UID-bound Pod")
+	}
 	return endpoints, nil
 }

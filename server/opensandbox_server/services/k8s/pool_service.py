@@ -36,6 +36,11 @@ from opensandbox_server.services.k8s.client import (
     POOL_KIND,
     POOL_PLURAL,
 )
+from opensandbox_server.services.k8s.pool_allocation import (
+    ALLOCATION_MODE_ANNOTATION,
+    UID_BOUND_ALLOCATION_MODE,
+    ensure_no_allocation_annotations,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,9 +48,16 @@ logger = logging.getLogger(__name__)
 class PoolService:
     """Service for managing Pool CRD resources in Kubernetes."""
 
-    def __init__(self, k8s_client: K8sClient, namespace: str) -> None:
+    def __init__(
+        self,
+        k8s_client: K8sClient,
+        namespace: str,
+        *,
+        protected_pool_allocations: bool = False,
+    ) -> None:
         self._custom_api = k8s_client.get_custom_objects_api()
         self._namespace = namespace
+        self._protected_pool_allocations = protected_pool_allocations
 
     def _build_pool_manifest(
         self,
@@ -55,7 +67,7 @@ class PoolService:
         capacity_spec: PoolCapacitySpec,
     ) -> Dict[str, Any]:
         """Build a Pool CRD manifest dict."""
-        return {
+        manifest = {
             "apiVersion": f"{OPENSANDBOX_API_GROUP}/{OPENSANDBOX_API_VERSION}",
             "kind": POOL_KIND,
             "metadata": {
@@ -72,6 +84,25 @@ class PoolService:
                 },
             },
         }
+        if self._protected_pool_allocations:
+            try:
+                metadata = template.get("metadata") or {}
+                if not isinstance(metadata, dict):
+                    raise ValueError("Protected pool template metadata must be a mapping.")
+                ensure_no_allocation_annotations(metadata.get("annotations"))
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        "code": SandboxErrorCodes.INVALID_PARAMETER,
+                        "message": str(exc),
+                    },
+                ) from exc
+            manifest["metadata"]["annotations"] = {
+                ALLOCATION_MODE_ANNOTATION: UID_BOUND_ALLOCATION_MODE,
+            }
+            manifest["spec"]["recycleStrategy"] = {"type": "Delete"}
+        return manifest
 
     def _pool_from_raw(self, raw: Dict[str, Any]) -> PoolResponse:
         """Convert a raw Pool CRD dict to a PoolResponse model."""

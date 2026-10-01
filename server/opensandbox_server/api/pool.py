@@ -67,7 +67,11 @@ def _get_pool_service():
         )
 
     k8s_client = K8sClient(config.kubernetes)
-    return PoolService(k8s_client, namespace=config.kubernetes.namespace)
+    return PoolService(
+        k8s_client,
+        namespace=config.kubernetes.namespace,
+        protected_pool_allocations=config.kubernetes.protected_pool_allocations,
+    )
 
 
 @router.post(

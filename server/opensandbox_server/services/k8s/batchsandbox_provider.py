@@ -24,6 +24,8 @@ from copy import deepcopy
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
+from kubernetes.client import ApiException
+
 from opensandbox_server.config import (
     AppConfig,
     INGRESS_MODE_GATEWAY,
@@ -34,7 +36,9 @@ from opensandbox_server.extensions.keys import (
 )
 from opensandbox_server.services.constants import (
     OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT,
+    SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY,
     SANDBOX_ID_LABEL,
+    SANDBOX_SECURE_ACCESS_TOKEN_METADATA_KEY,
     SANDBOX_SNAPSHOT_ID_LABEL,
 )
 from opensandbox_server.services.helpers import format_ingress_endpoint
@@ -44,8 +48,14 @@ from opensandbox_server.services.k8s.image_pull_secret_helper import (
     build_image_pull_secret_name,
 )
 from opensandbox_server.services.k8s.batchsandbox_template import BatchSandboxTemplateManager
-from opensandbox_server.services.k8s.client import K8sClient
+from opensandbox_server.services.k8s.client import K8sClient, POOL_PLURAL
 from opensandbox_server.services.k8s.egress_helper import apply_egress_to_spec
+from opensandbox_server.services.k8s.pool_allocation import (
+    ALLOCATION_MODE_ANNOTATION,
+    PASSIVE_POOL_EXTENSIONS,
+    UID_BOUND_ALLOCATION_MODE,
+    ensure_no_allocation_annotations,
+)
 from opensandbox_server.services.validators import ensure_egress_runtime_compatible
 from opensandbox_server.services.k8s.provider_common import (
     DEFAULT_ENTRYPOINT,
@@ -133,6 +143,9 @@ class BatchSandboxProvider(WorkloadProvider):
         self.ingress_config = app_config.ingress if app_config else None
 
         k8s_config = app_config.kubernetes if app_config else None
+        self.protected_pool_allocations = (
+            k8s_config.protected_pool_allocations if k8s_config else False
+        )
         template_file_path = k8s_config.batchsandbox_template_file if k8s_config else None
         if template_file_path:
             logger.info(f"Using BatchSandbox template file: {template_file_path}")
@@ -387,6 +400,30 @@ class BatchSandboxProvider(WorkloadProvider):
                     "Pool mode does not support networkPolicy. "
                     "Remove 'networkPolicy' from request or use template mode."
                 )
+            if self.protected_pool_allocations:
+                overrides = {
+                    "image": image_spec is not None,
+                    "resourceLimits": bool(resource_limits),
+                    "resourceRequests": bool(resource_requests),
+                    "volumes": volumes is not None,
+                }
+                unsupported = {name for name, supplied in overrides.items() if supplied}
+                unsupported.update(
+                    f"extensions.{key}" for key in extensions if key not in PASSIVE_POOL_EXTENSIONS
+                )
+                unsupported.update(
+                    key for key in (
+                        SANDBOX_SECURE_ACCESS_TOKEN_METADATA_KEY,
+                        SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY,
+                    )
+                    if key in (annotations or {})
+                )
+                if unsupported:
+                    raise ValueError(
+                        "Protected pool allocations use a fixed prestarted workload and "
+                        "do not accept workload/auth overrides: "
+                        + ", ".join(sorted(unsupported))
+                    )
             return self._create_workload_from_pool(
                 batchsandbox_name=sandbox_id,
                 namespace=namespace,
@@ -611,17 +648,29 @@ class BatchSandboxProvider(WorkloadProvider):
         env: Dict[str, str],
         annotations: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
-        """Create an interactive BatchSandbox task in an existing on-demand Pool."""
-        entrypoint = entrypoint or DEFAULT_ENTRYPOINT
+        """Create a passive protected allocation or a native interactive Pool task."""
+        if self.protected_pool_allocations:
+            if entrypoint or env:
+                raise ValueError(
+                    "Protected pool allocations use a fixed prestarted workload and "
+                    "do not accept workload/auth overrides: entrypoint or env."
+                )
+            ensure_no_allocation_annotations(annotations)
+            self._ensure_protected_pool(pool_ref, namespace)
+            annotations = {
+                **(annotations or {}),
+                ALLOCATION_MODE_ANNOTATION: UID_BOUND_ALLOCATION_MODE,
+            }
         spec: Dict[str, Any] = {
             "replicas": 1,
             "poolRef": pool_ref,
-            "taskTemplate": self._build_task_template(
-                entrypoint,
+        }
+        if not self.protected_pool_allocations:
+            spec["taskTemplate"] = self._build_task_template(
+                entrypoint or DEFAULT_ENTRYPOINT,
                 env,
                 batchsandbox_name,
-            ),
-        }
+            )
         if expires_at is not None:
             spec["expireTime"] = expires_at.isoformat()
         runtime_manifest = {
@@ -651,6 +700,54 @@ class BatchSandboxProvider(WorkloadProvider):
             "apiVersion": f"{self.group}/{self.version}",
             "kind": "BatchSandbox",
         }
+
+    def _ensure_protected_pool(self, pool_ref: str, namespace: str) -> None:
+        if pool_ref == "*":
+            raise ValueError("Protected pool allocations require an explicit poolRef.")
+        # Admission must retain this contract across the read/create race.
+        # Read the API server directly rather than trusting informer state.
+        try:
+            raw_pool = self.k8s_client.get_custom_objects_api().get_namespaced_custom_object(
+                group=self.group,
+                version=self.version,
+                namespace=namespace,
+                plural=POOL_PLURAL,
+                name=pool_ref,
+            )
+        except ApiException as exc:
+            if exc.status == 404:
+                raise ValueError(f"Protected pool '{pool_ref}' does not exist.") from exc
+            raise
+
+        if not isinstance(raw_pool, dict):
+            raise ValueError(f"Protected pool '{pool_ref}' returned an invalid resource.")
+        pool: Dict[str, Any] = raw_pool
+        metadata = pool.get("metadata")
+        if not isinstance(metadata, dict):
+            raise ValueError(f"Protected pool '{pool_ref}' returned invalid metadata.")
+        annotations = metadata.get("annotations") or {}
+        if (
+            not isinstance(annotations, dict)
+            or metadata.get("name") != pool_ref
+            or metadata.get("namespace") != namespace
+            or not isinstance(metadata.get("uid"), str)
+            or not metadata["uid"]
+            or metadata.get("deletionTimestamp")
+            or annotations.get(ALLOCATION_MODE_ANNOTATION) != UID_BOUND_ALLOCATION_MODE
+        ):
+            raise ValueError(
+                f"Protected pool '{pool_ref}' must be a live UID-bearing Pool in namespace "
+                f"'{namespace}' created with allocation-mode={UID_BOUND_ALLOCATION_MODE}."
+            )
+        spec = pool.get("spec")
+        if not isinstance(spec, dict):
+            raise ValueError(f"Protected pool '{pool_ref}' returned an invalid spec.")
+        recycle_strategy = spec.get("recycleStrategy")
+        if recycle_strategy is not None and (
+            not isinstance(recycle_strategy, dict)
+            or recycle_strategy.get("type", "") not in ("", "Delete")
+        ):
+            raise ValueError(f"Protected pool '{pool_ref}' requires Delete recycling.")
 
     def _extract_template_pod_extras(
         self,

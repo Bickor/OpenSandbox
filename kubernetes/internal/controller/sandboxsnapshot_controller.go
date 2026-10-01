@@ -81,8 +81,9 @@ const (
 // No business logic (no scaling, no pool, no resume).
 type SandboxSnapshotReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
+	Recorder  record.EventRecorder
 
 	// ImageCommitterImage is the image used for commit and unpause Jobs.
 	ImageCommitterImage string
@@ -192,6 +193,9 @@ func (r *SandboxSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *SandboxSnapshotReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&sandboxv1alpha1.SandboxSnapshot{}).
 		Owns(&batchv1.Job{}).

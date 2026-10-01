@@ -613,6 +613,15 @@ class ProxyConfig(BaseModel):
 
 
 class KubernetesRuntimeConfig(BaseModel):
+    protected_pool_allocations: bool = Field(
+        default=False,
+        description=(
+            "Operator-only UID-bound Pool markers and passive BatchSandbox allocations "
+            "of a fixed prestarted workload, without per-allocation workload/auth overrides. "
+            "Requires external admission, Delete recycling, and single-replica allocations. "
+            "Does not enforce networkPolicy."
+        ),
+    )
     kubeconfig_path: Optional[str] = Field(
         default=None,
         description="Absolute path to the kubeconfig file used for API authentication.",
@@ -1278,6 +1287,13 @@ class AppConfig(BaseModel):
             if self.kubernetes is None:
                 self.kubernetes = KubernetesRuntimeConfig()
             provider_type = (self.kubernetes.workload_provider or "").lower()
+            if self.kubernetes.protected_pool_allocations and provider_type not in (
+                "",
+                "batchsandbox",
+            ):
+                raise ValueError(
+                    "kubernetes.protected_pool_allocations requires the batchsandbox provider."
+                )
             if provider_type == "agent-sandbox":
                 if self.agent_sandbox is None:
                     self.agent_sandbox = AgentSandboxRuntimeConfig()

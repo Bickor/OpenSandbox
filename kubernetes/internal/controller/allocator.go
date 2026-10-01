@@ -79,6 +79,11 @@ func (store *inMemoryAllocationStore) Recover(ctx context.Context, c client.Clie
 	newPools := make(map[string]*poolEntry)
 
 	for _, sbx := range batchSandboxList.Items {
+		// UID-bound pools recover from durable Pod reservations, never from this
+		// legacy name-only map. Invalid protected evidence is handled per Pool.
+		if hasAllocationIdentityContract(&sbx) {
+			continue
+		}
 		poolRef := sbx.Spec.PoolRef
 		if poolRef == "" {
 			continue
@@ -269,6 +274,9 @@ func newAnnoAllocationSyncer(client client.Client) allocationSyncer {
 }
 
 func (syncer *annoAllocationSyncer) SetAllocation(ctx context.Context, sandbox *sandboxv1alpha1.BatchSandbox, allocation *sandboxAllocation) error {
+	if hasAllocationIdentityContract(sandbox) {
+		return fmt.Errorf("UID-bound allocation requires fenced identity publication")
+	}
 	allocation.PoolRef = sandbox.Spec.PoolRef
 	allocation.Generation = sandbox.Generation
 	js, err := json.Marshal(allocation)
@@ -306,6 +314,9 @@ func (syncer *annoAllocationSyncer) SetAllocation(ctx context.Context, sandbox *
 }
 
 func (syncer *annoAllocationSyncer) GetAllocation(ctx context.Context, sandbox *sandboxv1alpha1.BatchSandbox) (*sandboxAllocation, error) {
+	if hasAllocationIdentityContract(sandbox) {
+		return nil, fmt.Errorf("UID-bound allocation requires live identity validation")
+	}
 	allocation := &sandboxAllocation{
 		Pods: make([]string, 0),
 	}
@@ -357,6 +368,9 @@ func (syncer *annoAllocationSyncer) GetReleased(ctx context.Context, sandbox *sa
 }
 
 func (syncer *annoAllocationSyncer) SetReleased(ctx context.Context, sandbox *sandboxv1alpha1.BatchSandbox, released *allocationReleased) error {
+	if hasAllocationIdentityContract(sandbox) {
+		return fmt.Errorf("UID-bound release requires fenced identity validation")
+	}
 	js, err := json.Marshal(released)
 	if err != nil {
 		return err
@@ -456,6 +470,13 @@ func NewDefaultAllocator(client client.Client) Allocator {
 }
 
 func (allocator *defaultAllocator) Schedule(ctx context.Context, spec *allocSpec) (*algorithm.AllocAction, error) {
+	protected, err := validateAllocationModes(spec.Pool, spec.Sandboxes)
+	if err != nil {
+		return nil, err
+	}
+	if protected {
+		return nil, fmt.Errorf("UID-bound allocation requires the identity-aware Pool scheduling path")
+	}
 	log := logf.FromContext(ctx)
 	log.Info("Schedule started", "pool", spec.Pool.Name, "totalPods", len(spec.Pods), "sandboxes", len(spec.Sandboxes))
 	if err := allocator.checkRecovery(ctx); err != nil {

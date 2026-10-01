@@ -42,6 +42,7 @@ import (
 	sandboxv1alpha1 "github.com/alibaba/OpenSandbox/sandbox-k8s/apis/sandbox/v1alpha1"
 	snapshotcontract "github.com/alibaba/OpenSandbox/sandbox-k8s/internal/snapshot"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils"
+	pkgutils "github.com/alibaba/OpenSandbox/sandbox-k8s/pkg/utils"
 )
 
 // handlePending resolves the source Pod and creates the commit Job.
@@ -456,6 +457,19 @@ func validateKataRestorePlanSecret(snapshot *sandboxv1alpha1.SandboxSnapshot, se
 
 // findPodForSandbox finds the running pod belonging to a BatchSandbox.
 func (r *SandboxSnapshotReconciler) findPodForSandbox(ctx context.Context, bs *sandboxv1alpha1.BatchSandbox, namespace string) (*corev1.Pod, error) {
+	if hasAllocationIdentityContract(bs) {
+		if namespace != bs.Namespace {
+			return nil, fmt.Errorf("snapshot namespace does not match allocation")
+		}
+		pod, err := pkgutils.ReadUIDBoundAllocation(ctx, r.APIReader, bs)
+		if err != nil {
+			return nil, err
+		}
+		if pod.Status.Phase != corev1.PodRunning {
+			return nil, fmt.Errorf("UID-bound Pod is not running")
+		}
+		return pod, nil
+	}
 	alloc, err := parseSandboxAllocation(bs)
 	if err == nil && len(alloc.Pods) > 0 {
 		for _, podName := range alloc.Pods {

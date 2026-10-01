@@ -91,6 +91,81 @@ opensandbox-server init-config ~/.sandbox.toml --example docker
    Topics covered there include: Docker `network_mode` / `host_ip` and `[proxy] resolve_internal` (e.g. server in Docker Compose), `[egress]` when clients send `networkPolicy`, `[ingress]`, `[secure_runtime]`, Kubernetes `workload_provider` / `batchsandbox_template_file`, `[agent_sandbox]`, TTL caps, `[renew_intent]`.
    The server-wide persistence backend is configured under `[store]`; by default OpenSandbox uses a local SQLite database at `~/.opensandbox/opensandbox.db` for server-managed metadata such as snapshot records. PostgreSQL can be selected for externally managed persistence; see the [store configuration](https://github.com/opensandbox-group/OpenSandbox/blob/main/server/configuration.md#store).
 
+### Protected Pool allocation prerequisite
+
+The operator-only TOML setting `kubernetes.protected_pool_allocations` defaults
+to `false`. Omitted or false preserves native Pool and BatchSandbox behavior.
+For a **new, dedicated protected backend**, configure:
+
+```toml
+[kubernetes]
+workload_provider = "batchsandbox"
+namespace = "protected-sandboxes"
+protected_pool_allocations = true
+```
+
+This stamps `sandbox.opensandbox.io/allocation-mode: uid-bound-v1` on every
+Pool and explicitly pooled BatchSandbox **in the initial Kubernetes create
+request**, never by adopting or patching existing resources. Pools use
+`recycleStrategy.type: Delete`; pooled BatchSandboxes have one replica. Used
+Pods must be deleted and replenished, never reset for same-Pod reuse. Allocation
+requires a live, non-terminating, UID-bearing Pool in the workload namespace
+with the exact marker and Delete recycling. Native/unmarked or unsupported
+Pools and pool auto-assignment (`poolRef: "*"`) are rejected.
+
+Protected pooled BatchSandboxes are **passive allocations**: they contain no
+`taskTemplate`, bootstrap task, or per-allocation runtime injection. The
+operator-approved Pool template must prestart the fixed workload, including
+net-init deny-all, without waiting for allocation certificates or policy.
+No native task-executor privileges or network access are required.
+
+The private allocation request may identify `extensions.poolRef`, set `timeout`
+and metadata, and optionally use `extensions["access.renew.extend.seconds"]`.
+Per-allocation image (including pull credentials), env, entrypoint, resources,
+volumes, platform, lifecycle, networkPolicy, credentialProxy, secureAccess,
+bootstrap extensions, and unrecognized request fields/extensions are rejected
+before allocation, not silently dropped. Omitted/null workload fields and
+`secureAccess: false` remain equivalent to no override. Native flag-false
+allocations retain their existing task-executor/bootstrap behavior.
+
+Backend creation readiness is Kubernetes Pod/BatchSandbox readiness, not proof
+of policy activation or certificate installation. Pool readiness probes must
+work while the workload is deny-all and has no allocation certificate; for
+example, use a suitable local exec probe. Otherwise the backend create wait
+can time out before the hosted facade can activate the allocation.
+`secureAccess: true` normally configures gateway-token annotations and requires
+gateway ingress; it is rejected on this passive path as an auth override.
+Hosted allocation authorization and endpoint authentication remain external.
+
+There is no request field or extension that enables or overrides this setting.
+On the protected path, caller-supplied Pool pod-template allocation annotations
+are rejected; the backend alone supplies the creation marker, and the
+controller owns allocation intent, identity, status, release/released, and endpoints.
+Private Pool and sandbox response shapes remain unchanged.
+
+Protected pause/resume is unsupported and must be rejected by admission. A
+released or lost allocation requires a new BatchSandbox UID; the same
+BatchSandbox must never acquire a replacement Pod.
+
+::: warning Prerequisite only — not networkPolicy enforcement
+Before enabling this setting, install external validating admission that
+requires and immutably retains the Pool and BatchSandbox creation markers,
+enforces Delete recycling and single-replica allocations for their full
+lifetime, and protects controller-owned annotations and Pod reservations.
+Existing native Pools must not be upgraded in place.
+
+This setting does not create NetworkPolicies, authorize allocations, or isolate
+warm Pods. The hosted facade must separately establish workload-traffic
+deny-all for unallocated warm Pods, activate policy only for the owned
+allocation, and compile/manage policy outside this backend. It must send a
+policy-free private pool request. The backend still rejects `networkPolicy`
+with `extensions.poolRef`; this prerequisite must not be advertised as enforced
+pool networkPolicy support.
+:::
+
+See [UID-bound pool allocation](/kubernetes/uid-bound-allocation) for the
+controller identity and admission contract.
+
 ### Fast Sandbox workload and network policy {#fast-sandbox-workload-and-network-policy}
 
 Fast Sandbox images/templates must include and start execd on port `44772`. Do not

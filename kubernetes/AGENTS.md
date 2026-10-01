@@ -49,6 +49,10 @@ The controller communicates allocation state through annotations on BatchSandbox
 - `sandbox.opensandbox.io/alloc-status`: current pool allocation. Legacy pods-only JSON such as `{"pods":["pod-1","pod-2"]}` remains accepted and readable. Current controller writes add `poolRef` and `generation`: `{"pods":["pod-1","pod-2"],"poolRef":"pool-a","generation":42}`. `generation` traces the BatchSandbox generation for the write; it is not an evidence-freshness predicate.
 - `sandbox.opensandbox.io/alloc-release`: JSON `{"pods":["pod-3"]}` — pods released back to pool
 - `sandbox.opensandbox.io/endpoints`: JSON endpoint list consumed by server-side endpoint resolution
+- Opt-in `allocation-mode: uid-bound-v1`, `alloc-intent`, and `alloc-identity`:
+  see [`docs/kubernetes/uid-bound-allocation.md`](../docs/kubernetes/uid-bound-allocation.md).
+  Protected allocations use immutable UID pins and an identity-aware scheduling
+  path, not the native name-only allocation store. Native formats are unchanged.
 
 Do not change annotation keys or JSON shapes without updating both writers and all readers, including controller tests and any server-side Kubernetes integration that parses them.
 

@@ -104,6 +104,7 @@ from opensandbox_server.services.k8s.client import (
     POOL_PLURAL,
 )
 from opensandbox_server.services.k8s.provider_factory import create_workload_provider
+from opensandbox_server.services.k8s.pool_allocation import PASSIVE_POOL_EXTENSIONS
 from opensandbox_server.services.snapshot_restore import (
     resolve_sandbox_from_request,
     verify_snapshot_restore_ready,
@@ -434,6 +435,40 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                     ),
                 },
             )
+        if self.app_config.kubernetes and self.app_config.kubernetes.protected_pool_allocations:
+            conflicts = {
+                "image": request.image is not None,
+                "snapshotId": request.snapshot_id is not None,
+                "templateId": request.template_id is not None,
+                "env": request.env is not None,
+                "entrypoint": request.entrypoint is not None,
+                "resourceLimits": request.resource_limits is not None,
+                "resourceRequests": request.resource_requests is not None,
+                "volumes": request.volumes is not None,
+                "platform": request.platform is not None,
+                "lifecycle": request.lifecycle is not None,
+                "credentialProxy": request.credential_proxy is not None,
+                "secureAccess": request.secure_access,
+            }
+            unsupported = set(request.extra_request_fields)
+            unsupported.update(name for name, supplied in conflicts.items() if supplied)
+            unsupported.update(
+                f"extensions.{key}"
+                for key in (request.extensions or {})
+                if key not in PASSIVE_POOL_EXTENSIONS
+            )
+            if unsupported:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        "code": SandboxErrorCodes.INVALID_PARAMETER,
+                        "message": (
+                            "Protected pool allocations use a fixed prestarted workload and "
+                            "do not accept workload/auth overrides or unknown fields: "
+                            + ", ".join(sorted(unsupported))
+                        ),
+                    },
+                )
 
     def _ensure_image_auth_support(self, request: CreateSandboxRequest) -> None:
         """

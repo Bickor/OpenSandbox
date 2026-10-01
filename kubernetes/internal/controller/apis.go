@@ -16,9 +16,11 @@ package controller
 
 import (
 	"encoding/json"
+	"fmt"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	sandboxv1alpha1 "github.com/alibaba/OpenSandbox/sandbox-k8s/apis/sandbox/v1alpha1"
 	pkgutils "github.com/alibaba/OpenSandbox/sandbox-k8s/pkg/utils"
 )
 
@@ -57,6 +59,15 @@ type poolAllocation struct {
 
 func parseSandboxAllocation(obj metav1.Object) (sandboxAllocation, error) {
 	ret := sandboxAllocation{}
+	if hasAllocationIdentityContract(obj) {
+		bs, ok := obj.(*sandboxv1alpha1.BatchSandbox)
+		if !ok {
+			return ret, fmt.Errorf("allocation identity requires a BatchSandbox")
+		}
+		if _, err := pkgutils.BatchAllocationIdentity(bs); err != nil {
+			return ret, err
+		}
+	}
 	if raw := obj.GetAnnotations()[annoAllocStatusKey]; raw != "" {
 		if err := json.Unmarshal([]byte(raw), &ret); err != nil {
 			return ret, err

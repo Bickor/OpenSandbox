@@ -87,6 +87,33 @@ def test_load_config_from_file(tmp_path, monkeypatch):
     assert loaded.ingress.gateway.address == "*.opensandbox.io"
     assert loaded.ingress.gateway.route.mode == "wildcard"
     assert loaded.kubernetes is not None
+    assert loaded.kubernetes.protected_pool_allocations is False
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_load_protected_pool_operator_config(tmp_path, monkeypatch, enabled):
+    _reset_config(monkeypatch)
+    config_path = tmp_path / "protected-pools.toml"
+    config_path.write_text(
+        '[runtime]\ntype = "kubernetes"\nexecd_image = "execd:test"\n'
+        '[kubernetes]\nnamespace = "protected-ns"\n'
+        f"protected_pool_allocations = {str(enabled).lower()}\n"
+    )
+    loaded = config_module.load_config(config_path)
+    assert loaded.kubernetes is not None
+    assert loaded.kubernetes.protected_pool_allocations is enabled
+
+
+@pytest.mark.parametrize("provider", ["agent-sandbox", "other-provider"])
+def test_protected_pool_config_requires_batchsandbox_provider(provider):
+    with pytest.raises(ValidationError, match="requires the batchsandbox provider"):
+        AppConfig.model_validate({
+            "runtime": {"type": "kubernetes", "execd_image": "execd:test"},
+            "kubernetes": {
+                "workload_provider": provider,
+                "protected_pool_allocations": True,
+            },
+        })
 
 
 def test_load_config_env_override_api_key(tmp_path, monkeypatch):

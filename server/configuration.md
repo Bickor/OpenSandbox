@@ -141,6 +141,7 @@ If `runtime.type = "kubernetes"` and the `[kubernetes]` table is absent, the ser
 | `namespace` | string \| omitted | `null` | Namespace for sandbox workloads. |
 | `workload_provider` | string \| omitted | `null` | One of: **`batchsandbox`**, **`agent-sandbox`**. If omitted, the **first registered** provider is used (currently **`batchsandbox`**). |
 | `batchsandbox_template_file` | string \| omitted | `null` | Path to **BatchSandbox** CR YAML template when `workload_provider = "batchsandbox"`. |
+| `protected_pool_allocations` | boolean | `false` | Operator-only Pool / BatchSandbox creation-time `uid-bound-v1` markers and passive, no-task allocations of a fixed prestarted workload. Rejects per-allocation workload/auth overrides; requires external admission, Delete recycling, and one replica. Not networkPolicy enforcement. See [protected Pool prerequisites](../docs/components/server.md#protected-pool-allocation-prerequisite). |
 | `image_pull_policy` | string \| omitted | `"IfNotPresent"` | Image pull policy for the BatchSandbox main container. Values: **`Always`**, **`IfNotPresent`**, **`Never`**. |
 | `sandbox_create_timeout_seconds` | integer | `60` | Max time to wait for a new sandbox to become ready (e.g. IP assigned), in seconds. |
 | `pool_acquisition_timeout_seconds` | integer | `30` | Max cumulative time to wait while Pool capacity prevents allocation. This does not extend `sandbox_create_timeout_seconds`. |
@@ -166,7 +167,7 @@ Kubernetes workloads are created by a **workload provider**. There is **no** `[b
 | Per-request image auth | `image.auth` in the create request — creates a per-sandbox imagePullSecret owned by the BatchSandbox CR | Same — owned by the Sandbox CR |
 | Extra TOML table | None | **`[agent_sandbox]`** is required (see below) |
 
-**BatchSandbox-only config keys in `config.py`:** `batchsandbox_template_file` and `image_pull_policy` on `KubernetesRuntimeConfig`. Everything else in the `[kubernetes]` table (namespace, kubeconfig, informer, API QPS, `sandbox_create_*`, `execd_init_resources`, …) applies to **whichever** provider you select.
+**BatchSandbox-only config keys in `config.py`:** `batchsandbox_template_file`, `image_pull_policy`, and `protected_pool_allocations` on `KubernetesRuntimeConfig`. Enabling `protected_pool_allocations` requires the `batchsandbox` provider (explicit or default); it does not apply to Fast Sandbox. Everything else in the `[kubernetes]` table (namespace, kubeconfig, informer, API QPS, `sandbox_create_*`, `execd_init_resources`, …) applies to **whichever** provider you select.
 
 ### `kubernetes.execd_init_resources`
 

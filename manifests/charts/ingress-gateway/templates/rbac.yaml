@@ -29,6 +29,9 @@ rules:
   - apiGroups: ["sandbox.opensandbox.io"]
     resources: ["batchsandboxes", "batchsandboxes/status"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["sandbox.opensandbox.io"]
+    resources: ["pools"]
+    verbs: ["get"]
 ---
 apiVersion: {{ include "opensandbox-ingress-gateway.rbac.apiVersion" . }}
 kind: ClusterRoleBinding

@@ -28,6 +28,10 @@ The BatchSandbox custom resource allows you to create and manage multiple identi
 - **Detailed Status Reporting**: Comprehensive metrics on replicas, allocations, and task states
 
 ### Resource Pooling
+For the opt-in single-use allocation identity prerequisite, see
+[UID-bound pool allocation](/kubernetes/uid-bound-allocation). This does not provide
+network policy enforcement and requires a trusted creation-time admission contract.
+
 The Pool custom resource maintains a pool of pre-warmed compute resources to enable rapid sandbox provisioning:
 - Configurable buffer sizes (minimum and maximum) to balance resource availability and cost
 - Pool capacity limits to control overall resource consumption

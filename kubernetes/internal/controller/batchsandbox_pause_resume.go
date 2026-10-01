@@ -139,6 +139,13 @@ func (r *BatchSandboxReconciler) deleteInternalPauseSnapshot(ctx context.Context
 }
 
 func (r *BatchSandboxReconciler) hasReadyResumePod(ctx context.Context, bs *sandboxv1alpha1.BatchSandbox) (bool, error) {
+	if hasAllocationIdentityContract(bs) {
+		pods, err := r.listPods(ctx, strategy.NewPoolStrategy(bs), bs)
+		if err != nil {
+			return false, err
+		}
+		return len(pods) == 1 && utils.IsPodReady(pods[0]), nil
+	}
 	poolStrategy := strategy.NewPoolStrategy(bs)
 	if poolStrategy.IsPooledMode() {
 		alloc, err := parseSandboxAllocation(bs)
@@ -185,6 +192,13 @@ func (r *BatchSandboxReconciler) hasReadyResumePod(ctx context.Context, bs *sand
 // dispatchPauseResume implements the 5-case dispatch table from the design doc.
 // Returns (result, handled, error). If handled=true, the caller should return immediately.
 func (r *BatchSandboxReconciler) dispatchPauseResume(ctx context.Context, bs *sandboxv1alpha1.BatchSandbox) (ctrl.Result, bool, error) {
+	if hasAllocationIdentityContract(bs) {
+		if bs.Spec.Pause != nil && *bs.Spec.Pause || bs.Status.Phase == sandboxv1alpha1.BatchSandboxPhasePausing ||
+			bs.Status.Phase == sandboxv1alpha1.BatchSandboxPhasePaused || bs.Status.Phase == sandboxv1alpha1.BatchSandboxPhaseResuming {
+			return ctrl.Result{}, true, fmt.Errorf("UID-bound allocations do not support pause/resume")
+		}
+		return ctrl.Result{}, false, nil
+	}
 	log := logf.FromContext(ctx)
 	generation := bs.Generation
 	pauseObservedGen := bs.Status.PauseObservedGeneration
