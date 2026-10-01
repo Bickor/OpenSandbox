@@ -196,3 +196,24 @@ def test_composite_runtime_defaults_without_fsb_runtime() -> None:
 
     assert default.preflight == ["fsb-001"]
     assert default.inspected == ["snap-1"]
+
+
+@pytest.mark.parametrize("source", ["sbx-001", "fsb-001"])
+def test_composite_delete_preflight_routes_to_source_backend(source) -> None:
+    from unittest.mock import Mock
+    default = _DispatchStubRuntime("k8s")
+    fsb = _DispatchStubRuntime("fsb")
+    default.preflight_delete_snapshot = Mock()
+    fsb.preflight_delete_snapshot = Mock()
+    composite = _composite(default, fsb)
+    composite.preflight_delete_snapshot("snap", namespace="tenant-a", source_sandbox_id=source)
+    selected, other = (fsb, default) if source.startswith("fsb-") else (default, fsb)
+    selected.preflight_delete_snapshot.assert_called_once_with(
+        "snap", namespace="tenant-a", source_sandbox_id=source,
+    )
+    other.preflight_delete_snapshot.assert_not_called()
+
+
+def test_composite_delete_preflight_accepts_legacy_runtime_without_hook() -> None:
+    composite = _composite(_DispatchStubRuntime("legacy"))
+    composite.preflight_delete_snapshot("snap", namespace="tenant-a", source_sandbox_id="sbx")

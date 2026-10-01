@@ -798,6 +798,33 @@ def test_snapshot_service_propagates_snapshot_delete_conflict(tmp_path) -> None:
     assert stored.status.state == SnapshotState.DELETING
 
 
+def test_composite_kubernetes_delete_conflict_keeps_catalog_ready(tmp_path) -> None:
+    from unittest.mock import Mock
+    from opensandbox_server.services.k8s.snapshot_runtime import KubernetesSnapshotRuntime
+    from opensandbox_server.services.snapshot_runtime_factory import CompositeSnapshotRuntime
+
+    client = Mock()
+    client.list_custom_objects.return_value = [{"metadata": {"name": "live-consumer"}}]
+    runtime = CompositeSnapshotRuntime(KubernetesSnapshotRuntime(client, namespace="default"))
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    repo.create(_snapshot_record("snap-in-use", SnapshotState.READY, image="snapshot:image"))
+    service = PersistedSnapshotService(repo, StubSandboxService(), snapshot_runtime=runtime)
+    try:
+        with pytest.raises(HTTPException) as error:
+            service.delete_snapshot("snap-in-use")
+        assert error.value.status_code == 409
+        assert error.value.detail["code"] == "SNAPSHOT::DELETE_CONFLICT"
+        assert repo.get("snap-in-use").status.state == SnapshotState.READY
+        client.delete_custom_object.assert_not_called()
+        # Once the consumer is released, normal deletion must still succeed.
+        client.list_custom_objects.return_value = []
+        service.delete_snapshot("snap-in-use")
+        assert repo.get("snap-in-use") is None
+        client.delete_custom_object.assert_called_once()
+    finally:
+        service.close()
+
+
 def test_snapshot_service_recovers_delete_after_runtime_cleanup_succeeds(tmp_path) -> None:
     repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
     runtime = StubSnapshotRuntime()
