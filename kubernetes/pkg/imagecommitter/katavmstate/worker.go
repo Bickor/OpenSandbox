@@ -25,6 +25,7 @@ import (
 	"regexp"
 	"strings"
 	"syscall"
+	"time"
 
 	containerd "github.com/containerd/containerd"
 	"github.com/containerd/errdefs"
@@ -75,7 +76,18 @@ type containerMetadata struct {
 	Labels map[string]string
 }
 
+// captureTimings records only phase durations, never request or artifact data.
+type captureTimings struct {
+	containerdConnect time.Duration
+	sourceLookup      time.Duration
+	snapshotCreate    time.Duration
+	metadataVerify    time.Duration
+	remoteUpload      time.Duration
+	resultWrite       time.Duration
+}
+
 type worker struct {
+	timings        *captureTimings
 	hostRoot       string
 	snapshotRoot   string
 	listContainers func(context.Context) ([]containerMetadata, error)
@@ -129,41 +141,61 @@ func (w *worker) create(ctx context.Context, request createRequest) (Result, err
 		return Result{}, err
 	}
 
-	containers, err := w.listContainers(ctx)
-	if err != nil {
-		return Result{}, err
+	lookupStart := time.Now()
+	sandboxID, err := func() (string, error) {
+		containers, err := w.listContainers(ctx)
+		if err != nil {
+			return "", err
+		}
+		return selectPauseContainer(containers, request)
+	}()
+	if w.timings != nil {
+		w.timings.sourceLookup = time.Since(lookupStart)
 	}
-	sandboxID, err := selectPauseContainer(containers, request)
 	if err != nil {
 		return Result{}, err
 	}
 	snapshotPath := filepath.Join(SnapshotRoot, request.SnapshotName)
+	snapshotStart := time.Now()
 	output, err := w.runChild(ctx, w.hostRoot, request.HostKataCtlPath,
 		"snapshot", "create", "--sandbox-id", sandboxID, "--path", snapshotPath)
+	if w.timings != nil {
+		w.timings.snapshotCreate = time.Since(snapshotStart)
+	}
 	if err != nil {
 		return Result{}, fmt.Errorf("kata-ctl snapshot create failed: %w; output: %s", err, strings.TrimSpace(string(output)))
 	}
 
-	metadataPath, err := w.hostSnapshotPath(request.SnapshotName, SnapshotMetadataFile)
+	metadataStart := time.Now()
+	runtimeVersion, err := func() (string, error) {
+		metadataPath, err := w.hostSnapshotPath(request.SnapshotName, SnapshotMetadataFile)
+		if err != nil {
+			return "", err
+		}
+		data, err := w.readFile(metadataPath)
+		if err != nil {
+			return "", fmt.Errorf("read Kata snapshot metadata: %w", err)
+		}
+		var metadata struct {
+			RuntimeVersion string `json:"runtime_version"`
+		}
+		if err := json.Unmarshal(data, &metadata); err != nil {
+			return "", fmt.Errorf("parse Kata snapshot metadata: %w", err)
+		}
+		if strings.TrimSpace(metadata.RuntimeVersion) == "" {
+			return "", errors.New("Kata snapshot metadata has no runtime_version")
+		}
+		return metadata.RuntimeVersion, nil
+	}()
+	if w.timings != nil {
+		w.timings.metadataVerify = time.Since(metadataStart)
+	}
 	if err != nil {
 		return Result{}, err
 	}
-	data, err := w.readFile(metadataPath)
-	if err != nil {
-		return Result{}, fmt.Errorf("read Kata snapshot metadata: %w", err)
-	}
-	var metadata struct {
-		RuntimeVersion string `json:"runtime_version"`
-	}
-	if err := json.Unmarshal(data, &metadata); err != nil {
-		return Result{}, fmt.Errorf("parse Kata snapshot metadata: %w", err)
-	}
-	if strings.TrimSpace(metadata.RuntimeVersion) == "" {
-		return Result{}, errors.New("Kata snapshot metadata has no runtime_version")
-	}
 	return Result{Containers: []struct{}{}, KataVMState: VMStateResult{
 		SnapshotName:   request.SnapshotName,
-		RuntimeVersion: metadata.RuntimeVersion,
+		RuntimeVersion: runtimeVersion,
 	}}, nil
 }
 
