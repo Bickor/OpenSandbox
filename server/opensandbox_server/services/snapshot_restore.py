@@ -32,7 +32,9 @@ DEFAULT_SNAPSHOT_RESTORE_ENTRYPOINT = ["tail", "-f", "/dev/null"]
 KATA_VMSTATE_FORMAT = "kata-vmstate-v1"
 
 
-def _reject_kata_restore_conflicts(request: CreateSandboxRequest) -> None:
+def _reject_kata_restore_conflicts(
+    request: CreateSandboxRequest, snapshot_format: str = KATA_VMSTATE_FORMAT
+) -> None:
     public_names = {
         "snapshot_id": "snapshotId",
         "resource_limits": "resourceLimits",
@@ -44,9 +46,7 @@ def _reject_kata_restore_conflicts(request: CreateSandboxRequest) -> None:
     }
     allowed = {"snapshot_id", "timeout", "metadata"}
     present = sorted(
-        public_names.get(name, name)
-        for name in request.model_fields_set
-        if name not in allowed
+        public_names.get(name, name) for name in request.model_fields_set if name not in allowed
     )
     if present:
         raise HTTPException(
@@ -54,7 +54,7 @@ def _reject_kata_restore_conflicts(request: CreateSandboxRequest) -> None:
             detail={
                 "code": SandboxErrorCodes.INVALID_PARAMETER,
                 "message": (
-                    "kata-vmstate-v1 snapshot restore accepts only snapshotId, timeout, "
+                    f"{snapshot_format} snapshot restore accepts only snapshotId, timeout, "
                     f"and metadata; conflicting fields: {', '.join(present)}."
                 ),
             },
@@ -96,7 +96,9 @@ async def resolve_sandbox_image_from_request(
         )
 
     tenant = get_current_tenant()
-    if tenant is not None and (snapshot.namespace is None or snapshot.namespace != tenant.namespace):
+    if tenant is not None and (
+        snapshot.namespace is None or snapshot.namespace != tenant.namespace
+    ):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={
@@ -114,16 +116,19 @@ async def resolve_sandbox_image_from_request(
             },
         )
 
-    if snapshot.restore_config.format == KATA_VMSTATE_FORMAT:
-        if not snapshot.restore_config.is_complete_kata_plan():
+    if snapshot.restore_config.format in {KATA_VMSTATE_FORMAT, "qemu-v1"}:
+        if not (
+            snapshot.restore_config.is_complete_kata_plan()
+            or snapshot.restore_config.is_complete_qemu_plan()
+        ):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={
                     "code": "SNAPSHOT::INVALID_RESTORE_CONFIG",
-                    "message": f"Snapshot {snapshot_id} does not have a complete Kata restore plan.",
+                    "message": f"Snapshot {snapshot_id} does not have a complete VM restore plan.",
                 },
             )
-        _reject_kata_restore_conflicts(request)
+        _reject_kata_restore_conflicts(request, snapshot.restore_config.format)
         request.snapshot_id = snapshot_id
         request._resolved_snapshot_backend = snapshot.restore_config.backend
         request._snapshot_restore_config = SnapshotRestoreConfig.from_dict(

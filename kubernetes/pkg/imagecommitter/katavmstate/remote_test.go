@@ -53,7 +53,8 @@ const remoteTestName = "ks-0123456789abcdef0123456789abcdef"
 func remoteFixture(t *testing.T) (string, *memoryStore) {
 	t.Helper()
 	root := t.TempDir()
-	for _, name := range []string{SnapshotMetadataFile, "config.json", "memory-ranges", restorePlanFile} {
+	require.NoError(t, os.Mkdir(filepath.Join(root, "clh"), 0700))
+	for _, name := range []string{SnapshotMetadataFile, "runtime-state.json", "clh/config.json", "clh/state.json", "clh/memory-ranges", restorePlanFile} {
 		require.NoError(t, os.WriteFile(filepath.Join(root, name), []byte(`{"runtime_version":"3.32.0"}`), 0600))
 	}
 	require.NoError(t, os.Mkdir(filepath.Join(root, "containers"), 0700))
@@ -84,7 +85,7 @@ func TestRemoteSnapshotRoundTripConcurrentPrepare(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, append(make([]byte, 1<<20), []byte("disk data")...), data)
 	// An existing damaged cache must not be overwritten while a VM may use it.
-	require.NoError(t, os.WriteFile(filepath.Join(target, remoteTestName, "config.json"), []byte("corrupt"), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(target, remoteTestName, "clh/config.json"), []byte("corrupt"), 0600))
 	require.Error(t, prepareSnapshot(ctx, store, target, remoteTestName, hash))
 }
 
@@ -147,7 +148,7 @@ func TestRemoteSnapshotRejectsLinksAndMissingArtifacts(t *testing.T) {
 	_, err := uploadSnapshot(context.Background(), store, root, remoteTestName, "3.32.0")
 	require.Error(t, err)
 	require.NoError(t, os.Remove(filepath.Join(root, "link")))
-	require.NoError(t, os.Remove(filepath.Join(root, "memory-ranges")))
+	require.NoError(t, os.Remove(filepath.Join(root, "clh/memory-ranges")))
 	_, err = uploadSnapshot(context.Background(), store, root, remoteTestName, "3.32.0")
 	require.Error(t, err)
 	require.NotContains(t, store.objects, manifestKey(remoteTestName))

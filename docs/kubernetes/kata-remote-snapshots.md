@@ -15,6 +15,17 @@ the image-committer Pod template with a Workload Identity service account and
 the `azure.workload.identity/use: "true"` label. Grant that identity Storage
 Blob Data Contributor on the container. No storage credentials enter the sandbox.
 
+If role assignments cannot be created, an operator who already has Blob data
+access can supply a short-lived **user-delegation SAS** via the image-committer
+Pod template's `KATA_SNAPSHOT_BLOB_SAS_TOKEN` environment variable, sourced from a
+Kubernetes Secret. It must be HTTPS-only, container-scoped, and expire within
+24 hours; allow read/create/write/list/delete for the snapshot lifecycle. This
+optional path does not accept account keys or account SAS. Refresh the Secret
+before expiry; existing Jobs retain their original environment and may need to
+be retried. The default remains Azure Identity/Workload Identity. SAS transport
+errors are redacted because SDK error messages may otherwise contain query
+credentials. This path validates storage transport, not Workload Identity RBAC.
+
 For the umbrella chart, these keys are under
 `opensandbox-controller.controller.snapshot.kataVMState`. Deploy the controller,
 server and image-committer built from the same remote-snapshot commit. The chart

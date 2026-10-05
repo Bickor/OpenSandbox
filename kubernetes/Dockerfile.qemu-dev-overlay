@@ -1,0 +1,3 @@
+ARG BASE
+FROM ${BASE}
+COPY bin/image-committer-qemu /usr/local/bin/image-committer-qemu

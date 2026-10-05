@@ -10,7 +10,7 @@ COMPONENTS = {"controller", "server", "image-committer-azure", "image-committer"
               "task-executor", "execd", "ingress", "egress", "osb-dashboard", "code-server-execd"}
 
 
-def assemble(metadata: Path, output: Path, version: str, commit: str, repository: str, remote_snapshots: bool = False):
+def assemble(metadata: Path, output: Path, version: str, commit: str, repository: str, remote_snapshots: bool = False, qemu_snapshots: bool = False):
     if not re.fullmatch(r"\d+\.\d+\.\d+-rc\.\d+(?:\.\d+)?", version):
         raise ValueError("expected X.Y.Z-rc.N preview version")
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
@@ -47,7 +47,7 @@ def assemble(metadata: Path, output: Path, version: str, commit: str, repository
             "repository": repository,
             "commit": commit,
             "platforms": ["linux/amd64"],
-            "capabilities": {"kataVMState": True, "remoteSnapshots": remote_snapshots, "restorePlacement": "same-node"},
+            "capabilities": {"kataVMState": True, "remoteSnapshots": remote_snapshots, "qemuSnapshots": qemu_snapshots, "restorePlacement": "same-node"},
             "images": images,
             "sources": {"osb-dashboard": json.loads((Path(__file__).parent / "dashboard-source.json").read_text())},
             "chart": {"file": chart.name, "sha256": chart_digest},
@@ -94,4 +94,5 @@ if __name__ == "__main__":
     parser.add_argument("--commit", required=True)
     parser.add_argument("--repository", required=True)
     parser.add_argument("--remote-snapshots", action="store_true")
+    parser.add_argument("--qemu-snapshots", action="store_true")
     assemble(**vars(parser.parse_args()))
