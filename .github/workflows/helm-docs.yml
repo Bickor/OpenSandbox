@@ -2,7 +2,6 @@ name: Helm Docs Check
 
 on:
   pull_request:
-    branches: [ main ]
     paths:
       - 'manifests/charts/**'
       - 'manifests/Makefile'

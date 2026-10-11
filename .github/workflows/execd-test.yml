@@ -2,7 +2,7 @@ name: Execd Tests
 
 on:
   pull_request:
-    branches: [ main ]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -99,7 +99,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, self-hosted]
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -183,8 +183,8 @@ jobs:
           # Runs the execd-ebpf variant in a bare container against THIS
           # runner's kernel and asserts exec/connect/privilege events land in
           # the JSONL audit file. GitHub-hosted ubuntu validates the stock CI
-          # kernel; the self-hosted leg is the 5.10 empirical validation
-          # (inline-filename exec-hook fallback). Host prerequisites (BTF,
+          # kernel. Linux 5.10 validation needs a dedicated runner, which this
+          # fork does not have. Host prerequisites (BTF,
           # cgroup v2, tracefs) are prechecked by the script.
           bash scripts/execd-ebpf-smoke.sh --build
 
