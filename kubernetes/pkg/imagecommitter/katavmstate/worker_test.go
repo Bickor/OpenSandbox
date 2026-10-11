@@ -15,13 +15,16 @@
 package katavmstate
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
 
 const testSnapshotName = "ks-0123456789abcdef0123456789abcdef"
@@ -65,19 +68,26 @@ func TestWorkerCreateInvokesChrootedKataCtlAndReadsRuntimeVersion(t *testing.T) 
 	}
 	var gotRoot, gotName string
 	var gotArgs []string
+	timings := &captureTimings{}
 	w := &worker{
+		timings:      timings,
 		hostRoot:     hostRoot,
 		snapshotRoot: SnapshotRoot,
 		listContainers: func(context.Context) ([]containerMetadata, error) {
+			time.Sleep(2 * time.Millisecond)
 			return []containerMetadata{{ID: "sandbox-id", Labels: map[string]string{
 				podNameLabel: "pod", podNamespaceLabel: "tenant", podUIDLabel: "uid", containerNameLabel: PauseContainerName,
 			}}}, nil
 		},
 		runChild: func(_ context.Context, root, name string, args ...string) ([]byte, error) {
 			gotRoot, gotName, gotArgs = root, name, append([]string(nil), args...)
+			time.Sleep(2 * time.Millisecond)
 			return nil, nil
 		},
-		readFile: os.ReadFile,
+		readFile: func(path string) ([]byte, error) {
+			time.Sleep(2 * time.Millisecond)
+			return os.ReadFile(path)
+		},
 	}
 	result, err := w.create(context.Background(), createRequest{
 		PodName: "pod", PodNamespace: "tenant", PodUID: "uid", SnapshotName: testSnapshotName,
@@ -95,6 +105,73 @@ func TestWorkerCreateInvokesChrootedKataCtlAndReadsRuntimeVersion(t *testing.T) 
 	}
 	if result.KataVMState.SnapshotName != testSnapshotName || result.KataVMState.RuntimeVersion != "3.15.0-aks.1" {
 		t.Fatalf("unexpected result: %#v", result)
+	}
+	if timings.sourceLookup < 2*time.Millisecond || timings.snapshotCreate < 2*time.Millisecond || timings.metadataVerify < 2*time.Millisecond {
+		t.Fatalf("capture phases were not recorded: %+v", timings)
+	}
+}
+
+func TestCaptureTimingLogIsMetadataOnly(t *testing.T) {
+	timings := captureTimings{
+		containerdConnect: 2 * time.Millisecond,
+		sourceLookup:      8 * time.Millisecond,
+		snapshotCreate:    850 * time.Millisecond,
+		metadataVerify:    3 * time.Millisecond,
+		resultWrite:       time.Millisecond,
+	}
+	var log bytes.Buffer
+	writeCaptureTiming(&log, timings, time.Second, true)
+	const prefix = "KATA_VMSTATE_TIMING="
+	if !strings.HasPrefix(log.String(), prefix) {
+		t.Fatalf("missing timing record: %q", log.String())
+	}
+	var record struct {
+		Operation           string `json:"operation"`
+		Status              string `json:"status"`
+		TotalMS             int64  `json:"total_ms"`
+		ContainerdConnectMS int64  `json:"containerd_connect_ms"`
+		SourceLookupMS      int64  `json:"source_lookup_ms"`
+		KataCTLSnapshotMS   int64  `json:"kata_ctl_snapshot_ms"`
+		MetadataVerifyMS    int64  `json:"metadata_verify_ms"`
+		RemoteUploadMS      int64  `json:"remote_upload_ms"`
+		ResultWriteMS       int64  `json:"result_write_ms"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(log.String(), prefix))), &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Operation != "create" || record.Status != "ok" || record.TotalMS != 1000 ||
+		record.ContainerdConnectMS != 2 || record.SourceLookupMS != 8 || record.KataCTLSnapshotMS != 850 ||
+		record.MetadataVerifyMS != 3 || record.RemoteUploadMS != 0 || record.ResultWriteMS != 1 {
+		t.Fatalf("unexpected timing record: %+v", record)
+	}
+	if strings.Contains(log.String(), testSnapshotName) || strings.Contains(log.String(), "sandbox-id") || strings.Contains(log.String(), "pod-name") {
+		t.Fatalf("timing record contains an identity: %s", log.String())
+	}
+	log.Reset()
+	writeCaptureTiming(&log, timings, time.Second, false)
+	if !strings.Contains(log.String(), `"status":"error"`) {
+		t.Fatalf("failed operation lost timing status: %s", log.String())
+	}
+}
+
+func TestRunLogsCaptureTimingOnFailureWithoutPodIdentity(t *testing.T) {
+	t.Setenv("CONTAINERD_SOCKET", filepath.Join(t.TempDir(), "missing.sock"))
+	t.Setenv("KATA_SNAPSHOT_BLOB_ACCOUNT_URL", "")
+	t.Setenv("KATA_SNAPSHOT_BLOB_CONTAINER", "")
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	var output bytes.Buffer
+	err := Run(ctx, []string{
+		"kata-vmstate", "create", "--pod-name", "private-pod", "--pod-namespace", "tenant",
+		"--pod-uid", "private-uid", "--snapshot-name", testSnapshotName,
+		"--kata-ctl-path", DefaultKataCtlPath,
+	}, filepath.Join(t.TempDir(), "result"), &output)
+	if err == nil || !strings.Contains(output.String(), `"status":"error"`) {
+		t.Fatalf("failed capture did not emit timing status: %v, %s", err, output.String())
+	}
+	if strings.Contains(output.String(), "private-pod") || strings.Contains(output.String(), "private-uid") ||
+		strings.Contains(output.String(), testSnapshotName) {
+		t.Fatalf("capture timing leaked request metadata: %s", output.String())
 	}
 }
 

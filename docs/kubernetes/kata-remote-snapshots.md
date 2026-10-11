@@ -44,6 +44,20 @@ an init container of the Kata Pod. Concurrent prepares use a node-local lock;
 completed caches are verified and incomplete downloads are never published.
 The preparation Job remains owned by the restored BatchSandbox until deletion.
 
+## Capture timing logs
+
+The Azure image-committer's `kata-vmstate create` worker writes one
+`KATA_VMSTATE_TIMING=<JSON>` line to its Job logs on success or error. All values
+are milliseconds: `total_ms`, `containerd_connect_ms`, `source_lookup_ms`
+(containerd listing and exact source-Pod selection), `kata_ctl_snapshot_ms`
+(host `kata-ctl snapshot create`, including VM capture), `metadata_verify_ms`,
+`remote_upload_ms` (zero when Blob storage is not configured), and
+`result_write_ms`. `status` is `ok` or `error`. The phases do not necessarily
+sum to `total_ms`; validation, setup, cleanup, and log writing also take time.
+The log contains no Pod names, UIDs, snapshot paths, query credentials,
+process memory, or snapshot contents. The snapshot operation itself may need
+separate runtime tracing for a finer-grained breakdown.
+
 ## Scope and recovery
 
 This first version retains **same-node placement** and `durable: false` in the

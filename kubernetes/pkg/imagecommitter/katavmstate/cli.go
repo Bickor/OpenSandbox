@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	containerd "github.com/containerd/containerd"
 )
@@ -35,6 +36,12 @@ func Run(ctx context.Context, args []string, terminationMessagePath string, outp
 		return err
 	}
 	var result Result
+	var timings captureTimings
+	started := time.Now()
+	completed := false
+	if operation == "create" && output != nil {
+		defer func() { writeCaptureTiming(output, timings, time.Since(started), completed) }()
+	}
 	var store objectStore
 	account, container := os.Getenv("KATA_SNAPSHOT_BLOB_ACCOUNT_URL"), os.Getenv("KATA_SNAPSHOT_BLOB_CONTAINER")
 	if account != "" || container != "" {
@@ -73,31 +80,42 @@ func Run(ctx context.Context, args []string, terminationMessagePath string, outp
 			removeAll:    os.RemoveAll,
 		}).delete(snapshotName)
 	} else {
+		connectStart := time.Now()
 		client, clientErr := containerd.New(
 			containerdSocket(),
 			containerd.WithDefaultNamespace(containerdNamespace),
 		)
+		timings.containerdConnect = time.Since(connectStart)
 		if clientErr != nil {
 			return fmt.Errorf("connect to containerd: %w", clientErr)
 		}
 		defer client.Close()
-		result, err = newWorker(client).create(ctx, request)
+		w := newWorker(client)
+		w.timings = &timings
+		result, err = w.create(ctx, request)
 		if err == nil && store != nil {
+			uploadStart := time.Now()
 			root := filepath.Join(HostRoot, SnapshotRoot, request.SnapshotName)
 			plan, planErr := os.ReadFile("/restore-plan/pod-template.json")
 			if planErr != nil {
+				timings.remoteUpload = time.Since(uploadStart)
 				return fmt.Errorf("read private restore plan: %w", planErr)
 			}
 			if err := os.WriteFile(filepath.Join(root, restorePlanFile), plan, 0600); err != nil {
+				timings.remoteUpload = time.Since(uploadStart)
 				return err
 			}
 			result.KataVMState.ManifestDigest, err = uploadSnapshot(ctx, store, root, request.SnapshotName, result.KataVMState.RuntimeVersion)
+			timings.remoteUpload = time.Since(uploadStart)
 		}
 	}
 	if err != nil {
 		return err
 	}
-	if err := writeResult(terminationMessagePath, result); err != nil {
+	writeStart := time.Now()
+	err = writeResult(terminationMessagePath, result)
+	timings.resultWrite = time.Since(writeStart)
+	if err != nil {
 		return fmt.Errorf("write Kata VM state result: %w", err)
 	}
 	if output != nil {
@@ -106,6 +124,7 @@ func Run(ctx context.Context, args []string, terminationMessagePath string, outp
 			fmt.Fprintf(output, "KATA_VMSTATE_RUNTIME_VERSION=%s\n", result.KataVMState.RuntimeVersion)
 		}
 	}
+	completed = true
 	return nil
 }
 
@@ -145,6 +164,35 @@ func parseArgs(args []string) (string, createRequest, string, error) {
 	default:
 		return "", createRequest{}, "", fmt.Errorf("unsupported kata-vmstate operation %q", args[1])
 	}
+}
+
+// writeCaptureTiming emits a single metadata-only record; durations include
+// failed phases, and zero means a phase did not run or took less than 1 ms.
+func writeCaptureTiming(output io.Writer, timings captureTimings, total time.Duration, completed bool) {
+	status := "error"
+	if completed {
+		status = "ok"
+	}
+	record := struct {
+		Operation           string `json:"operation"`
+		Status              string `json:"status"`
+		TotalMS             int64  `json:"total_ms"`
+		ContainerdConnectMS int64  `json:"containerd_connect_ms"`
+		SourceLookupMS      int64  `json:"source_lookup_ms"`
+		KataCTLSnapshotMS   int64  `json:"kata_ctl_snapshot_ms"`
+		MetadataVerifyMS    int64  `json:"metadata_verify_ms"`
+		RemoteUploadMS      int64  `json:"remote_upload_ms"`
+		ResultWriteMS       int64  `json:"result_write_ms"`
+	}{"create", status, total.Milliseconds(), timings.containerdConnect.Milliseconds(),
+		timings.sourceLookup.Milliseconds(), timings.snapshotCreate.Milliseconds(),
+		timings.metadataVerify.Milliseconds(), timings.remoteUpload.Milliseconds(),
+		timings.resultWrite.Milliseconds()}
+	data, err := json.Marshal(record)
+	if err != nil {
+		fmt.Fprintf(output, "KATA_VMSTATE_TIMING_ERROR=%v\n", err)
+		return
+	}
+	fmt.Fprintf(output, "KATA_VMSTATE_TIMING=%s\n", data)
 }
 
 func writeResult(path string, result Result) error {
