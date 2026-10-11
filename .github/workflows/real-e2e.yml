@@ -13,7 +13,6 @@ on:
         type: boolean
         default: false
   pull_request:
-    branches: [ main ]
   push:
     branches: [ main ]
 
@@ -31,7 +30,7 @@ jobs:
     name: Python E2E (docker bridge)
     needs: changes
     if: needs.changes.outputs.relevant == 'true'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     env:
       RUN_CODE_INTERPRETER_E2E: ${{ github.event_name == 'workflow_dispatch' && inputs.run_code_interpreter_e2e == true && 'true' || 'false' }}
     steps:
@@ -263,7 +262,7 @@ jobs:
     name: Java E2E (docker bridge)
     needs: changes
     if: needs.changes.outputs.relevant == 'true'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     env:
       RUN_CODE_INTERPRETER_E2E: ${{ github.event_name == 'workflow_dispatch' && inputs.run_code_interpreter_e2e == true && 'true' || 'false' }}
     steps:
@@ -383,7 +382,7 @@ jobs:
     name: JavaScript E2E (docker bridge)
     needs: changes
     if: needs.changes.outputs.relevant == 'true'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     env:
       RUN_CODE_INTERPRETER_E2E: ${{ github.event_name == 'workflow_dispatch' && inputs.run_code_interpreter_e2e == true && 'true' || 'false' }}
     steps:
@@ -492,7 +491,7 @@ jobs:
     name: C# E2E (docker bridge)
     needs: changes
     if: needs.changes.outputs.relevant == 'true'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     env:
       RUN_CODE_INTERPRETER_E2E: ${{ github.event_name == 'workflow_dispatch' && inputs.run_code_interpreter_e2e == true && 'true' || 'false' }}
     steps:
@@ -586,7 +585,7 @@ jobs:
     name: Go E2E (docker bridge)
     needs: changes
     if: needs.changes.outputs.relevant == 'true'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     env:
       RUN_CODE_INTERPRETER_E2E: ${{ github.event_name == 'workflow_dispatch' && inputs.run_code_interpreter_e2e == true && 'true' || 'false' }}
     steps:
@@ -681,7 +680,7 @@ jobs:
 
   required:
     name: Real E2E CI
-    if: ${{ always() && github.event_name == 'pull_request' }}
+    if: always()
     needs: [changes, python-e2e, java-e2e, javascript-e2e, csharp-e2e, go-e2e]
     runs-on: ubuntu-latest
     steps:
