@@ -16,7 +16,7 @@ name: SDK Tests
 
 on:
   pull_request:
-    branches: [main]
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
@@ -344,7 +344,7 @@ jobs:
 
   required:
     name: SDK CI
-    if: ${{ always() && github.event_name == 'pull_request' }}
+    if: always()
     needs:
       - changes
       - cli-quality
