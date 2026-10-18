@@ -35,6 +35,12 @@ The preparation Job remains owned by the restored BatchSandbox until deletion.
 
 ## Scope and recovery
 
+The server reports `Creating` while a local snapshot worker is queued or running.
+Reads and runtime events do not infer failure from a controller object that the
+worker has not created yet. After the worker finishes, reads converge against
+controller status. Explicit worker failures still report `Failed`. Startup
+recovery still detects missing artifacts when no local worker owns the operation.
+
 This first version retains **same-node placement** and `durable: false` in the
 public restore constraints: artifact persistence does not yet guarantee recovery
 after losing the node or cluster catalog. The original node must remain Ready.

@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
+from threading import Event, Thread
 from types import SimpleNamespace
 import time
 
@@ -442,6 +443,115 @@ class WatchableStubSnapshotRuntime(StubSnapshotRuntime):
 
     def close(self) -> None:
         self.closed = True
+
+
+@pytest.mark.parametrize("worker_running", [False, True])
+def test_snapshot_reads_do_not_fail_before_worker_publishes_artifact(
+    tmp_path, worker_running
+) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    runtime = WatchableStubSnapshotRuntime()
+    executor = CapturingExecutor()
+    service = PersistedSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        snapshot_executor=executor,
+    )
+    started, release = Event(), Event()
+    worker = None
+
+    def create_artifact(snapshot_id, sandbox_id, *, namespace=None, format=None):
+        started.set()
+        assert release.wait(5), "test did not release the snapshot worker"
+        runtime.inspect_status_by_snapshot_id[snapshot_id] = SnapshotRuntimeStatus(
+            state=SnapshotState.READY, reason="controller_ready", image="snapshot-image"
+        )
+        return SnapshotRuntimeStatus(state=SnapshotState.CREATING)
+
+    runtime.create_snapshot = create_artifact
+    created = service.create_snapshot("sbx-001", CreateSnapshotRequest(name=None, format=None))
+    runtime.inspect_status_by_snapshot_id[created.id] = SnapshotRuntimeStatus(
+        state=SnapshotState.FAILED, reason="snapshot_recovery_missing_snapshot"
+    )
+    fn, args, kwargs = executor.submitted[0]
+    assert callable(fn)
+    try:
+        if worker_running:
+            worker = Thread(target=fn, args=args, kwargs=kwargs)
+            worker.start()
+            assert started.wait(5), "snapshot worker did not start"
+        assert service.get_snapshot(created.id).status.state == "Creating"
+        listed = service.list_snapshots(ListSnapshotsRequest(pagination=None))
+        assert listed.items[0].status.state == "Creating"
+        service._on_runtime_change(created.id, "default")
+        stored = repo.get(created.id)
+        assert stored is not None
+        assert stored.status.state == SnapshotState.CREATING
+    finally:
+        release.set()
+        if worker is not None:
+            worker.join(5)
+            assert not worker.is_alive()
+        else:
+            fn(*args, **kwargs)
+
+    assert service.get_snapshot(created.id).status.state == "Ready"
+    assert not service._inflight_snapshot_ids
+
+
+def test_snapshot_row_publication_and_worker_registration_are_atomic(tmp_path, monkeypatch) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    runtime = WatchableStubSnapshotRuntime()
+    service = PersistedSnapshotService(
+        repo, StubSandboxService(), snapshot_runtime=runtime, snapshot_executor=CapturingExecutor()
+    )
+    published, reading, release = Event(), Event(), Event()
+    persisted: list[SnapshotRecord] = []
+    create = repo.create
+    converge = service._converge_from_runtime
+
+    def publish_then_pause(record: SnapshotRecord) -> None:
+        create(record)
+        runtime.inspect_status_by_snapshot_id[record.id] = SnapshotRuntimeStatus(
+            state=SnapshotState.FAILED, reason="snapshot_recovery_missing_snapshot"
+        )
+        persisted.append(record)
+        published.set()
+        assert release.wait(5), "test did not release row publication"
+
+    def observe(record: SnapshotRecord) -> bool:
+        reading.set()
+        return converge(record)
+
+    monkeypatch.setattr(repo, "create", publish_then_pause)
+    monkeypatch.setattr(service, "_converge_from_runtime", observe)
+    with ThreadPoolExecutor(max_workers=2) as requests:
+        creating = requests.submit(
+            service.create_snapshot, "sbx-001", CreateSnapshotRequest(name=None, format=None)
+        )
+        try:
+            assert published.wait(5), "snapshot row was not published"
+            fetching = requests.submit(service.get_snapshot, persisted[0].id)
+            assert reading.wait(5), "reader did not reach convergence"
+        finally:
+            release.set()
+        assert creating.result(timeout=5).status.state == "Creating"
+        assert fetching.result(timeout=5).status.state == "Creating"
+
+
+def test_snapshot_without_local_worker_still_converges_to_missing_artifact_failure(tmp_path) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    runtime = WatchableStubSnapshotRuntime()
+    service = PersistedSnapshotService(
+        repo,
+        StubSandboxService(),
+        snapshot_runtime=runtime,
+        snapshot_executor=CapturingExecutor(),
+    )
+    record = _snapshot_record("snap-orphan", SnapshotState.CREATING)
+    repo.create(record)
+    assert service.get_snapshot(record.id).status.state == "Failed"
 
 
 def test_get_snapshot_converges_creating_row_from_runtime(tmp_path) -> None:
