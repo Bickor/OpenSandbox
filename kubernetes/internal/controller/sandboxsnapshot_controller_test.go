@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -487,7 +487,7 @@ func TestBuildCommitJob_SetsBoundedBackoffLimit(t *testing.T) {
 	r := newTestSnapshotReconciler(snapshot)
 	r.SnapshotPushSecret = "registry-snapshot-push-secret"
 
-	job, err := r.buildCommitJob(snapshot, "")
+	job, err := r.buildCommitJob(snapshot, "", "")
 	require.NoError(t, err)
 	require.NotNil(t, job.Spec.BackoffLimit)
 	assert.Equal(t, DefaultCommitJobBackoffLimit, *job.Spec.BackoffLimit)
@@ -543,7 +543,7 @@ func TestBuildCommitJob_ExecutesImageCommitterDirectlyWithIsolatedArgs(t *testin
 		},
 	}
 
-	job, err := r.buildCommitJob(snapshot, "source-pod-uid")
+	job, err := r.buildCommitJob(snapshot, "source-pod-uid", "")
 	require.NoError(t, err)
 	require.Len(t, job.Spec.Template.Spec.Containers, 2)
 
@@ -624,7 +624,7 @@ func TestBuildCommitJob_QEMUUsesStructuredRequestAndWorkVolume(t *testing.T) {
 		},
 	}
 
-	job, err := r.buildCommitJob(snapshotObject, "source-pod-uid", contract)
+	job, err := r.buildCommitJob(snapshotObject, "source-pod-uid", "registry.example/snapshots/test-sandbox-vmstate:snap-123", contract)
 	require.NoError(t, err)
 	assert.True(t, job.Spec.Template.Spec.HostPID)
 	container := job.Spec.Template.Spec.Containers[0]
@@ -684,7 +684,7 @@ func TestBuildCommitJob_InternalQEMUSnapshotLeavesSourceFrozen(t *testing.T) {
 		},
 	}
 
-	job, err := r.buildCommitJob(snapshotObject, "source-pod-uid", contract)
+	job, err := r.buildCommitJob(snapshotObject, "source-pod-uid", "registry.example/snapshots/test-sandbox-vmstate:snap-123", contract)
 	require.NoError(t, err)
 	requestData, err := base64.StdEncoding.DecodeString(job.Spec.Template.Spec.Containers[0].Args[2])
 	require.NoError(t, err)
@@ -954,7 +954,7 @@ func TestBuildCommitJob_KataUsesPrivilegedSameNodeHostWorker(t *testing.T) {
 	r.ImageCommitterImage = "image-committer-azure:test"
 	r.HostKataCtlPath = "/opt/custom/kata-ctl"
 
-	job, err := r.buildCommitJob(snapshotObject, "source-pod-uid")
+	job, err := r.buildCommitJob(snapshotObject, "source-pod-uid", "")
 	require.NoError(t, err)
 	assert.Equal(t, "node-a", job.Spec.Template.Spec.NodeName)
 	assert.False(t, job.Spec.Template.Spec.HostPID)
@@ -998,7 +998,7 @@ func TestBuildCommitJob_KataRejectsUnsafeHostKataCtlPath(t *testing.T) {
 	}
 	r := newTestSnapshotReconciler(snapshotObject)
 	r.HostKataCtlPath = "../kata-ctl"
-	_, err := r.buildCommitJob(snapshotObject, "source-pod-uid")
+	_, err := r.buildCommitJob(snapshotObject, "source-pod-uid", "")
 	require.ErrorContains(t, err, "clean absolute path")
 }
 

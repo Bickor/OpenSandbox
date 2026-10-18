@@ -21,9 +21,12 @@ This file tracks AKS-specific changes carried by the `aks-dev` branch relative t
 
 ## Unreleased
 
+- Synced `bahe-msft/OpenSandbox:aks-dev` through `798f9d60`, retaining Kata VM-state snapshots, remote Azure Blob artifacts, and fork release automation.
 - Added the opt-in `kata-vmstate-v1` public snapshot backend for
   `kata-vm-isolation-v2`, including same-node VM-state capture and restore,
   node-local cleanup, lifecycle API format selection, and SDK metadata.
+- [`3dca2fe`](https://github.com/opensandbox-group/OpenSandbox/commit/3dca2fe0c633ac80c7accef66b5e17e6e3970c0e) — Synced `upstream/main`, adapted rotating credential providers to transactional vault snapshots, and moved AKS activity and ACR documentation to the new upstream pages.
+- Aligned AKS egress image publishing with upstream's pinned HTTP/2 dependencies and bundled `egress-trace` tool.
 
 ## aksdev/20260918-1
 

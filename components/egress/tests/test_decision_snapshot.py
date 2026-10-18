@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -120,6 +120,22 @@ class DecisionSnapshotTest(unittest.TestCase):
             "redactions": [],
         }
         self.assertIsNone(decision.validate(self.snapshot(empty, vault=0, policy=0)))
+
+    def test_accepts_unresolved_dynamic_bindings_without_credentials(self):
+        candidate = self.active()
+        dynamic = binding("dynamic", ["https"], ["api.example.com"])
+        dynamic["dynamic"] = True
+        candidate["fullRenderedBindings"] = [dynamic]
+        candidate["tlsBindingHostSelectors"] = ["api.example.com"]
+        candidate["redactions"] = []
+        self.assertIsNone(decision.validate(self.snapshot(candidate)))
+        for invalid in (False, 1, "true"):
+            dynamic["dynamic"] = invalid
+            self.assert_rejected(candidate)
+        dynamic["dynamic"] = True
+        dynamic["headers"] = [{"name": "Private-Token", "value": "never-log-me"}]
+        candidate["redactions"] = ["never-log-me"]
+        self.assert_rejected(candidate)
 
     def test_rejects_schema_identity_and_derived_state_mismatches(self):
         cases = []

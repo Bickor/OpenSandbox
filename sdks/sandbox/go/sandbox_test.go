@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,16 +24,6 @@ import (
 	"testing"
 	"time"
 )
-
-func TestSandbox_Close(t *testing.T) {
-	sb := &Sandbox{id: "sbx-close"}
-	require.NoError(t, sb.Close(), "Close should return nil")
-}
-
-func TestSandboxManager_Close(t *testing.T) {
-	mgr := &SandboxManager{}
-	require.NoError(t, mgr.Close(), "Close should return nil")
-}
 
 func TestCreateSandbox_ForwardsLifecycle(t *testing.T) {
 	timeout := 300
@@ -157,8 +147,6 @@ func TestCreateSandbox_FullStateRestoreWireBody(t *testing.T) {
 		})
 	}
 }
-
-func intPtr(value int) *int { return &value }
 
 func TestSandbox_Kill(t *testing.T) {
 	var (

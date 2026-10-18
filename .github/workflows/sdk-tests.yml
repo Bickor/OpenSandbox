@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -290,6 +290,18 @@ jobs:
             --logger "trx;LogFileName=test-results.trx" \
             --results-directory TestResults \
             --collect:"XPlat Code Coverage"
+
+      # The transfer-deadline tests run a second time against the netstandard2.0 asset of the
+      # SDK, so the compile-time branches that only exist below .NET 5 are covered in CI.
+      - name: Run netstandard2.0 compatibility tests
+        if: matrix.package_name == 'sandbox'
+        working-directory: ${{ matrix.package_dir }}
+        run: |
+          dotnet test tests/OpenSandbox.NetStandardCompat.Tests/OpenSandbox.NetStandardCompat.Tests.csproj \
+            --configuration Release \
+            --no-build \
+            --logger "trx;LogFileName=netstandard2.0-results.trx" \
+            --results-directory TestResults
 
       - name: Upload C# reports
         if: always()

@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -241,6 +241,7 @@ export class SandboxPool {
   private createSemaphore: AsyncSemaphore;
   private postCreateSemaphore: AsyncSemaphore;
   private readonly tracer: PoolTracer;
+  private warmupCreateConfig?: ConnectionConfig;
 
   private constructor(options: SandboxPoolOptions) {
     const poolName = options.poolName?.trim();
@@ -766,6 +767,11 @@ export class SandboxPool {
         releaseCreate();
       }
       const warmupReadinessDeadline = performance.now() + this.options.warmupReadyTimeoutSeconds * 1_000;
+      // Decide the final attempt before sleeping, as Kotlin does: the delay timer can fire slightly
+      // before performance.now() reaches the deadline. Compare in seconds, because 2.007 * 1_000 is
+      // 2007.0000000000002 and a millisecond comparison would miss equal settings.
+      const warmupFinalAttemptOnly =
+        this.options.warmupHealthCheckInitialDelayMillis / 1_000 >= this.options.warmupReadyTimeoutSeconds;
       if (!this.options.warmupSkipHealthCheck && this.options.warmupHealthCheckInitialDelayMillis > 0) {
         await sleep(
           Math.min(
@@ -782,6 +788,7 @@ export class SandboxPool {
             await this.waitUntilWarmupHealthy(
               sandbox!,
               warmupReadinessDeadline,
+              warmupFinalAttemptOnly,
               postCreateSemaphore,
               lease,
               signal,
@@ -858,9 +865,13 @@ export class SandboxPool {
     signal?: AbortSignal,
     injectTraceContext = false,
   ): Promise<Sandbox> {
+    const baseCreateConfig =
+      reason === PooledSandboxCreateReason.WARMUP
+        ? (this.warmupCreateConfig ??= this.options.connectionConfig.withCreateMetricsDisabled())
+        : this.options.connectionConfig;
     const createConnectionConfig = injectTraceContext
-      ? this.tracer.createConnectionConfig(this.options.connectionConfig)
-      : this.options.connectionConfig;
+      ? this.tracer.createConnectionConfig(baseCreateConfig)
+      : baseCreateConfig;
     if (this.options.sandboxCreator) {
       return await this.options.sandboxCreator({
         poolName: this.options.poolName,
@@ -964,12 +975,13 @@ export class SandboxPool {
   private async waitUntilWarmupHealthy(
     sandbox: Sandbox,
     deadline: number,
+    finalAttemptOnly: boolean,
     semaphore: AsyncSemaphore,
     lease: AsyncSemaphoreLease,
     signal?: AbortSignal,
   ): Promise<void> {
     const remainingMillis = deadline - performance.now();
-    if (remainingMillis > 0) {
+    if (!finalAttemptOnly && remainingMillis > 0) {
       await this.waitUntilHealthyWithSemaphore(
         sandbox,
         this.options.warmupHealthCheck ?? ((current) => current.isHealthy()),

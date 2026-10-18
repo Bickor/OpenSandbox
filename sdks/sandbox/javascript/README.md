@@ -27,7 +27,7 @@ yarn add @alibaba-group/opensandbox
 
 The following example shows how to create a sandbox and execute a shell command.
 
-> **Note**: Before running this example, ensure the OpenSandbox service is running. See the root [README.md](../../../README.md) for startup instructions.
+> **Note**: Before running this example, ensure the OpenSandbox service is running. See the root [README](https://github.com/opensandbox-group/OpenSandbox#readme) for startup instructions.
 
 ```ts
 import { ConnectionConfig, Sandbox, SandboxException } from "@alibaba-group/opensandbox";
@@ -356,17 +356,28 @@ The `ConnectionConfig` class manages API server connection settings.
 Runtime notes:
 
 - In browsers, the SDK uses the global `fetch` implementation.
-- In Node.js, every `Sandbox` and `SandboxManager` clones the base `ConnectionConfig` via `withTransportIfMissing()`, so each instance gets an isolated `undici` keep-alive pool. Call `sandbox.close()` or `manager.close()` when you are done so the SDK can release the associated agent.
+- `requestTimeoutSeconds` bounds the wait for a response: it stops applying once
+  the response headers arrive (streaming responses are not cut off). It never
+  caps a healthy file upload body, which can legitimately take longer than the
+  timeout; on Node.js a stalled upload, or an upload that gets no response
+  headers within the timeout once the body has been sent, is aborted instead of
+  hanging (the Go SDK's `ResponseHeaderTimeout` contract).
+- In Node.js, every `Sandbox` and `SandboxManager` gets its own transport via `withTransportIfMissing()` unless you pass an already-initialized `ConnectionConfig`; shared configs are reused, and the SDK only closes transports it allocated itself. Call `sandbox.close()` or `manager.close()` when you are done so the SDK can release the agent it owns.
 
 | Parameter               | Description                                                                                                  | Default          | Environment Variable   |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------ | ---------------- | ---------------------- |
 | `apiKey`                | API key for authentication                                                                                   | Optional         | `OPEN_SANDBOX_API_KEY` |
-| `domain`                | Sandbox service domain (`host[:port]`)                                                                       | `localhost:8080` | `OPEN_SANDBOX_DOMAIN`  |
+| `domain`                | Sandbox service domain (`host[:port]`), or a full base URL including a path prefix (e.g. `https://gw.example.com/opensandbox`) | `localhost:8080` | `OPEN_SANDBOX_DOMAIN`  |
 | `protocol`              | HTTP protocol (`http`/`https`)                                                                               | `http`           | -                      |
 | `requestTimeoutSeconds` | Request timeout applied to SDK HTTP calls                                                                    | `30`             | -                      |
 | `debug`                 | Enable basic HTTP debug logging                                                                              | `false`          | -                      |
 | `headers`               | Extra headers applied to every request                                                                       | `{}`             | -                      |
 | `useServerProxy`        | Use sandbox server as proxy for execd/endpoint requests (e.g. when client cannot reach the sandbox directly) | `false`          | -                      |
+| `endpointCacheTtlMs`    | How long a cached sandbox endpoint stays valid                                                               | `600000`         | -                      |
+| `endpointCacheSize`     | Maximum number of cached endpoints                                                                           | `1024`           | -                      |
+| `endpointCacheDisabled` | Disable endpoint caching entirely                                                                            | `false`          | -                      |
+| `disableMetrics`        | Opt out of create-latency telemetry                                                                          | `false`          | `OPENSANDBOX_DISABLE_METRICS=1` |
+| `enableTracing`         | Emit pool trace context headers                                                                              | `false`          | -                      |
 
 ```ts
 import { ConnectionConfig } from "@alibaba-group/opensandbox";
@@ -475,7 +486,7 @@ await sandbox.credentialVault.create({
 });
 ```
 
-See [Credential Vault](../../../docs/guides/credential-vault.md) for auth types,
+See [Credential Vault](https://github.com/opensandbox-group/OpenSandbox/blob/main/docs/guides/credential-vault.md) for auth types,
 binding guidance, and Git/curl examples.
 
 ### 5. Resource cleanup

@@ -28,10 +28,15 @@ T = TypeVar("T", bound="InlineCredentialSource")
 
 @_attrs_define
 class InlineCredentialSource:
-    """
-    Attributes:
-        type_ (InlineCredentialSourceType):
-        value (str):
+    """Credential source envelope. For `type: inline`,
+    `value` is write-only credential material. For `type: plugin`, `value`
+    selects a trusted provider executable basename installed in the egress
+    credential-provider directory. Callers cannot provide executable paths
+    or arguments.
+
+        Attributes:
+            type_ (InlineCredentialSourceType):
+            value (str):
     """
 
     type_: InlineCredentialSourceType

@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ import hmac
 import logging
 from collections.abc import AsyncIterator, Mapping
 from typing import Optional
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import anyio
 import httpx
@@ -62,6 +62,22 @@ SERVER_GENERATED_RESPONSE_HEADERS = {
     "server",
 }
 
+# OSEP-0009 per-request opt-out, mirroring ingress pkg/proxy/header.go.
+# Exact sentinel only; unknown values are ignored (forward compatible).
+ACCESS_RENEW_HEADER = "opensandbox-access-renew"  # "OpenSandbox-Access-Renew"
+ACCESS_RENEW_SKIP_VALUE = "skip"
+
+# OSEP-0024 activity-probe sentinel; the sweeper is the only issuer.
+# Stripped on this hop so a proxy-path client cannot suppress recording at
+# the ingress.
+SKIP_ACTIVITY_HEADER = "opensandbox-skip-activity"  # "OpenSandbox-Skip-Activity"
+
+# Hop-control headers consumed by the proxy itself; never forwarded upstream.
+PROXY_CONTROL_HEADERS = {
+    ACCESS_RENEW_HEADER,
+    SKIP_ACTIVITY_HEADER,
+}
+
 SENSITIVE_HEADERS = {
     "authorization",
     "cookie",
@@ -99,9 +115,10 @@ def _build_proxy_target_url(
 ) -> str:
     """Build the backend URL from an endpoint plus optional path/query suffix.
 
-    The raw query is appended as-is for both HTTP and WebSocket. Passing it to httpx
-    via ``params=`` would re-serialize it: repeated keys get regrouped, valueless keys
-    gain ``=``, non-UTF-8 escapes become U+FFFD and ``%20`` turns into ``+``.
+    ``full_path`` must already be percent-encoded. The raw query is appended as-is
+    for both HTTP and WebSocket. Passing it to httpx via ``params=`` would
+    re-serialize it: repeated keys get regrouped, valueless keys gain ``=``,
+    non-UTF-8 escapes become U+FFFD and ``%20`` turns into ``+``.
     """
     scheme = "ws" if websocket else "http"
     base = endpoint.endpoint.rstrip("/")
@@ -111,7 +128,25 @@ def _build_proxy_target_url(
         url = f"{url}/{normalized_path}"
     if query_string:
         url = f"{url}?{query_string}"
-    return url
+    # uvicorn can pass a literal '#' through; httpx drops the fragment and the
+    # websockets client rejects it. A '#' in the path also drops the query.
+    return url.partition("#")[0]
+
+
+def _raw_path_suffix(scope: Scope, full_path: str) -> str:
+    """Return the client's still-encoded form of the decoded ``full_path`` match.
+
+    Starlette binds ``{full_path:path}`` from the decoded path, where ``%2F``,
+    ``%3F``, ``%23`` and ``%25`` are indistinguishable from ``/ ? # %``. The
+    raw tail after as many ``/`` as precede the match is used only if it decodes
+    back to ``full_path``; an encoded ``/`` earlier in the path shifts it and
+    falls back to re-encoding the decoded value.
+    """
+    path: str = scope["path"]
+    depth = path[: len(path) - len(full_path)].count("/")
+    raw_path: bytes = scope.get("raw_path") or b""
+    raw_suffix = raw_path.decode("latin-1").split("/", depth)[-1]
+    return raw_suffix if unquote(raw_suffix) == full_path else quote(full_path)
 
 
 def _filter_proxy_headers(
@@ -131,7 +166,9 @@ def _filter_proxy_headers(
     (e.g. ``/networkpolicy``) rather than from the external ``/proxy/{port}``
     path, so egress-auth credentials resolved from the endpoint are preserved.
     """
-    excluded = set(HOP_BY_HOP_HEADERS) | set(SENSITIVE_HEADERS) | set(FORWARDED_HEADERS)
+    excluded = (
+        set(HOP_BY_HOP_HEADERS) | set(SENSITIVE_HEADERS) | set(FORWARDED_HEADERS) | PROXY_CONTROL_HEADERS
+    )
     if extra_excluded:
         excluded.update(extra_excluded)
     if connection_header:
@@ -212,6 +249,8 @@ def _rewrite_proxy_location(
 
 
 def _schedule_proxy_renew(request: Request | WebSocket, sandbox_id: str) -> None:
+    if request.headers.get(ACCESS_RENEW_HEADER, "") == ACCESS_RENEW_SKIP_VALUE:
+        return
     proxy_renew = getattr(request.app.state, "proxy_renew_coordinator", None)
     if proxy_renew is not None:
         proxy_renew.schedule(sandbox_id)
@@ -344,7 +383,7 @@ async def _proxy_http_request(
     )
     _verify_secure_access(endpoint, request.headers)
     _schedule_proxy_renew(request, sandbox_id)
-    query_string = request.url.query
+    query_string = request.scope.get("query_string", b"").decode()
     target_url = _build_proxy_target_url(endpoint, full_path, query_string, websocket=False)
     client: httpx.AsyncClient = request.app.state.http_client
 
@@ -414,7 +453,23 @@ async def _proxy_http_request(
             status_code=502,
             detail={
                 "code": "BACKEND_CONNECTION_FAILED",
-                "message": f"Could not connect to the backend sandbox {endpoint}: {e}",
+                "message": f"Could not connect to the backend sandbox {endpoint.endpoint}: {e}",
+            },
+        ) from e
+    except (httpx.ReadTimeout, httpx.WriteTimeout) as e:
+        raise HTTPException(
+            status_code=504,
+            detail={
+                "code": "BACKEND_TIMEOUT",
+                "message": f"The backend sandbox {endpoint.endpoint} did not respond in time: {e}",
+            },
+        ) from e
+    except (httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError) as e:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "BACKEND_RESPONSE_FAILED",
+                "message": f"The backend sandbox {endpoint.endpoint} dropped the connection or sent an invalid response: {e}",
             },
         ) from e
     except HTTPException:
@@ -561,7 +616,7 @@ async def _proxy_websocket_request(
         return
 
     _schedule_proxy_renew(websocket, sandbox_id)
-    query_string = websocket.url.query or ""
+    query_string = websocket.scope.get("query_string", b"").decode()
     target_url = _build_proxy_target_url(
         endpoint,
         full_path,
@@ -637,7 +692,9 @@ async def proxy_sandbox_endpoint_request(
     full_path: str,
 ):
     """Proxy HTTP requests to sandbox-backed services."""
-    return await _proxy_http_request(request, sandbox_id, port, full_path)
+    return await _proxy_http_request(
+        request, sandbox_id, port, _raw_path_suffix(request.scope, full_path)
+    )
 
 
 _PROXY_HTTP_METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH")
@@ -712,4 +769,6 @@ async def proxy_sandbox_endpoint_request_websocket(
     full_path: str,
 ):
     """Proxy WebSocket connections to sandbox-backed services."""
-    await _proxy_websocket_request(websocket, sandbox_id, port, full_path)
+    await _proxy_websocket_request(
+        websocket, sandbox_id, port, _raw_path_suffix(websocket.scope, full_path)
+    )

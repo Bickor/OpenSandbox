@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -103,6 +103,9 @@ const (
 
 	dohBlockV4Set = "doh_block_v4"
 	dohBlockV6Set = "doh_block_v6"
+
+	upstreamProxyV4Set = "upstream_proxy_v4"
+	upstreamProxyV6Set = "upstream_proxy_v6"
 )
 
 // Runner executes an nft script; the default invokes `nft -f -`.
@@ -142,6 +145,18 @@ type Options struct {
 	// executes the same policy on it using the conntrack ORIGINAL
 	// destination. 0 disables the input chain entirely (no MITM).
 	MitmRedirectPort int
+	// UpstreamProxy, when set, drops the chained upstream CONNECT proxy
+	// endpoint for EVERY subject profile-wide (forward and — with MITM —
+	// input path), ahead of the per-subject chains. The mitmdump dial is
+	// locally generated and never policed by this table (the profile
+	// installs no OUTPUT enforcement), so no accept-side exception is
+	// needed; the drop is the source-IP-model equivalent of the sidecar
+	// profile's uid-scoped upstream rules.
+	UpstreamProxy *UpstreamProxyEndpoint
+	// PortFloorDenyRanges carries the platform port cap (reachable.ports.cap
+	// complement), enforced profile-wide in the master chains. User
+	// port-scoped rules never reach this profile (#2213).
+	PortFloorDenyRanges []policy.PortRange
 }
 
 // installedSubject tracks the enforcement state the applier owns in memory;
@@ -169,6 +184,20 @@ type Applier struct {
 	conntrack  func(context.Context) ([]conntrackEntry, error) // injectable for tests
 	now        func() time.Time                                // injectable for tests
 	sandboxMir func(context.Context, subject.Subject, []nftables.ResolvedIP) error
+
+	// upstreamIPs mirrors the DNS-learned upstream-proxy drop-set elements
+	// and counts successful refreshes missing each address. Elements are
+	// permanent; SyncUpstreamProxyIPs owns expiry, not kernel timeouts. Rebuilds
+	// (subject removal, startup reset) re-seed them deterministically
+	// instead of losing the hostname containment until the next refresh
+	// tick. Literal endpoints are not mirrored: they are re-emitted from
+	// Options on every rebuild.
+	upstreamIPs map[netip.Addr]uint8
+
+	// upstreamSeedTimeout bounds the first-seed retry window of
+	// SeedUpstreamProxyIPs (injectable for tests). Past it the caller
+	// fails startup: fail closed, like every other initialization step.
+	upstreamSeedTimeout time.Duration
 }
 
 // NewApplier returns an Applier using r (nil selects DefaultRunner). Pass
@@ -178,11 +207,13 @@ func NewApplier(r Runner, opts ...Options) *Applier {
 		r = DefaultRunner
 	}
 	a := &Applier{
-		run:       r,
-		subjects:  make(map[subject.Subject]installedSubject),
-		states:    make(map[subject.Subject]*refreshState),
-		conntrack: readConntrack,
-		now:       time.Now,
+		run:                 r,
+		subjects:            make(map[subject.Subject]installedSubject),
+		states:              make(map[subject.Subject]*refreshState),
+		upstreamIPs:         make(map[netip.Addr]uint8),
+		upstreamSeedTimeout: upstreamProxySeedTimeout,
+		conntrack:           readConntrack,
+		now:                 time.Now,
 	}
 	if len(opts) > 0 {
 		a.opts = opts[0]
@@ -307,6 +338,19 @@ func (a *Applier) ApplyPolicy(ctx context.Context, s subject.Subject, pol *polic
 	if pol == nil {
 		pol = policy.DefaultDenyPolicy()
 	}
+	// User port-scoped rules (Ports) would be silently dropped by the fast
+	// path — a deny rule that stops denying is fail-open — so refuse the
+	// apply. PortRanges-only rules are the platform floor, enforced in the
+	// master chains, and are exempt.
+	blocked := 0
+	for _, r := range pol.Egress {
+		if len(r.Ports) > 0 {
+			blocked++
+		}
+	}
+	if blocked > 0 {
+		return fmt.Errorf("fastsandboxnft: subject policy carries %d port-scoped rule(s), which the fast path cannot enforce", blocked)
+	}
 	var b strings.Builder
 	if err := writeSubjectPolicySwapFragment(&b, s, pol, a.opts.MitmRedirectPort); err != nil {
 		return err
@@ -377,26 +421,15 @@ func (a *Applier) trackDynamicIPs(s subject.Subject, ips []nftables.ResolvedIP) 
 // is fine at the target density (removals are rare). Removing the last
 // subject swaps in the empty master drop chain (fail-closed, never a bare
 // table).
+//
+// The in-memory state mutates only AFTER the transaction commits: a failed
+// removal must stay retryable, since a subject forgotten from the map while
+// its kernel rules survive would turn the retry into a no-op that leaves the
+// stale same-IP dispatch rule first-match ahead of any successor.
 func (a *Applier) Remove(ctx context.Context, s subject.Subject) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if _, ok := a.subjects[s]; !ok {
-		return nil
-	}
-	delete(a.subjects, s)
-	delete(a.states, s)
-	if len(a.subjects) == 0 {
-		var b strings.Builder
-		if err := a.writeTableHeader(&b); err != nil {
-			return err
-		}
-		if err := a.applyWithMissingTableFallback(ctx, b.String()); err != nil {
-			telemetry.RecordNftablesUpdateFailed(telemetry.NftOpRemove)
-			return err
-		}
-		a.tableReady = true
-		a.recordRuleCountLocked()
-		telemetry.RecordNftablesUpdate()
 		return nil
 	}
 	var b strings.Builder
@@ -404,6 +437,9 @@ func (a *Applier) Remove(ctx context.Context, s subject.Subject) error {
 		return err
 	}
 	for subj, inst := range a.subjects {
+		if subj == s {
+			continue
+		}
 		var err error
 		if inst.pol == nil {
 			err = writeSubjectDenyFirstFragment(&b, subj, inst.att, a.opts.MitmRedirectPort)
@@ -414,10 +450,12 @@ func (a *Applier) Remove(ctx context.Context, s subject.Subject) error {
 			return err
 		}
 	}
-	if _, err := a.run(ctx, b.String()); err != nil {
+	if err := a.applyWithMissingTableFallback(ctx, b.String()); err != nil {
 		telemetry.RecordNftablesUpdateFailed(telemetry.NftOpRemove)
 		return err
 	}
+	delete(a.subjects, s)
+	delete(a.states, s)
 	a.tableReady = true
 	a.recordRuleCountLocked()
 	telemetry.RecordNftablesUpdate()
@@ -467,6 +505,9 @@ func (a *Applier) writeTableHeader(b *strings.Builder) error {
 		TableName, markChain, markPriority)
 	fmt.Fprintf(b, "add chain inet %s %s { type filter hook forward priority %d; policy accept; }\n",
 		TableName, dispatchChain, dispatchPriority)
+	if a.opts.UpstreamProxy != nil {
+		a.writeUpstreamProxyStatic(b)
+	}
 	fmt.Fprintf(b, "add rule inet %s %s ct state established,related accept\n", TableName, dispatchChain)
 	fmt.Fprintf(b, "add rule inet %s %s tcp dport 853 drop\n", TableName, dispatchChain)
 	fmt.Fprintf(b, "add rule inet %s %s udp dport 853 drop\n", TableName, dispatchChain)
@@ -476,17 +517,43 @@ func (a *Applier) writeTableHeader(b *strings.Builder) error {
 	if a.opts.MitmRedirectPort > 0 {
 		fmt.Fprintf(b, "add chain inet %s %s { type filter hook input priority %d; policy accept; }\n",
 			TableName, inputChain, inputPriority)
+		if a.opts.UpstreamProxy != nil {
+			a.writeUpstreamProxyInputRules(b)
+		}
 		fmt.Fprintf(b, "add rule inet %s %s ct state established,related accept\n", TableName, inputChain)
 	}
 	if !a.opts.BlockDoH443 {
+		a.writePortFloorFragment(b)
 		writeFailClosedTail(b)
 		return nil
 	}
 	if err := a.writeDoHBlockFragment(b); err != nil {
 		return err
 	}
+	a.writePortFloorFragment(b)
 	writeFailClosedTail(b)
 	return nil
+}
+
+// writePortFloorFragment emits the cap complement as one drop rule per
+// master chain. The input rule only fires on MITM-redirected flows
+// (tcp dport <MitmRedirectPort>); fsb DNS shares the same DNAT gate
+// (REDIRECT to :15353) and must not match, and the original — not the
+// redirect — port is evaluated via ct.
+func (a *Applier) writePortFloorFragment(b *strings.Builder) {
+	if len(a.opts.PortFloorDenyRanges) == 0 {
+		return
+	}
+	members := make([]string, 0, len(a.opts.PortFloorDenyRanges))
+	for _, rg := range a.opts.PortFloorDenyRanges {
+		members = append(members, fmt.Sprintf("%d-%d", rg.Lo, rg.Hi))
+	}
+	fmt.Fprintf(b, "add rule inet %s %s tcp dport { %s } drop\n", TableName, dispatchChain, strings.Join(members, ", "))
+	if a.opts.MitmRedirectPort > 0 {
+		fmt.Fprintf(b,
+			"add rule inet %s %s ct status dnat tcp dport %d ct original proto-dst { %s } drop\n",
+			TableName, inputChain, a.opts.MitmRedirectPort, strings.Join(members, ", "))
+	}
 }
 
 // writeFailClosedTail appends the master-chain rule that drops every

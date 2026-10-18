@@ -33,7 +33,11 @@ class Credential:
     """
     Attributes:
         name (str):
-        source (InlineCredentialSource):
+        source (InlineCredentialSource): Credential source envelope. For `type: inline`,
+            `value` is write-only credential material. For `type: plugin`, `value`
+            selects a trusted provider executable basename installed in the egress
+            credential-provider directory. Callers cannot provide executable paths
+            or arguments.
     """
 
     name: str

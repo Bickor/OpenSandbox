@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ import base64
 import shlex
 from copy import deepcopy
 from datetime import datetime
-from typing import Dict, List, Any, Optional
+from typing import Callable, Dict, List, Any, Optional
 
 from opensandbox_server.config import (
     AppConfig,
@@ -150,6 +150,7 @@ class BatchSandboxProvider(WorkloadProvider):
         self.plural = "batchsandboxes"
 
         self.template_manager = BatchSandboxTemplateManager(template_file_path)
+        self._warn_on_restartable_template_policy()
 
     def supports_image_auth(self) -> bool:
         return True
@@ -447,6 +448,12 @@ class BatchSandboxProvider(WorkloadProvider):
             "automountServiceAccountToken": False,
             "containers": containers,
             "volumes": pod_volumes,
+            # A kubelet in-place container restart recreates the container from
+            # the image: the writable layer and in-memory state are wiped while
+            # the sandbox keeps reporting healthy. Restarting is never a
+            # meaningful recovery for a sandbox, so default to Never unless the
+            # template explicitly opts into a restartable policy.
+            "restartPolicy": self._template_restart_policy() or "Never",
         }
         if init_container is not None:
             pod_spec["initContainers"] = [_container_to_dict(init_container)]
@@ -493,6 +500,7 @@ class BatchSandboxProvider(WorkloadProvider):
             containers=containers,
             egress_settings=egress_settings,
             sandbox_id=sandbox_id,
+            pod_volumes=pod_spec["volumes"],
         )
 
         if volumes:
@@ -568,6 +576,7 @@ class BatchSandboxProvider(WorkloadProvider):
                         plural=self.plural,
                         name=sandbox_id,
                         grace_period_seconds=0,
+                        propagation_policy=self._deletion_propagation_policy(batchsandbox),
                     )
                 except Exception as del_exc:
                     logger.warning(f"Failed to rollback BatchSandbox {sandbox_id}: {del_exc}")
@@ -651,6 +660,38 @@ class BatchSandboxProvider(WorkloadProvider):
             "apiVersion": f"{self.group}/{self.version}",
             "kind": "BatchSandbox",
         }
+
+    def _template_restart_policy(self) -> Optional[str]:
+        """Explicit restartPolicy from the user's BatchSandbox template, if any.
+
+        Returned as the runtime value so it survives the runtime-wins deep
+        merge; None means the template is silent and the Never default applies.
+        """
+        template = self.template_manager.get_base_template()
+        template_spec = template.get("spec", {}).get("template", {}).get("spec", {})
+        if not isinstance(template_spec, dict):
+            return None
+        policy = template_spec.get("restartPolicy")
+        if isinstance(policy, str) and policy:
+            return policy
+        return None
+
+    def _warn_on_restartable_template_policy(self) -> None:
+        """Surface the in-place-restart footgun once at startup, at template load.
+
+        A restartable policy is honored as an explicit opt-out of the Never
+        default, but a kubelet container restart recreates the container from
+        its image: the writable layer and in-memory state are wiped while the
+        sandbox keeps reporting healthy.
+        """
+        policy = self._template_restart_policy()
+        if policy and policy != "Never":
+            logger.warning(
+                "BatchSandbox template sets restartPolicy=%s: in-place container "
+                "restarts will silently reset sandbox state (writable layer, "
+                "in-memory data) while the sandbox keeps reporting healthy.",
+                policy,
+            )
 
     def _extract_template_pod_extras(
         self,
@@ -776,6 +817,18 @@ class BatchSandboxProvider(WorkloadProvider):
         }
 
 
+    def subscribe_workload(
+        self, sandbox_id: str, namespace: str, callback: Callable[[str, Dict[str, Any]], None]
+    ) -> Optional[Callable[[], None]]:
+        return self.k8s_client.subscribe_custom_objects(
+            group=self.group,
+            version=self.version,
+            namespace=namespace,
+            plural=self.plural,
+            names=[sandbox_id, self.legacy_resource_name(sandbox_id)],
+            callback=callback,
+        )
+
     def get_workload(self, sandbox_id: str, namespace: str) -> Optional[Dict[str, Any]]:
         workload = self.k8s_client.get_custom_object(
             group=self.group,
@@ -799,6 +852,12 @@ class BatchSandboxProvider(WorkloadProvider):
 
         return None
     
+    @staticmethod
+    def _deletion_propagation_policy(batchsandbox: Dict[str, Any]) -> str:
+        # Keep executor and main containers alive until the task cleanup finalizer
+        # stops tasks and hooks, then deletes owned pods and waits for their removal.
+        return "Background" if batchsandbox.get("spec", {}).get("taskTemplate") is not None else "Foreground"
+
     def delete_workload(self, sandbox_id: str, namespace: str) -> None:
         batchsandbox = self.get_workload(sandbox_id, namespace)
         if not batchsandbox:
@@ -811,6 +870,7 @@ class BatchSandboxProvider(WorkloadProvider):
             plural=self.plural,
             name=batchsandbox["metadata"]["name"],
             grace_period_seconds=0,
+            propagation_policy=self._deletion_propagation_policy(batchsandbox),
         )
 
     def list_workloads(self, namespace: str, label_selector: str) -> List[Dict[str, Any]]:
@@ -818,6 +878,15 @@ class BatchSandboxProvider(WorkloadProvider):
             group=self.group,
             version=self.version,
             namespace=namespace,
+            plural=self.plural,
+            label_selector=label_selector,
+        )
+
+    def list_workloads_all_namespaces(self, label_selector: str) -> List[Dict[str, Any]]:
+        """List BatchSandboxes across all namespaces matching the label selector."""
+        return self.k8s_client.list_custom_objects_all_namespaces(
+            group=self.group,
+            version=self.version,
             plural=self.plural,
             label_selector=label_selector,
         )
@@ -1055,8 +1124,18 @@ class BatchSandboxProvider(WorkloadProvider):
 
     def get_status(self, workload: Dict[str, Any]) -> Dict[str, Any]:
         """Derive sandbox state from BatchSandbox status and pod readiness."""
+        metadata = workload.get("metadata", {})
+        deletion_timestamp = metadata.get("deletionTimestamp")
+        if deletion_timestamp:
+            return {
+                "state": "Stopping",
+                "reason": "DELETING",
+                "message": "Sandbox is being deleted",
+                "last_transition_at": deletion_timestamp,
+            }
+
         status = workload.get("status", {})
-        creation_timestamp = workload.get("metadata", {}).get("creationTimestamp")
+        creation_timestamp = metadata.get("creationTimestamp")
 
         # Phase is authoritative when set (Pausing/Paused/Resuming/Failed)
         phase = status.get("phase", "")
