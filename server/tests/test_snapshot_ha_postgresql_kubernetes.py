@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 import os
 from threading import Barrier, Lock
 import time
-from typing import cast
+from typing import Literal, cast
 
 from kubernetes.client import ApiException
 import psycopg
@@ -198,6 +198,18 @@ class _SharedK8sClient:
                     }
                 ],
             }
+            if body["spec"].get("format") == "kata-vmstate-v1":
+                stored["metadata"]["uid"] = "snapshot-uid"
+                stored["status"] = {
+                    "phase": "Succeed",
+                    "format": "kata-vmstate-v1",
+                    "sourceNodeName": "node-a",
+                    "kataVMState": {
+                        "snapshotName": "ks-0123456789abcdef0123456789abcdef",
+                        "restorePlanSecretName": "kata-restore-plan",
+                        "runtimeVersion": "3.15.0",
+                    },
+                }
             self.objects[name] = stored
             self.successful_creates += 1
             return deepcopy(stored)
@@ -222,6 +234,10 @@ class _SharedK8sClient:
     def read_pod(self, namespace: str, name: str):
         pod = self.pods.get(name)
         return deepcopy(pod) if pod is not None else None
+
+    def read_runtime_class(self, name: str):
+        assert name == "kata-vm-isolation-v2"
+        return {"handler": "kata-v2"}
 
     def list_pods(self, namespace: str, label_selector: str = ""):
         return [deepcopy(pod) for pod in self.pods.values()]
@@ -353,8 +369,11 @@ def test_two_active_services_share_one_cr_and_one_terminal_cas(
             repository.close()
 
 
+@pytest.mark.parametrize("snapshot_format", [None, "kata-vmstate-v1"])
 def test_active_peer_periodically_recovers_after_creator_crash(
     postgresql_dsn: str,
+    monkeypatch: pytest.MonkeyPatch,
+    snapshot_format: Literal["kata-vmstate-v1"] | None,
 ) -> None:
     repositories = [_repository(postgresql_dsn), _repository(postgresql_dsn)]
     creator = None
@@ -362,6 +381,16 @@ def test_active_peer_periodically_recovers_after_creator_crash(
     try:
         _truncate(postgresql_dsn)
         k8s_client = _SharedK8sClient()
+        if snapshot_format == "kata-vmstate-v1":
+            k8s_client.pods[f"{SANDBOX_ID}-0"]["spec"]["runtimeClassName"] = "kata-vm-isolation-v2"
+        persist = repositories[0].create
+
+        def persist_after_cr(record: SnapshotRecord) -> SnapshotRecord:
+            snapshot_cr = k8s_client.objects[build_public_snapshot_name(record.id)]
+            assert snapshot_cr["spec"].get("format") == snapshot_format
+            return persist(record)
+
+        monkeypatch.setattr(repositories[0], "create", persist_after_cr)
         creator_executor = _CapturingExecutor()
         creator = PostgreSQLKubernetesSnapshotService(
             repositories[0],
@@ -389,7 +418,7 @@ def test_active_peer_periodically_recovers_after_creator_crash(
         # The CR is created synchronously in the request path.
         created = creator.create_snapshot(
             SANDBOX_ID,
-            CreateSnapshotRequest(name="creator-crash"),
+            CreateSnapshotRequest(name="creator-crash", format=snapshot_format),
         )
         assert creator_executor.submitted == []
         assert k8s_client.successful_creates == 1
@@ -403,7 +432,12 @@ def test_active_peer_periodically_recovers_after_creator_crash(
         else:
             pytest.fail("active peer did not recover the creator's unfinished snapshot")
 
-        assert stored.restore_config.image == "registry/sandbox:snapshot"
+        if snapshot_format == "kata-vmstate-v1":
+            assert stored.restore_config.image is None
+            assert stored.restore_config.is_complete_kata_plan()
+            assert stored.restore_config.restore_plan_owner_uid == "snapshot-uid"
+        else:
+            assert stored.restore_config.image == "registry/sandbox:snapshot"
         assert k8s_client.successful_creates == 1
 
         peer.close()

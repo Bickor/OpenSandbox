@@ -210,11 +210,19 @@ class PersistedSnapshotService(SnapshotService):
     def _create_snapshot_synchronously(self, record: SnapshotRecord) -> None:
         """Create the runtime object first, then persist the row."""
         try:
-            runtime_status = self._snapshot_runtime.create_snapshot(
-                record.id,
-                record.source_sandbox_id,
-                namespace=record.namespace,
-            )
+            if record.restore_config.format is None:
+                runtime_status = self._snapshot_runtime.create_snapshot(
+                    record.id,
+                    record.source_sandbox_id,
+                    namespace=record.namespace,
+                )
+            else:
+                runtime_status = self._snapshot_runtime.create_snapshot(
+                    record.id,
+                    record.source_sandbox_id,
+                    namespace=record.namespace,
+                    format=record.restore_config.format,
+                )
         except Exception as exc:  # noqa: BLE001 - surfaced to the caller
             logger.exception(
                 f"Failed to create snapshot {record.id} from sandbox "

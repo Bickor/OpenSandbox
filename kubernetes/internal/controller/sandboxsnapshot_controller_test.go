@@ -38,6 +38,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	sandboxv1alpha1 "github.com/alibaba/OpenSandbox/sandbox-k8s/apis/sandbox/v1alpha1"
 	snapshotcontract "github.com/alibaba/OpenSandbox/sandbox-k8s/internal/snapshot"
@@ -905,9 +906,55 @@ func TestSandboxSnapshotHandlePending_KataDoesNotRequireRegistry(t *testing.T) {
 	runtimeClass := &nodev1.RuntimeClass{ObjectMeta: metav1.ObjectMeta{Name: kataRuntimeClassName}, Handler: kataRuntimeHandler}
 	r := newTestSnapshotReconciler(bs, pod, snapshotObject, runtimeClass)
 	r.KataVMStateEnabled = true
+	failResolvedStatus := true
+	secretCreates := 0
+	r.Client = fake.NewClientBuilder().WithScheme(r.Scheme).
+		WithStatusSubresource(&sandboxv1alpha1.SandboxSnapshot{}).
+		WithObjects(bs, pod, snapshotObject, runtimeClass).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, c client.Client, name string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				if resolved, ok := obj.(*sandboxv1alpha1.SandboxSnapshot); ok && name == "status" {
+					require.NotNil(t, resolved.Status.KataVMState)
+					require.NoError(t, c.Get(ctx, types.NamespacedName{
+						Namespace: resolved.Namespace, Name: resolved.Status.KataVMState.RestorePlanSecretName,
+					}, &corev1.Secret{}))
+				}
+				if failResolvedStatus && name == "status" {
+					return fmt.Errorf("resolved status unavailable")
+				}
+				return c.SubResource(name).Update(ctx, obj, opts...)
+			},
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if _, ok := obj.(*corev1.Secret); ok {
+					secretCreates++
+				}
+				if _, ok := obj.(*batchv1.Job); ok {
+					persisted := &sandboxv1alpha1.SandboxSnapshot{}
+					require.NoError(t, c.Get(ctx, client.ObjectKeyFromObject(snapshotObject), persisted))
+					require.Equal(t, sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1, persisted.Status.Format)
+					require.Equal(t, pod.Name, persisted.Status.SourcePodName)
+					require.Equal(t, pod.Spec.NodeName, persisted.Status.SourceNodeName)
+					require.NotNil(t, persisted.Status.KataVMState)
+					secret := &corev1.Secret{}
+					require.NoError(t, c.Get(ctx, types.NamespacedName{
+						Namespace: snapshotObject.Namespace, Name: persisted.Status.KataVMState.RestorePlanSecretName,
+					}, secret))
+					require.Equal(t, snapshotObject.UID, secret.OwnerReferences[0].UID)
+				}
+				return c.Create(ctx, obj, opts...)
+			},
+		}).Build()
 
+	_, err := r.handlePending(context.Background(), snapshotObject)
+	require.ErrorContains(t, err, "resolved status unavailable")
+	jobs := &batchv1.JobList{}
+	require.NoError(t, r.List(context.Background(), jobs))
+	require.Empty(t, jobs.Items)
+
+	failResolvedStatus = false
 	result, err := r.handlePending(context.Background(), snapshotObject)
 	require.NoError(t, err)
+	assert.Equal(t, 1, secretCreates)
 	assert.Equal(t, time.Second, result.RequeueAfter)
 	updated := &sandboxv1alpha1.SandboxSnapshot{}
 	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: snapshotObject.Name, Namespace: snapshotObject.Namespace}, updated))
@@ -936,6 +983,66 @@ func TestSandboxSnapshotHandlePending_KataDoesNotRequireRegistry(t *testing.T) {
 	assert.NotContains(t, capturedTemplate.Labels, labelSandboxIdentity)
 	assert.NotContains(t, capturedTemplate.Annotations, kataSnapshotAnnotation)
 	assert.Equal(t, "keep", capturedTemplate.Labels["workload"])
+}
+
+func TestSandboxSnapshotHandlePending_KataPreservesExistingJobOnRetry(t *testing.T) {
+	snapshotObject := &sandboxv1alpha1.SandboxSnapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-snapshot", Namespace: "default", UID: "snapshot-uid"},
+		Spec: sandboxv1alpha1.SandboxSnapshotSpec{
+			SandboxName: "removed-sandbox", Format: sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1,
+		},
+		Status: sandboxv1alpha1.SandboxSnapshotStatus{
+			Phase: sandboxv1alpha1.SandboxSnapshotPhasePending, Format: sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1,
+			SourcePodName: "removed-pod", SourceNodeName: "original-node",
+			KataVMState: &sandboxv1alpha1.KataVMStateSnapshot{
+				SnapshotName: "ks-0123456789abcdef0123456789abcdef", RestorePlanSecretName: "original-plan",
+				BlobAccountURL: "https://original.blob.core.windows.net", BlobContainer: "original",
+			},
+		},
+	}
+	r := newTestSnapshotReconciler()
+	job, err := r.buildCommitJob(snapshotObject, "original-pod-uid", "")
+	require.NoError(t, err)
+	r.KataBlobAccountURL = "https://changed.blob.core.windows.net"
+	r.KataBlobContainer = "changed"
+	failStatusUpdate := true
+	r.Client = fake.NewClientBuilder().WithScheme(r.Scheme).
+		WithStatusSubresource(&sandboxv1alpha1.SandboxSnapshot{}).
+		WithObjects(snapshotObject, job).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, c client.Client, name string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				if failStatusUpdate && name == "status" {
+					return fmt.Errorf("committing status unavailable")
+				}
+				return c.SubResource(name).Update(ctx, obj, opts...)
+			},
+		}).Build()
+	ctx := context.Background()
+	_, err = r.handlePending(ctx, snapshotObject)
+	require.ErrorContains(t, err, "committing status unavailable")
+	failStatusUpdate = false
+	result, err := r.handlePending(ctx, snapshotObject)
+	require.NoError(t, err)
+	assert.Equal(t, time.Second, result.RequeueAfter)
+	updated := &sandboxv1alpha1.SandboxSnapshot{}
+	require.NoError(t, r.Get(ctx, client.ObjectKeyFromObject(snapshotObject), updated))
+	assert.Equal(t, sandboxv1alpha1.SandboxSnapshotPhaseCommitting, updated.Status.Phase)
+	assert.Equal(t, snapshotObject.Status.KataVMState, updated.Status.KataVMState)
+	assert.Equal(t, snapshotObject.Status.SourcePodName, updated.Status.SourcePodName)
+	assert.Equal(t, snapshotObject.Status.SourceNodeName, updated.Status.SourceNodeName)
+	jobs := &batchv1.JobList{}
+	require.NoError(t, r.List(ctx, jobs))
+	require.Len(t, jobs.Items, 1)
+	assert.Equal(t, job.Spec, jobs.Items[0].Spec)
+
+	updated.Status.Phase = sandboxv1alpha1.SandboxSnapshotPhaseSucceed
+	updated.Status.KataVMState.RuntimeVersion = "3.15.0"
+	require.NoError(t, r.Status().Update(ctx, updated))
+	_, err = r.handlePending(ctx, snapshotObject)
+	require.NoError(t, err)
+	require.NoError(t, r.Get(ctx, client.ObjectKeyFromObject(snapshotObject), updated))
+	assert.Equal(t, sandboxv1alpha1.SandboxSnapshotPhaseSucceed, updated.Status.Phase)
+	assert.Equal(t, "3.15.0", updated.Status.KataVMState.RuntimeVersion)
 }
 
 func TestBuildCommitJob_KataUsesPrivilegedSameNodeHostWorker(t *testing.T) {
@@ -1130,6 +1237,83 @@ func TestSandboxSnapshotHandleDeletion_KataReleasesFinalizerWhenSourceNodeIsGone
 	deleted := &sandboxv1alpha1.SandboxSnapshot{}
 	err = r.Get(context.Background(), types.NamespacedName{Name: snapshotObject.Name, Namespace: snapshotObject.Namespace}, deleted)
 	assert.True(t, apierrors.IsNotFound(err))
+}
+
+func TestSandboxSnapshotHandleDeletion_KataStopsCommitBeforeCleanupAndFinalizerRemoval(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+	snapshotObject := &sandboxv1alpha1.SandboxSnapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-snapshot", Namespace: "default", DeletionTimestamp: &now,
+			Finalizers: []string{sandboxSnapshotFinalizer},
+		},
+		Status: sandboxv1alpha1.SandboxSnapshotStatus{
+			Format: sandboxv1alpha1.SandboxSnapshotFormatKataVMStateV1, SourceNodeName: "node-a",
+			KataVMState: &sandboxv1alpha1.KataVMStateSnapshot{SnapshotName: "ks-0123456789abcdef0123456789abcdef"},
+		},
+	}
+	commitJob := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+		Name: "test-snapshot-commit", Namespace: "default", Finalizers: []string{metav1.FinalizerDeleteDependents},
+	}}
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-a"},
+		Status:     corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}},
+	}
+	r := newTestSnapshotReconciler()
+	r.Client = fake.NewClientBuilder().WithScheme(r.Scheme).
+		WithStatusSubresource(&sandboxv1alpha1.SandboxSnapshot{}).
+		WithObjects(snapshotObject, commitJob, node).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				if obj.GetName() == commitJob.Name {
+					options := &client.DeleteOptions{}
+					for _, opt := range opts {
+						opt.ApplyToDelete(options)
+					}
+					require.NotNil(t, options.PropagationPolicy)
+					assert.Equal(t, metav1.DeletePropagationForeground, *options.PropagationPolicy)
+				}
+				return c.Delete(ctx, obj, opts...)
+			},
+		}).Build()
+	cleanupKey := types.NamespacedName{Name: r.getKataCleanupJobName(snapshotObject), Namespace: snapshotObject.Namespace}
+
+	result, err := r.handleDeletion(ctx, snapshotObject)
+	require.NoError(t, err)
+	assert.Equal(t, time.Second, result.RequeueAfter)
+	require.NoError(t, r.Get(ctx, client.ObjectKeyFromObject(commitJob), commitJob))
+	assert.False(t, commitJob.DeletionTimestamp.IsZero())
+	assert.True(t, apierrors.IsNotFound(r.Get(ctx, cleanupKey, &batchv1.Job{})))
+	remaining := &sandboxv1alpha1.SandboxSnapshot{}
+	require.NoError(t, r.Get(ctx, client.ObjectKeyFromObject(snapshotObject), remaining))
+	assert.Contains(t, remaining.Finalizers, sandboxSnapshotFinalizer)
+
+	commitJob.Finalizers = nil
+	require.NoError(t, r.Update(ctx, commitJob))
+	require.True(t, apierrors.IsNotFound(r.Get(ctx, client.ObjectKeyFromObject(commitJob), &batchv1.Job{})))
+	_, err = r.handleDeletion(ctx, snapshotObject)
+	require.NoError(t, err)
+	cleanupJob := &batchv1.Job{}
+	require.NoError(t, r.Get(ctx, cleanupKey, cleanupJob))
+	_, err = r.handleDeletion(ctx, snapshotObject)
+	require.NoError(t, err)
+	require.NoError(t, r.Get(ctx, client.ObjectKeyFromObject(snapshotObject), remaining))
+	assert.Contains(t, remaining.Finalizers, sandboxSnapshotFinalizer)
+
+	cleanupJob.Status.Succeeded = 1
+	require.NoError(t, r.Status().Update(ctx, cleanupJob))
+	cleanupPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "cleanup-worker", Namespace: "default", Labels: map[string]string{"job-name": cleanupJob.Name}},
+		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
+			Name: commitJobContainerName,
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0,
+				Message: `{"kataVMState":{"snapshotName":"ks-0123456789abcdef0123456789abcdef"}}`}},
+		}}},
+	}
+	require.NoError(t, r.Create(ctx, cleanupPod))
+	_, err = r.handleDeletion(ctx, snapshotObject)
+	require.NoError(t, err)
+	assert.True(t, apierrors.IsNotFound(r.Get(ctx, client.ObjectKeyFromObject(snapshotObject), remaining)))
 }
 
 func TestSandboxSnapshotHandleDeletion_KataRemovesFinalizerAfterCleanupResult(t *testing.T) {

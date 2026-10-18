@@ -516,7 +516,8 @@ def test_list_snapshots_converges_creating_rows_from_runtime(tmp_path) -> None:
     assert stored.status.state == SnapshotState.FAILED
 
 
-def test_synchronous_create_submits_runtime_before_persisting(tmp_path) -> None:
+@pytest.mark.parametrize("snapshot_format", [None, "rootfs-v1", "qemu-v1", "kata-vmstate-v1"])
+def test_synchronous_create_submits_runtime_before_persisting(tmp_path, snapshot_format) -> None:
     repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
     runtime = SynchronousStubSnapshotRuntime()
     executor = CapturingExecutor()
@@ -532,13 +533,18 @@ def test_synchronous_create_submits_runtime_before_persisting(tmp_path) -> None:
     def create_snapshot(snapshot_id: str, sandbox_id: str, **kwargs):
         rows_seen_by_runtime.append(repo.get(snapshot_id))
         runtime.calls.append((snapshot_id, sandbox_id))
+        runtime.create_formats.append(kwargs.get("format"))
         return runtime.create_result
 
     runtime.create_snapshot = create_snapshot
 
-    created = service.create_snapshot("sbx-001", CreateSnapshotRequest(name="sync-submit", format=None))
+    created = service.create_snapshot(
+        "sbx-001",
+        CreateSnapshotRequest(name="sync-submit", format=snapshot_format),
+    )
 
     assert rows_seen_by_runtime == [None]
+    assert runtime.create_formats == [snapshot_format]
     assert executor.submitted == []
     stored = repo.get(created.id)
     assert stored is not None
@@ -628,7 +634,10 @@ def test_synchronous_create_conflict_returns_409_without_persisting(tmp_path) ->
     assert executor.submitted == []
 
 
-def test_synchronous_create_cleans_up_runtime_object_when_persist_fails(tmp_path) -> None:
+@pytest.mark.parametrize("snapshot_format", [None, "kata-vmstate-v1"])
+def test_synchronous_create_cleans_up_runtime_object_when_persist_fails(
+    tmp_path, snapshot_format
+) -> None:
     repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
     runtime = SynchronousStubSnapshotRuntime()
     executor = CapturingExecutor()
@@ -646,8 +655,12 @@ def test_synchronous_create_cleans_up_runtime_object_when_persist_fails(tmp_path
     repo.create = crash_create
 
     with pytest.raises(RuntimeError, match="simulated metadata persist crash"):
-        service.create_snapshot("sbx-001", CreateSnapshotRequest(name="orphan-cleanup", format=None))
+        service.create_snapshot(
+            "sbx-001",
+            CreateSnapshotRequest(name="orphan-cleanup", format=snapshot_format),
+        )
 
+    assert runtime.create_formats == [snapshot_format]
     assert len(runtime.calls) == 1
     assert [delete_call[0] for delete_call in runtime.delete_calls] == [
         runtime.calls[0][0],
@@ -1235,9 +1248,11 @@ def test_postgresql_kubernetes_recovery_waits_for_pending_worker(tmp_path) -> No
         service.close()
 
 
-def test_recovery_retries_synchronous_create_inline_without_worker(tmp_path) -> None:
+@pytest.mark.parametrize("snapshot_format", [None, "kata-vmstate-v1"])
+def test_recovery_retries_synchronous_create_inline_without_worker(tmp_path, snapshot_format) -> None:
     repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
     record = _snapshot_record("snap-sync-retry", SnapshotState.CREATING)
+    record.restore_config.format = snapshot_format
     repo.create(record)
     runtime = SynchronousStubSnapshotRuntime()
     executor = CapturingExecutor()
@@ -1261,6 +1276,7 @@ def test_recovery_retries_synchronous_create_inline_without_worker(tmp_path) -> 
     assert stored.status.state == SnapshotState.CREATING
     assert executor.submitted == []
     assert runtime.calls == [(record.id, "sbx-001")]
+    assert runtime.create_formats == [snapshot_format]
 
 
 def test_ha_recovery_converges_fsb_snapshot_without_failed_mapping(tmp_path) -> None:

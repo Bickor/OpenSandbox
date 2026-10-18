@@ -33,6 +33,22 @@ an init container of the Kata Pod. Concurrent prepares use a node-local lock;
 completed caches are verified and incomplete downloads are never published.
 The preparation Job remains owned by the restored BatchSandbox until deletion.
 
+## Creation, retries, and deletion
+
+The server creates the `SandboxSnapshot` object before saving its metadata row.
+It passes `kata-vmstate-v1` through this synchronous path and through recovery.
+If metadata persistence fails, the server requests deletion of the orphan object.
+
+The controller creates the immutable restore-plan Secret before saving the
+resolved source and Kata settings in snapshot status. It creates the capture Job
+only after both writes succeed. If the Job already exists, reconciliation retries
+the status update without resolving the source again or changing the recorded
+snapshot name, node, restore plan, or Blob target.
+
+Deletion requests foreground removal of the capture Job before starting cleanup.
+The snapshot finalizer remains until that Job is gone and cleanup completes.
+This prevents a capture worker from writing artifacts after cleanup.
+
 ## Scope and recovery
 
 This first version retains **same-node placement** and `durable: false` in the
