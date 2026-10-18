@@ -1,3 +1,17 @@
+// Copyright 2026 The OpenSandbox Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -277,5 +291,56 @@ test("Sandbox.connect keeps the sidecar egress for non-template sandboxes", asyn
   assert.ok(
     calls.some(([method]) => method === "createEgressStack"),
     "expected the sidecar egress stack to be created",
+  );
+});
+
+test("Sandbox.createFromTemplate forwards the idle policy as lifecycle.idlePolicy", async () => {
+  const { adapterFactory, createdRequests } = createTemplateFactory();
+  const connectionConfig = new ConnectionConfig({ domain: "http://127.0.0.1:8080" });
+  connectionConfig.withTransportIfMissing = () => connectionConfig;
+
+  await Sandbox.createFromTemplate({
+    adapterFactory,
+    connectionConfig,
+    templateId: "tpl_123",
+    timeoutSeconds: 300,
+    idlePolicy: {
+      idleTimeoutSeconds: 300,
+      onIdle: "pause",
+      wakeOnAccess: true,
+      activeProbe: { port: 8080, path: "/active" },
+    },
+    skipHealthCheck: true,
+  });
+
+  assert.equal(createdRequests.length, 1);
+  // Service-level request carries the idle policy at the top level; the
+  // adapter maps it to `lifecycle.idlePolicy` on the wire (covered in
+  // sandboxes.lifecycle.test.mjs).
+  assert.deepEqual(createdRequests[0].idlePolicy, {
+    idleTimeoutSeconds: 300,
+    onIdle: "pause",
+    wakeOnAccess: true,
+    activeProbe: { port: 8080, path: "/active" },
+  });
+});
+
+test("Sandbox.createFromTemplate rejects an invalid idle policy before allocating transport resources", async () => {
+  const { adapterFactory } = createTemplateFactory();
+  const connectionConfig = new ConnectionConfig({ domain: "http://127.0.0.1:8080" });
+  connectionConfig.withTransportIfMissing = () => {
+    throw new Error("transport must not be allocated for an invalid idle policy");
+  };
+
+  await assert.rejects(
+    Sandbox.createFromTemplate({
+      adapterFactory,
+      connectionConfig,
+      templateId: "tpl_123",
+      timeoutSeconds: 300,
+      idlePolicy: { idleTimeoutSeconds: 10, onIdle: "pause" },
+      skipHealthCheck: true,
+    }),
+    /idleTimeoutSeconds must be an integer between 30 and 86400/
   );
 });

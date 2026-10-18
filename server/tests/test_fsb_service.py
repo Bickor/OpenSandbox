@@ -1,7 +1,7 @@
 # pyright: reportAttributeAccessIssue=false
 # protobuf-generated modules expose dynamic attributes.
 
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@ from concurrent import futures
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -34,13 +35,21 @@ from opensandbox_server.api import lifecycle, network_policy
 from opensandbox_server.api.schema import RenewSandboxExpirationRequest
 from opensandbox_server.config import (
     AppConfig,
+    EGRESS_MODE_DNS_NFT,
+    EgressConfig,
+    EgressUpstreamProxyConfig,
     IngressConfig,
     KubernetesRuntimeConfig,
     RuntimeConfig,
     ServerConfig,
 )
 from opensandbox_server.middleware.request_id import RequestIdMiddleware
-from opensandbox_server.services.fast_sandbox.fastpath_client import FastPathClient
+from opensandbox_server.services.constants import SandboxErrorCodes
+from opensandbox_server.services.fast_sandbox.fastpath_client import (
+    FastPathClient,
+    FastPathResourceExhausted,
+    FastPathUnavailable,
+)
 from opensandbox_server.services.composite_service import CompositeSandboxService
 from opensandbox_server.services.factory import create_sandbox_service
 from opensandbox_server.services.fast_sandbox.service import FastSandboxService
@@ -312,7 +321,8 @@ def http_fsb(monkeypatch):
     )
     fastpath = FastPathClient(endpoint=f"127.0.0.1:{port}")
     with patch.object(K8sClient, "_load_config"):
-        k8s = K8sClient(KubernetesRuntimeConfig(informer_enabled=False))
+        k8s = K8sClient(KubernetesRuntimeConfig())
+    monkeypatch.setattr(WorkloadInformer, "start", lambda self: None)
     api = Mock(spec=CustomObjectsApi)
     api.get_api_resources.return_value = V1APIResourceList(
         group_version="sandbox.fast.io/v1alpha2",
@@ -382,6 +392,166 @@ def test_http_create_calls_fastpath_with_ready_completion(http_fsb):
     assert fake.last_create.request_id == body["id"]
     assert fake.last_create.completion == pb2.CREATE_COMPLETION_READY
     assert fake.create_time_remaining > service._k8s.fastpath_wait_ready_seconds
+
+
+def _annotation_api(service: FastSandboxService) -> Mock:
+    return service._cr_reader._kubernetes()._custom_objects_api  # type: ignore[return-value]
+
+
+def test_http_create_persists_idle_policy_annotation(http_fsb):
+    client, fake, service = http_fsb
+    api = _annotation_api(service)
+
+    response = client.post(
+        "/v1/sandboxes",
+        json={
+            "image": {"uri": "python:3.11"},
+            "entrypoint": ["python"],
+            "timeout": 3600,
+            "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+            "lifecycle": {
+                "idlePolicy": {"idleTimeoutSeconds": 300, "onIdle": "pause"},
+            },
+        },
+    )
+
+    assert response.status_code == 202
+    sandbox_id = response.json()["id"]
+    api.patch_namespaced_custom_object.assert_called_once()
+    kwargs = api.patch_namespaced_custom_object.call_args.kwargs
+    assert kwargs["group"] == "sandbox.fast.io"
+    assert kwargs["version"] == "v1alpha2"
+    assert kwargs["namespace"] == "ns-1"
+    assert kwargs["name"] == sandbox_id
+    annotation = kwargs["body"]["metadata"]["annotations"]["sandbox.opensandbox.io/idle-policy"]
+    assert json.loads(annotation) == {
+        "idleTimeoutSeconds": 300,
+        "onIdle": "pause",
+        "wakeOnAccess": True,
+    }
+
+
+def test_http_create_wake_only_policy_annotation(http_fsb):
+    client, fake, service = http_fsb
+    api = _annotation_api(service)
+
+    response = client.post(
+        "/v1/sandboxes",
+        json={
+            "image": {"uri": "python:3.11"},
+            "entrypoint": ["python"],
+            "timeout": 3600,
+            "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+            "lifecycle": {"idlePolicy": {"wakeOnAccess": False}},
+        },
+    )
+
+    assert response.status_code == 202
+    annotation = (
+        api.patch_namespaced_custom_object.call_args.kwargs["body"]["metadata"][
+            "annotations"
+        ]["sandbox.opensandbox.io/idle-policy"]
+    )
+    assert json.loads(annotation) == {"wakeOnAccess": False}
+
+
+def test_http_create_probe_policy_annotation_applies_default_timeout(http_fsb):
+    client, fake, service = http_fsb
+    api = _annotation_api(service)
+
+    response = client.post(
+        "/v1/sandboxes",
+        json={
+            "image": {"uri": "python:3.11"},
+            "entrypoint": ["python"],
+            "timeout": 3600,
+            "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+            "lifecycle": {
+                "idlePolicy": {
+                    "idleTimeoutSeconds": 300,
+                    "onIdle": "pause",
+                    "activeProbe": {"port": 8080, "path": "/active"},
+                },
+            },
+        },
+    )
+
+    assert response.status_code == 202
+    annotation = (
+        api.patch_namespaced_custom_object.call_args.kwargs["body"]["metadata"][
+            "annotations"
+        ]["sandbox.opensandbox.io/idle-policy"]
+    )
+    assert json.loads(annotation) == {
+        "idleTimeoutSeconds": 300,
+        "onIdle": "pause",
+        "wakeOnAccess": True,
+        "activeProbe": {"port": 8080, "path": "/active", "timeoutSeconds": 2},
+    }
+
+
+def test_http_create_without_idle_policy_skips_annotation_write(http_fsb):
+    client, fake, service = http_fsb
+    api = _annotation_api(service)
+
+    response = client.post(
+        "/v1/sandboxes",
+        json={
+            "image": {"uri": "python:3.11"},
+            "entrypoint": ["python"],
+            "timeout": 3600,
+            "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+        },
+    )
+
+    assert response.status_code == 202
+    api.patch_namespaced_custom_object.assert_not_called()
+
+
+def test_http_create_rejects_idle_timeout_above_activity_ttl(http_fsb):
+    client, fake, service = http_fsb
+    api = _annotation_api(service)
+
+    response = client.post(
+        "/v1/sandboxes",
+        json={
+            "image": {"uri": "python:3.11"},
+            "entrypoint": ["python"],
+            "timeout": 3600,
+            "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+            "lifecycle": {
+                "idlePolicy": {"idleTimeoutSeconds": 3000, "onIdle": "pause"},
+            },
+        },
+    )
+
+    assert response.status_code == 400
+    assert "activity_ttl_seconds" in response.json()["detail"]["message"]
+    assert fake.last_create is None  # rejected before any side effect
+    api.patch_namespaced_custom_object.assert_not_called()
+
+
+def test_http_create_survives_idle_policy_annotation_write_failure(http_fsb):
+    client, fake, service = http_fsb
+    api = _annotation_api(service)
+    api.patch_namespaced_custom_object.side_effect = ApiException(status=403)
+
+    response = client.post(
+        "/v1/sandboxes",
+        json={
+            "image": {"uri": "python:3.11"},
+            "entrypoint": ["python"],
+            "timeout": 3600,
+            "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+            "lifecycle": {
+                "idlePolicy": {"idleTimeoutSeconds": 300, "onIdle": "pause"},
+            },
+        },
+    )
+
+    # A failed policy write must not fail the create; sandbox stays unpolicied.
+    assert response.status_code == 202
+    assert fake.last_create is not None
 
 
 def test_http_create_recovers_an_ambiguous_post_persistence_failure(http_fsb):
@@ -519,7 +689,6 @@ def test_cr_reads_do_not_depend_on_fastpath_and_remain_tenant_scoped(persisted_f
 def test_cr_watch_and_fastpath_mutations_refresh_http_reads(persisted_fsb, monkeypatch):
     client, fake, service, sandbox_id = persisted_fsb
     k8s = service._cr_reader._client
-    k8s.config.informer_enabled = True
     monkeypatch.setattr(WorkloadInformer, "start", lambda self: None)
     url = f"/v1/sandboxes/{sandbox_id}"
     assert client.get(url).json()["status"]["state"] == "Running"
@@ -571,6 +740,87 @@ def test_delete_uses_cr_identity_when_runtime_observation_is_gone(persisted_fsb)
     assert client.delete(url).status_code == 204
     assert fake.last_delete.sandbox.expected_uid == uid
     assert client.delete(url).status_code == 404
+
+
+def test_upstream_proxy_config_rejects_network_policy_create(http_fsb):
+    client, fake, service = http_fsb
+    service._app_config.egress = EgressConfig(
+        image="opensandbox/egress:v1.1.7",
+        mode=EGRESS_MODE_DNS_NFT,
+        upstream_proxy=EgressUpstreamProxyConfig(url="http://proxy.local:3128"),
+    )
+
+    response = client.post(
+        "/v1/sandboxes",
+        json={
+            "image": {"uri": "python:3.11"},
+            "entrypoint": ["python"],
+            "timeout": 3600,
+            "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+            "networkPolicy": {"defaultAction": "deny", "egress": []},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "SANDBOX::INVALID_PARAMETER"
+    assert "egress.upstream_proxy" in response.json()["detail"]["message"]
+    assert fake.last_create is None
+
+
+def test_upstream_proxy_config_rejects_network_policy_mutation(persisted_fsb):
+    client, fake, service, sandbox_id = persisted_fsb
+    service._app_config.egress = EgressConfig(
+        image="opensandbox/egress:v1.1.7",
+        mode=EGRESS_MODE_DNS_NFT,
+        upstream_proxy=EgressUpstreamProxyConfig(url="http://proxy.local:3128"),
+    )
+
+    response = client.put(
+        f"/v1/sandboxes/{sandbox_id}/networkpolicy",
+        json={"defaultAction": "deny", "egress": []},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "SANDBOX::INVALID_PARAMETER"
+    assert fake.last_update is None
+
+
+def test_upstream_proxy_config_allows_delete_network_policy_rules(persisted_fsb):
+    client, fake, service, sandbox_id = persisted_fsb
+    service._app_config.egress = EgressConfig(
+        image="opensandbox/egress:v1.1.7",
+        mode=EGRESS_MODE_DNS_NFT,
+        upstream_proxy=EgressUpstreamProxyConfig(url="http://proxy.local:3128"),
+    )
+    url = f"/v1/sandboxes/{sandbox_id}/networkpolicy"
+
+    # Deleting rules stays available: teardown is not chaining-sensitive.
+    response = client.request("DELETE", url, json=["a.com"])
+
+    assert response.status_code == 200
+    assert fake.last_update is not None
+
+
+def test_upstream_proxy_config_allows_create_without_network_policy(http_fsb):
+    client, fake, service = http_fsb
+    service._app_config.egress = EgressConfig(
+        image="opensandbox/egress:v1.1.7",
+        mode=EGRESS_MODE_DNS_NFT,
+        upstream_proxy=EgressUpstreamProxyConfig(url="http://proxy.local:3128"),
+    )
+
+    response = client.post(
+        "/v1/sandboxes",
+        json={
+            "image": {"uri": "python:3.11"},
+            "entrypoint": ["python"],
+            "timeout": 3600,
+            "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+        },
+    )
+
+    assert response.status_code == 202
+    assert fake.last_create is not None
 
 
 def test_http_policy_replace_preserves_bindings_and_fences_updates(persisted_fsb):
@@ -654,8 +904,10 @@ def test_http_policy_patch_and_delete_match_sidecar_semantics(persisted_fsb):
 def test_policy_rejects_invalid_input_and_other_tenant(persisted_fsb):
     client, fake, _, sandbox_id = persisted_fsb
     url = f"/v1/sandboxes/{sandbox_id}/networkpolicy"
-    for policy in ({"defaultAction": "invalid"}, {"egress": [{"action": "allow", "target": " "}]}):
-        assert client.put(url, json=policy).status_code == 400
+    # defaultAction is validated by the fsb service (400); a blank target is
+    # now rejected earlier by the NetworkRule schema (422).
+    assert client.put(url, json={"defaultAction": "invalid"}).status_code == 400
+    assert client.put(url, json={"egress": [{"action": "allow", "target": " "}]}).status_code == 422
     assert fake.last_update is None
     previous = get_current_tenant()
     try:
@@ -665,6 +917,21 @@ def test_policy_rejects_invalid_input_and_other_tenant(persisted_fsb):
         assert fake.last_update is None
     finally:
         set_current_tenant(previous)
+
+
+def test_policy_rejects_port_scoped_rules(persisted_fsb):
+    """Fast Sandbox enforcement does not cover port-scoped rules yet; accepting
+    them would silently drop deny rules (fail-open), so both PUT and PATCH
+    reject them until the fastlet path catches up."""
+    client, fake, _, sandbox_id = persisted_fsb
+    url = f"/v1/sandboxes/{sandbox_id}/networkpolicy"
+    port_only = {"action": "deny", "ports": [25]}
+    scoped = {"action": "allow", "target": "10.0.0.5", "ports": [22]}
+    assert client.put(url, json={"defaultAction": "deny", "egress": [port_only]}).status_code == 400
+    assert client.put(url, json={"defaultAction": "deny", "egress": [scoped]}).status_code == 400
+    assert client.patch(url, json=[port_only]).status_code == 400
+    assert client.patch(url, json=[scoped]).status_code == 400
+    assert fake.last_update is None
 
 
 def test_legacy_policy_route_preserves_body_for_existing_proxy(http_fsb, monkeypatch):
@@ -774,6 +1041,41 @@ async def test_mixed_create_keeps_legacy_semantics(persisted_fsb):
     request = Mock(template_id=None)
     assert await service.create_sandbox(request) is legacy.create_sandbox.return_value
     legacy.create_sandbox.assert_awaited_once_with(request)
+
+
+@pytest.mark.parametrize(
+    "delta_seconds",
+    [-600, 0, 600, 10800],
+    ids=["shorten", "unchanged", "extend", "above-create-limit"],
+)
+def test_http_renew_sets_future_timestamp_without_create_limit(http_fsb, delta_seconds):
+    client, fake, _ = http_fsb
+    response = client.post(
+        "/v1/sandboxes",
+        json={
+            "image": {"uri": "python:3.11"},
+            "entrypoint": ["python"],
+            "timeout": 1800,
+            "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+        },
+    )
+    assert response.status_code == 202
+    sandbox_id = response.json()["id"]
+    cr = fake.crs[("ns-1", sandbox_id)]
+    current_expiration = datetime.fromisoformat(cr["spec"]["expireTime"])
+    new_expiration = current_expiration + timedelta(seconds=delta_seconds)
+
+    renewed = client.post(
+        f"/v1/sandboxes/{sandbox_id}/renew-expiration",
+        json={"expiresAt": new_expiration.isoformat()},
+    )
+
+    assert renewed.status_code == 200
+    assert datetime.fromisoformat(
+        renewed.json()["expiresAt"].replace("Z", "+00:00")
+    ) == new_expiration
+    assert fake.last_update.expires_at_unix_seconds == int(new_expiration.timestamp())
+    assert datetime.fromisoformat(cr["spec"]["expireTime"]) == new_expiration
 
 
 def test_http_renew_and_delete_use_uid_fences(http_fsb):
@@ -999,6 +1301,72 @@ def test_http_create_handles_capacity_rejection_and_accepted_pending(http_fsb, p
     else:
         assert response.status_code == 429
         assert response.headers["Retry-After"] == "1"
+        detail = response.json()["detail"]
+        assert detail["message"] == "scripted rejection before persistence"
+        assert detail["cause"] == "FastPath pool capacity is temporarily unavailable."
+
+
+class _CapturingHandler(logging.Handler):
+    """Collect records directly on the target logger.
+
+    The app's dictConfig disables propagation, so pytest's caplog cannot
+    see app records; attach our own (pattern from test_renew_intent_restart).
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+_SERVICE_LOGGER = "opensandbox_server.services.fast_sandbox.service"
+
+
+def test_capacity_mapping_propagates_and_logs_underlying_fastpath_error(http_fsb):
+    _, _, service = http_fsb
+    exc = FastPathResourceExhausted(
+        "RESOURCE_EXHAUSTED",
+        "all Fastlet candidates rejected admission: load Firecracker snapshot: "
+        "Error creating KVM object: No such device (os error 19)",
+    )
+
+    handler = _CapturingHandler()
+    service_logger = logging.getLogger(_SERVICE_LOGGER)
+    service_logger.addHandler(handler)
+    try:
+        error = service._fastpath_http_error(exc)
+    finally:
+        service_logger.removeHandler(handler)
+
+    assert error.status_code == 429
+    assert error.headers == {"Retry-After": "1"}
+    assert error.detail["code"] == SandboxErrorCodes.FSB_API_ERROR
+    assert error.detail["message"] == exc.message
+    assert error.detail["cause"] == "FastPath pool capacity is temporarily unavailable."
+    messages = [record.getMessage() for record in handler.records]
+    assert messages, "expected a WARNING carrying the underlying FastPath message"
+    assert "Error creating KVM object: No such device" in messages[0]
+
+
+def test_unavailable_mapping_logs_underlying_fastpath_error(http_fsb):
+    _, _, service = http_fsb
+    exc = FastPathUnavailable("UNAVAILABLE", "gRPC deadline exceeded after 30s")
+
+    handler = _CapturingHandler()
+    service_logger = logging.getLogger(_SERVICE_LOGGER)
+    service_logger.addHandler(handler)
+    try:
+        error = service._fastpath_http_error(exc)
+    finally:
+        service_logger.removeHandler(handler)
+
+    assert error.status_code == 503
+    assert error.detail["message"] == "FastPath backend unavailable."
+    messages = [record.getMessage() for record in handler.records]
+    assert messages, "expected a WARNING carrying the underlying FastPath message"
+    assert "gRPC deadline exceeded after 30s" in messages[0]
 
 
 def _gateway_config(mode="header"):

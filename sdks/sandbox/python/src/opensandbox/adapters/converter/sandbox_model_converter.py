@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -51,6 +51,7 @@ from opensandbox.api.lifecycle.types import Unset
 from opensandbox.models.sandboxes import (
     CreateSnapshotRequest,
     CredentialProxyConfig,
+    IdlePolicy,
     NetworkPolicy,
     NetworkRule,
     PagedSandboxInfos,
@@ -281,7 +282,11 @@ class SandboxModelConverter:
                     "lifecycle must be a SandboxLifecycle or None, "
                     f"got {type(lifecycle).__name__}"
                 )
-            if lifecycle.pre_start is not None or lifecycle.periodic:
+            if (
+                lifecycle.pre_start is not None
+                or lifecycle.periodic
+                or lifecycle.idle_policy is not None
+            ):
                 lifecycle_payload = lifecycle.model_dump(
                     by_alias=True, exclude_none=True
                 )
@@ -366,7 +371,9 @@ class SandboxModelConverter:
             api_egress = [
                 ApiNetworkRule(
                     action=NetworkRuleAction(rule.action),
-                    target=rule.target,
+                    # None here means UNSET (omit the field) in the client.
+                    target=rule.target if rule.target is not None else UNSET,
+                    ports=rule.ports if rule.ports is not None else UNSET,
                 )
                 for rule in network_policy.egress
             ]
@@ -383,12 +390,12 @@ class SandboxModelConverter:
         metadata: dict[str, str] | None,
         network_policy: NetworkPolicy | None,
         extensions: dict[str, str] | None,
+        idle_policy: IdlePolicy | None = None,
     ) -> CreateSandboxRequest:
         """Convert template-mode parameters to API CreateSandboxRequest.
 
-        Template mode fixes the workload shape on the server: workload-shaping
-        fields (entrypoint, env, resources, volumes, platform, ...) must be
-        omitted or the server rejects the request with 400.
+        Template mode fixes the workload shape on the server; the exception
+        is ``lifecycle.idlePolicy`` (OSEP-0024, control-plane state).
         """
         from opensandbox.api.lifecycle.models.create_sandbox_request_extensions import (
             CreateSandboxRequestExtensions,
@@ -396,7 +403,21 @@ class SandboxModelConverter:
         from opensandbox.api.lifecycle.models.create_sandbox_request_metadata import (
             CreateSandboxRequestMetadata,
         )
+        from opensandbox.api.lifecycle.models.sandbox_lifecycle import (
+            SandboxLifecycle as ApiSandboxLifecycle,
+        )
         from opensandbox.api.lifecycle.types import UNSET
+
+        api_lifecycle = UNSET
+        if idle_policy is not None:
+            if not isinstance(idle_policy, IdlePolicy):
+                raise TypeError(
+                    "idle_policy must be an IdlePolicy or None, "
+                    f"got {type(idle_policy).__name__}"
+                )
+            api_lifecycle = ApiSandboxLifecycle.from_dict(
+                {"idlePolicy": idle_policy.model_dump(by_alias=True, exclude_none=True)}
+            )
 
         request = CreateSandboxRequest(
             template_id=template_id,
@@ -413,6 +434,7 @@ class SandboxModelConverter:
                 if extensions
                 else UNSET
             ),
+            lifecycle=api_lifecycle,
         )
         request.timeout = int(timeout.total_seconds())
         return request
@@ -461,11 +483,13 @@ class SandboxModelConverter:
         from opensandbox.api.lifecycle.models.network_rule_action import (
             NetworkRuleAction,
         )
+        from opensandbox.api.lifecycle.types import UNSET
 
         return [
             ApiNetworkRule(
                 action=NetworkRuleAction(rule.action),
-                target=rule.target,
+                target=rule.target if rule.target is not None else UNSET,
+                ports=rule.ports if rule.ports is not None else UNSET,
             )
             for rule in rules
         ]
@@ -496,7 +520,10 @@ class SandboxModelConverter:
                         Literal["allow", "deny"],
                         getattr(rule.action, "value", rule.action),
                     ),
-                    target=rule.target,
+                    # UNSET means "absent from the JSON body"; the domain
+                    # model spells that as None.
+                    target=rule.target if not isinstance(rule.target, Unset) else None,
+                    ports=rule.ports if not isinstance(rule.ports, Unset) else None,
                 )
                 for rule in api_policy.egress
             ]

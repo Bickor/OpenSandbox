@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ from opensandbox_server.config import (
     EGRESS_MODE_DNS,
     EGRESS_MODE_DNS_NFT,
     EgressConfig,
+    EgressUpstreamProxyConfig,
     ExecdInitResources,
     GatewayConfig,
     GatewayRouteModeConfig,
@@ -310,6 +311,59 @@ def test_renew_intent_defaults():
     assert ar.redis.consumer_concurrency == 8
 
 
+def test_idle_pause_defaults():
+    cfg = AppConfig(runtime=RuntimeConfig(type="docker", execd_image="opensandbox/execd:latest"))
+    ip = cfg.automation.idle_pause
+    assert ip.enabled is False
+    assert ip.sweep_interval_seconds == 15
+    assert ip.activity_ttl_seconds == 1800
+    assert ip.redis.dsn is None
+    assert ip.redis.lock_ttl_seconds == 30
+
+
+def test_idle_pause_redis_requires_dsn_when_enabled():
+    from opensandbox_server.config import IdlePauseConfig
+
+    with pytest.raises(ValidationError):
+        IdlePauseConfig(enabled=True)
+    with pytest.raises(ValidationError):
+        IdlePauseConfig(enabled=True, redis={"dsn": "   "})
+    ok = IdlePauseConfig(enabled=True, redis={"dsn": "redis://x", "lock_ttl_seconds": 45})
+    assert ok.redis.lock_ttl_seconds == 45
+
+
+def test_load_config_idle_pause_dotted_redis_keys(tmp_path, monkeypatch):
+    _reset_config(monkeypatch)
+    toml = textwrap.dedent(
+        """
+        [server]
+        host = "127.0.0.1"
+        port = 9000
+
+        [automation.idle_pause]
+        enabled = true
+        sweep_interval_seconds = 10
+        activity_ttl_seconds = 3600
+        redis.dsn = "redis://example:6379/2"
+        redis.lock_ttl_seconds = 45
+
+        [runtime]
+        type = "kubernetes"
+        execd_image = "opensandbox/execd:test"
+        """
+    )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(toml)
+
+    loaded = config_module.load_config(config_path)
+    ip = loaded.automation.idle_pause
+    assert ip.enabled is True
+    assert ip.sweep_interval_seconds == 10
+    assert ip.activity_ttl_seconds == 3600
+    assert ip.redis.dsn == "redis://example:6379/2"
+    assert ip.redis.lock_ttl_seconds == 45
+
+
 def test_renew_intent_redis_requires_dsn_when_enabled():
     with pytest.raises(ValidationError):
         RenewIntentRedisConfig(enabled=True, dsn=None)
@@ -473,6 +527,15 @@ def test_full_config_includes_store_sections(tmp_path) -> None:
     assert "[store]" in content
     assert "[store.postgresql]" in content
     assert "min_pool_size" in content
+
+
+def test_full_config_documents_container_runtime_network_modes(tmp_path) -> None:
+    """`osb config init` renders pydantic field descriptions, so they must list every accepted mode."""
+    config_path = render_full_config(tmp_path / "generated.toml")
+
+    content = config_path.read_text()
+    for mode in ("host", "bridge", "none", "pasta", "slirp4netns"):
+        assert mode in content
 
 
 def test_load_config_renew_intent_legacy_redis_subtable(tmp_path, monkeypatch):
@@ -1280,6 +1343,457 @@ def test_load_config_rejects_invalid_egress_resources_at_startup(
 
     with pytest.raises(ValidationError, match=error):
         config_module.load_config(config_path)
+
+
+# Expected results verified against the egress Go parseUpstreamProxy
+# (components/egress/pkg/mitmproxy/upstream.go); `%C3%A9` is intentionally
+# stricter than Go.
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://proxy.local:3128",
+        "https://proxy.local",
+        "http://[::1]:3128",
+        "HTTP://proxy:3128",
+        "Https://proxy",
+        "http://pro_xy:3128",
+        "http://pro!xy:3128",
+        "http://proxy:",
+        "http://proxy.local:3128/",
+        "http://[fe80::1%25eth0]:3128",
+    ],
+)
+def test_egress_upstream_proxy_accepts_valid_urls(url):
+    cfg = EgressConfig(
+        image="opensandbox/egress:v1",
+        mode=EGRESS_MODE_DNS_NFT,
+        upstream_proxy=EgressUpstreamProxyConfig(url=url),
+    )
+    assert cfg.upstream_proxy is not None
+    assert cfg.upstream_proxy.url == url
+    assert cfg.upstream_proxy.authorization is None
+
+
+def test_egress_upstream_proxy_authorization_is_secret():
+    cfg = EgressConfig(
+        image="opensandbox/egress:v1",
+        mode=EGRESS_MODE_DNS_NFT,
+        upstream_proxy=EgressUpstreamProxyConfig(
+            url="http://proxy.local:3128",
+            authorization=SecretStr("Basic s3cr3t-value"),
+        ),
+    )
+    assert cfg.upstream_proxy is not None
+    assert isinstance(cfg.upstream_proxy.authorization, SecretStr)
+    assert (
+        cfg.upstream_proxy.authorization.get_secret_value()
+        == "Basic s3cr3t-value"
+    )
+    assert "s3cr3t-value" not in repr(cfg)
+    assert "s3cr3t-value" not in str(cfg)
+
+
+def test_egress_upstream_proxy_defaults_to_none():
+    cfg = EgressConfig(image="opensandbox/egress:v1")
+    assert cfg.upstream_proxy is None
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "proxy:3128",
+        "ftp://proxy:21",
+        "http://:3128",
+        "http://proxy:3128/x",
+        "http://proxy:3128?x=1",
+        "http://proxy:3128#f",
+        "http://proxy:0",
+        "http://proxy:70000",
+        "http://proxy:abc",
+        "http://proxy\\corp:3128",
+        "http://exa\tmple.com:3128",
+        "http://exa\rmple.com:3128",
+        "http://exa\x00mple:3128",
+        "http://exa\x7fmple:3128",
+        "http://pro%xy:3128",
+        "http://proxy%20name:3128",
+        "http://pro%C3%A9xy:3128",
+        "http://prox y:3128",
+        "http://proxy|a:3128",
+        "http://proxy{a}:3128",
+        "http://proxy^a:3128",
+        "http://proxy`a:3128",
+    ],
+)
+def test_egress_upstream_proxy_rejects_invalid_urls(url):
+    with pytest.raises(ValidationError):
+        EgressConfig(
+            image="opensandbox/egress:v1",
+            mode=EGRESS_MODE_DNS_NFT,
+            upstream_proxy=EgressUpstreamProxyConfig(url=url),
+        )
+
+
+def test_egress_upstream_proxy_userinfo_error_does_not_leak_credentials():
+    with pytest.raises(ValidationError) as exc_info:
+        EgressConfig(
+            image="opensandbox/egress:v1",
+            mode=EGRESS_MODE_DNS_NFT,
+            upstream_proxy=EgressUpstreamProxyConfig(
+                url="http://user:s3cr3t@proxy:3128"
+            ),
+        )
+    assert "s3cr3t" not in str(exc_info.value)
+
+
+def test_egress_upstream_proxy_authorization_rejects_newlines_without_leak():
+    with pytest.raises(ValidationError) as exc_info:
+        EgressConfig(
+            image="opensandbox/egress:v1",
+            mode=EGRESS_MODE_DNS_NFT,
+            upstream_proxy=EgressUpstreamProxyConfig(
+                url="http://proxy.local:3128",
+                authorization=SecretStr("Basic s3cr3t\nInjected: x"),
+            ),
+        )
+    assert "s3cr3t" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("authorization", ["   ", "\t"])
+def test_egress_upstream_proxy_whitespace_authorization_normalizes_to_none(
+    authorization,
+):
+    cfg = EgressUpstreamProxyConfig(
+        url="http://proxy.local:3128", authorization=SecretStr(authorization)
+    )
+    assert cfg.authorization is None
+
+
+def test_load_config_with_egress_upstream_proxy(tmp_path, monkeypatch):
+    _reset_config(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [runtime]
+            type = "docker"
+            execd_image = "opensandbox/execd:test"
+
+            [egress]
+            image = "opensandbox/egress:test"
+            mode = "dns+nft"
+
+            [egress.upstream_proxy]
+            url = "http://proxy.local:3128"
+            authorization = "Basic dGVzdDp0ZXN0"
+            """
+        )
+    )
+
+    loaded = config_module.load_config(config_path)
+
+    assert loaded.egress is not None
+    assert loaded.egress.upstream_proxy is not None
+    assert loaded.egress.upstream_proxy.url == "http://proxy.local:3128"
+    assert loaded.egress.upstream_proxy.authorization is not None
+    assert (
+        loaded.egress.upstream_proxy.authorization.get_secret_value()
+        == "Basic dGVzdDp0ZXN0"
+    )
+
+
+def test_load_config_rejects_upstream_proxy_userinfo_without_leak(
+    tmp_path, monkeypatch
+):
+    _reset_config(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [runtime]
+            type = "docker"
+            execd_image = "opensandbox/execd:test"
+
+            [egress]
+            image = "opensandbox/egress:test"
+            mode = "dns+nft"
+
+            [egress.upstream_proxy]
+            url = "http://user:s3cr3t@proxy.local:3128"
+            """
+        )
+    )
+
+    with pytest.raises(ValidationError) as exc_info:
+        config_module.load_config(config_path)
+
+    assert "s3cr3t" not in str(exc_info.value)
+
+
+def test_egress_upstream_proxy_requires_dns_nft_mode():
+    with pytest.raises(ValidationError, match='egress.mode = "dns\\+nft"'):
+        EgressConfig(
+            image="opensandbox/egress:v1",
+            upstream_proxy=EgressUpstreamProxyConfig(
+                url="http://proxy.local:3128"
+            ),
+        )
+
+
+def test_load_config_rejects_upstream_proxy_without_dns_nft(
+    tmp_path, monkeypatch
+):
+    _reset_config(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [runtime]
+            type = "docker"
+            execd_image = "opensandbox/execd:test"
+
+            [egress]
+            image = "opensandbox/egress:test"
+
+            [egress.upstream_proxy]
+            url = "http://proxy.local:3128"
+            """
+        )
+    )
+
+    with pytest.raises(ValidationError, match="dns\\+nft"):
+        config_module.load_config(config_path)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/etc/ssl/certs/upstream-ca.pem",
+        " /opt/ca/proxy.pem ",
+        "/var/lib/ca.pem",
+    ],
+)
+def test_egress_upstream_proxy_ca_cert_path_valid(path):
+    cfg = EgressUpstreamProxyConfig(
+        url="http://proxy.local:3128", ca_cert_path=path
+    )
+    assert cfg.ca_cert_path == path.strip()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "",
+        "   ",
+        "relative/ca.pem",
+        "./ca.pem",
+        "ca.pem",
+        "C:\\ca\\proxy.pem",
+        "/has:colon/ca.pem",
+        "/bad/\x00ca.pem",
+    ],
+)
+def test_egress_upstream_proxy_ca_cert_path_invalid(path):
+    with pytest.raises(ValidationError):
+        EgressUpstreamProxyConfig(
+            url="http://proxy.local:3128", ca_cert_path=path
+        )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "corp-proxy-ca",
+        " proxy-ca.ns1 ",
+        "a",
+        "ca-bundle.example.org",
+        "ca-" + "b" * 60,
+    ],
+)
+def test_egress_upstream_proxy_ca_secret_name_valid(name):
+    cfg = EgressUpstreamProxyConfig(
+        url="http://proxy.local:3128", ca_secret_name=name
+    )
+    assert cfg.ca_secret_name == name.strip()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "",
+        "   ",
+        "UPPER_CASE",
+        "has_underscore",
+        "-leading-dash",
+        "trailing-dash-",
+        "a..b",
+        "a" * 64,
+        "a" * 254,
+    ],
+)
+def test_egress_upstream_proxy_ca_secret_name_invalid(name):
+    with pytest.raises(ValidationError):
+        EgressUpstreamProxyConfig(
+            url="http://proxy.local:3128", ca_secret_name=name
+        )
+
+
+def test_egress_upstream_proxy_ca_fields_default_to_none():
+    cfg = EgressUpstreamProxyConfig(url="http://proxy.local:3128")
+    assert cfg.ca_cert_path is None
+    assert cfg.ca_secret_name is None
+
+
+def test_load_config_with_egress_upstream_proxy_ca_cert_path_docker(
+    tmp_path, monkeypatch
+):
+    _reset_config(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [runtime]
+            type = "docker"
+            execd_image = "opensandbox/execd:test"
+
+            [egress]
+            image = "opensandbox/egress:test"
+            mode = "dns+nft"
+
+            [egress.upstream_proxy]
+            url = "https://proxy.local:8443"
+            ca_cert_path = "/etc/ssl/private-ca/upstream.pem"
+            """
+        )
+    )
+
+    loaded = config_module.load_config(config_path)
+
+    assert loaded.egress is not None
+    assert loaded.egress.upstream_proxy is not None
+    assert (
+        loaded.egress.upstream_proxy.ca_cert_path
+        == "/etc/ssl/private-ca/upstream.pem"
+    )
+
+
+def test_load_config_with_egress_upstream_proxy_ca_secret_name_kubernetes(
+    tmp_path, monkeypatch
+):
+    _reset_config(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [runtime]
+            type = "kubernetes"
+            execd_image = "opensandbox/execd:test"
+
+            [egress]
+            image = "opensandbox/egress:test"
+            mode = "dns+nft"
+
+            [egress.upstream_proxy]
+            url = "https://proxy.local:8443"
+            ca_secret_name = "corp-proxy-ca"
+            """
+        )
+    )
+
+    loaded = config_module.load_config(config_path)
+
+    assert loaded.egress is not None
+    assert loaded.egress.upstream_proxy is not None
+    assert loaded.egress.upstream_proxy.ca_secret_name == "corp-proxy-ca"
+
+
+def test_load_config_rejects_ca_secret_name_on_docker(tmp_path, monkeypatch):
+    _reset_config(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [runtime]
+            type = "docker"
+            execd_image = "opensandbox/execd:test"
+
+            [egress]
+            image = "opensandbox/egress:test"
+            mode = "dns+nft"
+
+            [egress.upstream_proxy]
+            url = "https://proxy.local:8443"
+            ca_secret_name = "corp-proxy-ca"
+            """
+        )
+    )
+
+    with pytest.raises(
+        ValidationError, match="ca_secret_name requires runtime.type"
+    ):
+        config_module.load_config(config_path)
+
+
+def test_load_config_rejects_ca_cert_path_on_kubernetes(
+    tmp_path, monkeypatch
+):
+    _reset_config(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [runtime]
+            type = "kubernetes"
+            execd_image = "opensandbox/execd:test"
+
+            [egress]
+            image = "opensandbox/egress:test"
+            mode = "dns+nft"
+
+            [egress.upstream_proxy]
+            url = "https://proxy.local:8443"
+            ca_cert_path = "/etc/ssl/private-ca/upstream.pem"
+            """
+        )
+    )
+
+    with pytest.raises(
+        ValidationError, match="ca_cert_path requires runtime.type"
+    ):
+        config_module.load_config(config_path)
+
+
+def test_upstream_proxy_egress_env_emits_extra_ca_only_when_ca_source_set():
+    from opensandbox_server.services.helpers import (
+        upstream_proxy_egress_env,
+    )
+
+    no_ca = upstream_proxy_egress_env(
+        EgressUpstreamProxyConfig(url="http://proxy.local:3128")
+    )
+    assert "OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA" not in no_ca
+
+    with_path = upstream_proxy_egress_env(
+        EgressUpstreamProxyConfig(
+            url="http://proxy.local:3128",
+            ca_cert_path="/etc/ssl/certs/ca.pem",
+        )
+    )
+    assert (
+        with_path["OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA"]
+        == "/etc/ssl/certs/opensandbox-upstream-extra-ca.pem"
+    )
+
+    with_secret = upstream_proxy_egress_env(
+        EgressUpstreamProxyConfig(
+            url="http://proxy.local:3128",
+            ca_secret_name="corp-proxy-ca",
+        )
+    )
+    assert (
+        with_secret["OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA"]
+        == "/etc/ssl/certs/opensandbox-upstream-extra-ca.pem"
+    )
 
 
 def test_log_config_defaults():
