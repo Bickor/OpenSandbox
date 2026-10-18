@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+using OpenSandbox.Adapters;
 using OpenSandbox.Config;
 using OpenSandbox.Core;
 using OpenSandbox.Factory;
@@ -55,6 +56,17 @@ public sealed class Sandbox : IAsyncDisposable
     /// Gets the filesystem service.
     /// </summary>
     public ISandboxFiles Files { get; }
+
+    /// <summary>
+    /// Returns an independent filesystem client using explicit Linux credentials.
+    /// Unsupported servers fail without falling back to the default identity.
+    /// </summary>
+    public ISandboxFiles FilesWithIdentity(uint uid, uint gid)
+    {
+        if (Files is not IIdentitySandboxFiles adapter)
+            throw new NotSupportedException("The selected filesystem adapter does not support execution identity.");
+        return adapter.WithIdentity(uid, gid);
+    }
 
     /// <summary>
     /// Gets the health check service.
@@ -178,8 +190,14 @@ public sealed class Sandbox : IAsyncDisposable
         {
             throw new InvalidArgumentException("Entrypoint must be omitted when SnapshotId is provided.");
         }
+        options.Lifecycle?.IdlePolicy?.Validate();
         ValidateHostPaths(options.Volumes);
         var startupSource = options.Image ?? options.SnapshotId;
+
+        if (options.NetworkPolicy?.Egress is { Count: > 0 })
+        {
+            NetworkPolicyCodec.ValidateRules(options.NetworkPolicy.Egress, nameof(options.NetworkPolicy.Egress));
+        }
 
         var request = new CreateSandboxRequest
         {
@@ -233,11 +251,12 @@ public sealed class Sandbox : IAsyncDisposable
     /// </summary>
     /// <remarks>
     /// Template mode fixes the workload shape on the server: the entrypoint,
-    /// env, resources, volumes, platform and lifecycle of the sandbox come
-    /// from the template's golden image and cannot be overridden here. Only
-    /// metadata, network policy and extensions may accompany the template id,
-    /// and the timeout is required. The created sandbox routes egress policy
-    /// operations through the lifecycle control plane.
+    /// env, resources, volumes, platform and lifecycle hooks of the sandbox
+    /// come from the template's golden image and cannot be overridden here.
+    /// Only metadata, network policy, extensions and the OSEP-0024 idle policy
+    /// (control-plane state, not workload shape) may accompany the template
+    /// id, and the timeout is required. The created sandbox routes egress
+    /// policy operations through the lifecycle control plane.
     /// </remarks>
     /// <param name="options">The template creation options.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
@@ -254,8 +273,14 @@ public sealed class Sandbox : IAsyncDisposable
         {
             throw new InvalidArgumentException("TemplateId must be specified.");
         }
+        options.IdlePolicy?.Validate();
 
         var connectionConfig = options.ConnectionConfig ?? new ConnectionConfig();
+        if (options.NetworkPolicy?.Egress is { Count: > 0 })
+        {
+            NetworkPolicyCodec.ValidateRules(options.NetworkPolicy.Egress, nameof(options.NetworkPolicy.Egress));
+        }
+
         var request = new CreateSandboxRequest
         {
             TemplateId = options.TemplateId,
@@ -268,7 +293,10 @@ public sealed class Sandbox : IAsyncDisposable
                     Egress = options.NetworkPolicy.Egress
                 }
                 : null,
-            Extensions = options.Extensions?.ToDictionary(kv => kv.Key, kv => (object)kv.Value)
+            Extensions = options.Extensions?.ToDictionary(kv => kv.Key, kv => (object)kv.Value),
+            Lifecycle = options.IdlePolicy != null
+                ? new SandboxLifecycle { IdlePolicy = options.IdlePolicy }
+                : null
         };
 
         return await LaunchAsync(
@@ -347,12 +375,19 @@ public sealed class Sandbox : IAsyncDisposable
             sandboxId = created.Id;
             logger.LogInformation("Sandbox created: {SandboxId}", sandboxId);
 
-            var endpoint = await sandboxes.GetSandboxEndpointAsync(
+            // Resolve endpoints through a readiness budget like ConnectAsync
+            // (fresh sandboxes may 404 with POD_IP_NOT_AVAILABLE).
+            using var budget = new ReadinessBudget(
+                readyTimeoutSeconds ?? Constants.DefaultReadyTimeoutSeconds,
+                cancellationToken);
+            var interval = healthCheckPollingInterval ?? Constants.DefaultHealthCheckPollingIntervalMillis;
+            var protocol = connectionConfig.Protocol == ConnectionProtocol.Https ? "https" : "http";
+
+            var endpoint = await budget.Endpoint(token => sandboxes.GetSandboxEndpointAsync(
                 sandboxId,
                 Constants.DefaultExecdPort,
                 connectionConfig.UseServerProxy,
-                cancellationToken).ConfigureAwait(false);
-            var protocol = connectionConfig.Protocol == ConnectionProtocol.Https ? "https" : "http";
+                token), interval).ConfigureAwait(false);
             var execdBaseUrl = $"{protocol}://{endpoint.EndpointAddress}";
             var execdHeaders = MergeHeaders(connectionConfig.Headers, endpoint.Headers);
 
@@ -390,11 +425,11 @@ public sealed class Sandbox : IAsyncDisposable
             }
             else
             {
-                var egressEndpoint = await sandboxes.GetSandboxEndpointAsync(
+                var egressEndpoint = await budget.Endpoint(token => sandboxes.GetSandboxEndpointAsync(
                     sandboxId,
                     Constants.DefaultEgressPort,
                     connectionConfig.UseServerProxy,
-                    cancellationToken).ConfigureAwait(false);
+                    token), interval).ConfigureAwait(false);
                 var egressBaseUrl = $"{protocol}://{egressEndpoint.EndpointAddress}";
                 var egressHeaders = MergeHeaders(connectionConfig.Headers, egressEndpoint.Headers);
 
@@ -431,12 +466,10 @@ public sealed class Sandbox : IAsyncDisposable
             if (!skipHealthCheck)
             {
                 logger.LogDebug("Waiting for sandbox readiness: {SandboxId}", sandboxId);
-                await sandbox.WaitUntilReadyAsync(new WaitUntilReadyOptions
-                {
-                    ReadyTimeoutSeconds = readyTimeoutSeconds ?? Constants.DefaultReadyTimeoutSeconds,
-                    PollingIntervalMillis = healthCheckPollingInterval ?? Constants.DefaultHealthCheckPollingIntervalMillis,
-                    HealthCheck = healthCheck
-                }, cancellationToken).ConfigureAwait(false);
+                // Reuse the endpoint budget so the ready timeout covers
+                // publication + health check once, mirroring ConnectAsync
+                // (WaitUntilReadyAsync would stack a second fresh budget).
+                await sandbox.CheckReadinessAsync(budget, interval, healthCheck).ConfigureAwait(false);
             }
 
             LifecycleMetricsReporter.ReportSandboxCreate(
@@ -457,9 +490,12 @@ public sealed class Sandbox : IAsyncDisposable
                 {
                     await sandboxes.DeleteSandboxAsync(sandboxId, CancellationToken.None).ConfigureAwait(false);
                 }
-                catch
+                catch (Exception cleanupEx)
                 {
-                    }
+                    // Best-effort zombie cleanup; never mask the create error,
+                    // but make the failure diagnosable.
+                    logger.LogError(cleanupEx, "Failed to clean up sandbox {SandboxId} after creation failure", sandboxId);
+                }
             }
 
             LifecycleMetricsReporter.ReportSandboxCreate(
@@ -752,7 +788,8 @@ public sealed class Sandbox : IAsyncDisposable
     }
 
     /// <summary>
-    /// Terminates the sandbox.
+    /// Requests irreversible sandbox termination.
+    /// Completes when deletion is accepted; runtime cleanup may continue afterward.
     /// </summary>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <exception cref="SandboxApiException">Thrown when the sandbox API returns an error.</exception>
@@ -763,7 +800,9 @@ public sealed class Sandbox : IAsyncDisposable
     }
 
     /// <summary>
-    /// Renews the sandbox expiration time.
+    /// Sets the sandbox expiration to the current time plus timeoutSeconds.
+    /// This may shorten or extend the remaining lifetime. The creation-time
+    /// server timeout limit does not apply.
     /// </summary>
     /// <param name="timeoutSeconds">The new timeout in seconds from now.</param>
     /// <param name="cancellationToken">Cancellation token.</param>

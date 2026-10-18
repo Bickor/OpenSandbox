@@ -14,13 +14,19 @@ janitor, node installer, runtime-agent + DART), `server` and
 `ingress-gateway`. The only env-owned manifests left are the kind cluster
 config and the SandboxPool resource.
 
-The last `up` stage creates one sandbox through the server API, reaches
-the in-sandbox execd `/ping` through the signed gateway route, and deletes
-it again. The environment is all-or-nothing: running fast-sandbox without
-the OpenSandbox layers is not a supported shape of this script.
+The last `up` stages drive the server through the opensandbox CLI (`osb`,
+installed fresh from PyPI into the workspace unless `OSB_BIN` is set):
+create a sandbox from the golden-image template, reach the in-sandbox
+execd `/ping` through the signed gateway route, and delete it again. Raw
+HTTP calls remain only where the CLI has no equivalent (networkpolicy
+replace, metadata merge-patch, snapshot re-entry fence). The environment
+is all-or-nothing: running fast-sandbox without the OpenSandbox layers is
+not a supported shape of this script.
 
 Requires a bare-metal Linux host with KVM (`/dev/kvm`), Docker, Go ≥ 1.25,
 cgroup v2, and `sudo` for the XFS StateRoot loop mount and sysctl bump.
+The CLI install requires `uv` (it manages its own ≥ 3.10 interpreter), or
+set `OSB_BIN` to a preinstalled `osb` binary.
 Full operational notes (topology, latency characteristics, production
 caveats): `fast-sandbox/docs/guides/firecracker-integration-env.md`.
 
@@ -31,12 +37,31 @@ caveats): `fast-sandbox/docs/guides/firecracker-integration-env.md`.
 ./scripts/fast-sandbox-env/integration-env.sh status    # component / pool / DART / OpenSandbox health
 ./scripts/fast-sandbox-env/integration-env.sh pool      # re-apply the pool only
 ./scripts/fast-sandbox-env/integration-env.sh sdk-e2e   # Python SDK e2e suite against the live stack
+./scripts/fast-sandbox-env/integration-env.sh idle-e2e  # OSEP-0024 idle-pause/wake suite (needs IDLE_PAUSE=1 up)
 ./scripts/fast-sandbox-env/integration-env.sh down      # teardown, host left clean
 ```
+
+### Idle-pause / wake-on-access profile (OSEP-0024)
+
+`IDLE_PAUSE=1 ./scripts/fast-sandbox-env/integration-env.sh up` additionally
+deploys an ephemeral Redis (`manifests/idle-pause/redis.yaml`, before the
+server — the sweeper connects at startup), enables the server
+`[automation.idle_pause]` sweeper (5s sweep) and the gateway's
+`--activity-enabled` + `--wake-enabled`,
+and runs an `idle-pause / wake-on-access` verify stage: an opted-in sandbox
+(`lifecycle.idlePolicy`, X=30s) is auto-paused with zero traffic, and the next
+gateway request wakes it (parked while the restore completes). The
+`idle-e2e` action then runs the SDK suite
+(`tests/python/tests/test_fsb_idle_pause_e2e.py`) covering auto-pause,
+wake-on-access through the SDK's wake retry contract, and the no-idlePolicy
+compatibility invariant. Sandboxes without `lifecycle.idlePolicy` are never
+auto-paused or auto-woken regardless of the profile.
 
 After `up`, point any OpenSandbox SDK at `http://127.0.0.1:18080` with the
 `OPEN-SANDBOX-API-KEY: fast-sandbox-env` header; sandbox endpoints are
 signed `f1.*` header routes served by the gateway at `http://127.0.0.1:18081`.
+The installed CLI works against the same stack, e.g.
+`OPEN_SANDBOX_DOMAIN=127.0.0.1:18080 OPEN_SANDBOX_API_KEY=fast-sandbox-env osb sandbox list`.
 
 The `up` verify stages are also available as Python SDK e2e tests
 (template create → gateway ping → networkpolicy convergence, lifecycle
@@ -127,7 +152,7 @@ applied with plain `kubectl apply` — the cluster keeps no helm state:
 preflight → sysctl → fast-sandbox checkout (pinned commit) → build images
 (6 fast-sandbox images via `manifests/release/build-fast-sandbox.sh` +
 egress + server + ingress) → XFS StateRoot → kind cluster + node labels
-(host ports 18080/18081) → MinIO → charts rendered + applied: base +
+(host ports 18080/18081) → RustFS → charts rendered + applied: base +
 fast-sandbox (CRDs, RBAC, control plane, installer, agent) → credentials →
 installer/agent roster asserted → charts rendered + applied: server +
 ingress gateway → SandboxTemplate golden image
@@ -143,9 +168,12 @@ Every stage logs to `$WORK/logs/`; failures dump component logs to
 
 ## Environment variables (selection)
 
+The RustFS migration replaces the previous `MINIO_*` and `MC_IMAGE` overrides.
+Before upgrading an existing environment, run `down` with the previous script.
+
 | Variable | Default | Meaning |
 |---|---|---|
-| `WORK` | `/data/fast-sandbox-env` when `/data` exists, else `$PWD/.fast-sandbox-env` | workspace + logs + XFS loop + MinIO data (heavy: prefer a big volume) |
+| `WORK` | `/data/fast-sandbox-env` when `/data` exists, else `$PWD/.fast-sandbox-env` | workspace + logs + XFS loop + RustFS data (heavy: prefer a big volume) |
 | `FSB_DIR` | `$WORK/fast-sandbox` | fast-sandbox checkout (env-owned clone, created when missing) |
 | `KIND_CLUSTER` | `fast-sandbox-integration` | kind cluster name |
 | `KIND_SINGLE` | `0` | `1` = single node (cache-only, no peer traffic) |
@@ -158,7 +186,11 @@ Every stage logs to `$WORK/logs/`; failures dump component logs to
 | — | agent-config defaults pinned by the chart | Firecracker asset version/kernel live in the runtime agent config (`runtime.config` chart value), hot-reloadable |
 | `POOL_MIN` / `POOL_MAX` | `2` / `2` | pool capacity (auto `1`/`1` when `KIND_SINGLE=1`) |
 | `WARM_IMAGES` | `0` | `1` = preheat pool instead of on-demand first-sandbox pull |
-| `SBX_IMAGE` / `EXECD` | `alpine:3.19` / `opensandbox/execd:1.1.0` | template build inputs |
-| `MINIO_PORT` | `9000` | host-side publish; in-cluster clients always use the container port |
-| `MINIO_CONSOLE_PORT` | `9001` | host-side MinIO console publish (human-only; override on port collision) |
+| `SBX_IMAGE` / `EXECD` | `opensandbox/fsb-sandbox-golden:latest` / `opensandbox/execd:latest` | template build inputs |
+| `RUSTFS_IMAGE` / `RC_IMAGE` | `rustfs/rustfs:latest` / `rustfs/rc:latest` | RustFS server and CLI images |
+| `RUSTFS_PORT` | `19000` | host-side S3 API publish; in-cluster clients use the RustFS container IP on port `9000` |
+| `RUSTFS_CONSOLE_PORT` | `19001` | host-side RustFS console publish (human-only; override on port collision) |
+| `RUSTFS_AK` / `RUSTFS_SK` | `integration-env` / `integration-env-secret` | local S3 credentials |
+| `RUSTFS_ENDPOINT` | auto-discovered kind-network IP on port `9000` | endpoint used by the fast-sandbox and OpenSandbox components |
 | `XFS_STATEROOT` / `XFS_SIZE` | `1` / `24G` | reflink StateRoot on/off, virtual size |
+| `OSB_PACKAGE` / `OSB_BIN` | `opensandbox-cli` / — | opensandbox CLI for the verify stages: latest from PyPI into the workspace venv, or a preinstalled `osb` binary |

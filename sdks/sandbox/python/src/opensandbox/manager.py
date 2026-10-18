@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -208,7 +208,8 @@ class SandboxManager:
 
     async def kill_sandbox(self, sandbox_id: str) -> None:
         """
-        Terminate a single sandbox.
+        Request irreversible termination of the remote sandbox. Returns when
+        deletion is accepted; runtime cleanup may continue afterward.
 
         Args:
             sandbox_id: Sandbox ID to terminate
@@ -218,7 +219,7 @@ class SandboxManager:
         """
         logger.info(f"Terminating sandbox: {sandbox_id}")
         await self._sandbox_service.kill_sandbox(sandbox_id)
-        logger.info(f"Successfully terminated sandbox: {sandbox_id}")
+        logger.info(f"Sandbox deletion accepted: {sandbox_id}")
 
     async def renew_sandbox(
         self, sandbox_id: str, timeout: timedelta

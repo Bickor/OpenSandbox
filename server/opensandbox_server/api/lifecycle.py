@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -246,7 +246,7 @@ def patch_sandbox_metadata(
     "/sandboxes/{sandbox_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     responses={
-        204: {"description": "Sandbox successfully deleted"},
+        204: {"description": "Sandbox deletion accepted. Runtime cleanup may still be in progress."},
         401: {"model": ErrorResponse, "description": "Authentication credentials are missing or invalid"},
         403: {"model": ErrorResponse, "description": "The authenticated user lacks permission for this operation"},
         404: {"model": ErrorResponse, "description": "The requested resource does not exist"},
@@ -261,7 +261,9 @@ def delete_sandbox(
     """
     Delete a sandbox.
 
-    Terminates sandbox execution. The sandbox will transition through Stopping state to Terminated.
+    Request sandbox deletion. Runtime cleanup may continue after the response.
+    For Kubernetes BatchSandbox workloads, queries report Stopping during cleanup
+    and return 404 once the resource is removed.
 
     Args:
         sandbox_id: Unique sandbox identifier
@@ -375,8 +377,9 @@ def renew_sandbox_expiration(
     """
     Renew sandbox expiration.
 
-    Renews the absolute expiration time of a sandbox.
-    The new expiration time must be in the future and after the current expiresAt time.
+    Sets the absolute expiration time of a sandbox to the supplied future timestamp.
+    This may shorten, preserve, or extend the current expiration.
+    The creation-time limit server.max_sandbox_timeout_seconds does not apply.
 
     Args:
         sandbox_id: Unique sandbox identifier

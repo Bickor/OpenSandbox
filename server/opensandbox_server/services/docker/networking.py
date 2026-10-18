@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -43,6 +43,7 @@ from opensandbox_server.services.constants import (
     OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT,
     OPENSANDBOX_EGRESS_SANDBOX_ID,
     OPENSANDBOX_EGRESS_TOKEN,
+    EGRESS_UPSTREAM_EXTRA_CA_PATH,
     OPENSANDBOX_RUNTIME_MOUNT_PATH,
     SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY,
     SANDBOX_EMBEDDING_PROXY_PORT_LABEL,
@@ -57,6 +58,7 @@ from opensandbox_server.services.endpoint_auth import (
     build_egress_auth_headers,
     merge_endpoint_headers,
 )
+from opensandbox_server.services.helpers import upstream_proxy_egress_env
 from opensandbox_server.services.validators import (
     ensure_credential_proxy_configured,
     ensure_egress_configured,
@@ -76,6 +78,10 @@ _CONTAINER_ENV_VARS = ("container", "CONTAINER")
 _CONTAINER_RUNTIME_VALUES = frozenset(
     {"podman", "docker", "oci", "lxc", "lxc-libvirt", "systemd-nspawn"}
 )
+# Bind hosts that name the process's own loopback: inside a container they never reach the
+# host-mapped ports, so they must not switch ``[docker].host_ip`` off (see the resolvers below).
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
 
 
 def _running_inside_docker_container() -> bool:
@@ -105,6 +111,21 @@ def _docker_error_indicates_unsupported_ipv6_sysctls(exc: DockerException) -> bo
 
 HOST_NETWORK_MODE = "host"
 BRIDGE_NETWORK_MODE = "bridge"
+NONE_NETWORK_MODE = "none"
+# Container-runtime network modes (as opposed to user-defined Docker networks). `pasta`
+# and `slirp4netns` are supported by some container runtimes (podman) and are the natural
+# choice where netavark/nftables is unavailable, e.g. rootless podman inside WSL2.
+PASTA_NETWORK_MODE = "pasta"
+SLIRP4NETNS_NETWORK_MODE = "slirp4netns"
+CONTAINER_RUNTIME_NETWORK_MODES = frozenset(
+    {
+        HOST_NETWORK_MODE,
+        BRIDGE_NETWORK_MODE,
+        NONE_NETWORK_MODE,
+        PASTA_NETWORK_MODE,
+        SLIRP4NETNS_NETWORK_MODE,
+    }
+)
 EGRESS_SIDECAR_LABEL = "opensandbox.io/egress-sidecar-for"
 
 
@@ -112,12 +133,16 @@ class DockerNetworkingMixin:
     """Mixin providing network validation, endpoint resolution, and egress sidecar."""
 
     def _is_user_defined_network(self) -> bool:
-        """Return True when network_mode is a named user-defined network (not host/bridge/none/container:*)."""
-        return self.network_mode not in {
-            HOST_NETWORK_MODE,
-            BRIDGE_NETWORK_MODE,
-            "none",
-        } and not self.network_mode.startswith("container:")
+        """Return True when network_mode is a named user-defined network.
+
+        Anything outside the container-runtime network modes (host/bridge/none/pasta/
+        slirp4netns) and the ``container:*`` form is treated as a Docker network name and
+        must exist before the sandbox is created.
+        """
+        return (
+            self.network_mode not in CONTAINER_RUNTIME_NETWORK_MODES
+            and not self.network_mode.startswith("container:")
+        )
 
     def _validate_network_exists(self) -> None:
         """Verify the configured user-defined Docker network exists before creating a sandbox."""
@@ -161,6 +186,24 @@ class DockerNetworkingMixin:
                 detail={
                     "code": SandboxErrorCodes.INVALID_PARAMETER,
                     "message": "networkPolicy is not supported when docker network_mode=host.",
+                },
+            )
+
+        # `none`, `pasta` and `slirp4netns` provide no bridge network for the egress sidecar
+        # to attach to, so network policy cannot be enforced with them.
+        if self.network_mode in {
+            NONE_NETWORK_MODE,
+            PASTA_NETWORK_MODE,
+            SLIRP4NETNS_NETWORK_MODE,
+        }:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": SandboxErrorCodes.INVALID_PARAMETER,
+                    "message": (
+                        f"networkPolicy is not supported when docker network_mode='{self.network_mode}'. "
+                        "Use network_mode='bridge' to enable network policy enforcement."
+                    ),
                 },
             )
 
@@ -264,6 +307,16 @@ class DockerNetworkingMixin:
                     labels,
                     port,
                 )
+            # User-mode networks (`pasta`, `slirp4netns`) have no host-routable container IP at
+            # all: the Docker-compatible inspect reports an empty IPAddress and no Networks entry,
+            # and the host reaches the sandbox through the published ports. Resolve those through
+            # the host mapping as well instead of failing with NETWORK_MODE_ENDPOINT_UNAVAILABLE.
+            if self.network_mode in {PASTA_NETWORK_MODE, SLIRP4NETNS_NETWORK_MODE}:
+                return self._resolve_host_mapped_endpoint(
+                    self._resolve_proxy_host(),
+                    labels,
+                    port,
+                )
             return self._resolve_internal_endpoint(container, port)
 
         # The server-side proxy needs a locally reachable host: when the
@@ -360,11 +413,15 @@ class DockerNetworkingMixin:
             return eip_cfg
         host_cfg = (self.app_config.server.host or "").strip()
         host_key = host_cfg.lower()
-        if host_key in {"", "0.0.0.0", "::"}:
+        # Inside a container, [docker].host_ip is where host-mapped ports answer; a loopback bind
+        # (the safe default beside the sandboxes' network) is never that address, so it must not
+        # turn the setting off. An explicit non-loopback bind is left as it is.
+        if host_key in {"", "0.0.0.0", "::"} or host_key in _LOOPBACK_HOSTS:
             if _running_inside_docker_container():
                 host_ip = self._get_docker_host_ip()
                 if host_ip:
                     return host_ip
+        if host_key in {"", "0.0.0.0", "::"}:
             return self._resolve_bind_ip(socket.AF_INET)
         return host_cfg
 
@@ -376,11 +433,14 @@ class DockerNetworkingMixin:
         """
         host_cfg = (self.app_config.server.host or "").strip()
         host_key = host_cfg.lower()
-        if host_key in {"", "0.0.0.0", "::"}:
+        # Same rule as the public host: inside a container, host_ip says where the host-mapped
+        # endpoints (execd, the egress sidecar's readiness probe) answer — for a loopback bind too.
+        if host_key in {"", "0.0.0.0", "::"} or host_key in _LOOPBACK_HOSTS:
             if _running_inside_docker_container():
                 host_ip = self._get_docker_host_ip()
                 if host_ip:
                     return host_ip
+        if host_key in {"", "0.0.0.0", "::"}:
             return "127.0.0.1"
         return host_cfg
 
@@ -472,6 +532,10 @@ class DockerNetworkingMixin:
             sidecar_env.append(
                 f"{OTEL_EXPORTER_OTLP_ENDPOINT}={self.app_config.egress.otlp_endpoint}"
             )
+        for key, value in upstream_proxy_egress_env(
+            self.app_config.egress.upstream_proxy
+        ).items():
+            sidecar_env.append(f"{key}={value}")
         if credential_proxy_enabled:
             sidecar_env.append(f"{OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT}=true")
         if self.app_config.egress.credential_providers:
@@ -489,9 +553,10 @@ class DockerNetworkingMixin:
                 if key not in skip_keys and value is not None:
                     sidecar_env.append(f"{key}={value}")
 
+        publish_host = self.app_config.docker.publish_host
         sidecar_port_bindings: dict[str, tuple[str, int]] = {
-            "44772": ("0.0.0.0", host_execd_port),
-            "8080": ("0.0.0.0", host_http_port),
+            "44772": (publish_host, host_execd_port),
+            "8080": (publish_host, host_http_port),
         }
         if extra_port_bindings:
             sidecar_port_bindings.update(extra_port_bindings)
@@ -501,10 +566,18 @@ class DockerNetworkingMixin:
             "cap_add": ["NET_ADMIN"],
             "port_bindings": normalize_port_bindings(sidecar_port_bindings),
         }
+        sidecar_binds: list[str] = []
         if runtime_volume_name:
-            base_sidecar_host_config_kwargs["binds"] = [
+            sidecar_binds.append(
                 f"{runtime_volume_name}:{OPENSANDBOX_RUNTIME_MOUNT_PATH}:rw"
-            ]
+            )
+        upstream_proxy = self.app_config.egress.upstream_proxy
+        if upstream_proxy is not None and upstream_proxy.ca_cert_path is not None:
+            sidecar_binds.append(
+                f"{upstream_proxy.ca_cert_path}:{EGRESS_UPSTREAM_EXTRA_CA_PATH}:ro"
+            )
+        if sidecar_binds:
+            base_sidecar_host_config_kwargs["binds"] = sidecar_binds
 
         def build_sidecar_host_config(*, include_ipv6_sysctls: bool) -> Any:
             sidecar_host_config_kwargs = dict(base_sidecar_host_config_kwargs)

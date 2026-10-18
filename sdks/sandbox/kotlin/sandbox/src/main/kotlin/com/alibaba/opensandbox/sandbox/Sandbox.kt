@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ import com.alibaba.opensandbox.sandbox.domain.models.diagnostics.DiagnosticConte
 import com.alibaba.opensandbox.sandbox.domain.models.execd.DEFAULT_EGRESS_PORT
 import com.alibaba.opensandbox.sandbox.domain.models.execd.DEFAULT_EXECD_PORT
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialProxyConfig
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.IdlePolicy
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.NetworkPolicy
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.NetworkRule
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PlatformSpec
@@ -44,6 +45,7 @@ import com.alibaba.opensandbox.sandbox.domain.services.Diagnostics
 import com.alibaba.opensandbox.sandbox.domain.services.Egress
 import com.alibaba.opensandbox.sandbox.domain.services.Filesystem
 import com.alibaba.opensandbox.sandbox.domain.services.Health
+import com.alibaba.opensandbox.sandbox.domain.services.IdentityFilesystem
 import com.alibaba.opensandbox.sandbox.domain.services.IsolationService
 import com.alibaba.opensandbox.sandbox.domain.services.Metrics
 import com.alibaba.opensandbox.sandbox.domain.services.Sandboxes
@@ -82,12 +84,13 @@ import java.time.OffsetDateTime
  *     .build()
  *
  * // Use the sandbox
- * sandbox.writeFile("script.py", "print('Hello World')")
- * val result = sandbox.execute("python script.py")
- * println(result.stdout) // Output: Hello World
+ * sandbox.files().writeFile("script.py", "print('Hello World')")
+ * val result = sandbox.commands().run("python script.py")
+ * println(result.logs.stdout.firstOrNull()?.text) // Output: Hello World
  *
  * // Always clean up resources
- * sandbox.terminate()
+ * sandbox.kill()
+ * sandbox.close()
  * ```
  *
  */
@@ -116,6 +119,25 @@ class Sandbox internal constructor(
      * @return Service for filesystem manipulation
      */
     fun files() = fileSystemService
+
+    /**
+     * Returns an independent filesystem client using explicit Linux credentials.
+     * Unsupported servers fail without falling back to the default identity.
+     *
+     * @throws UnsupportedOperationException if the configured filesystem does not support identity scoping
+     * @throws IllegalArgumentException if uid or gid is outside 0..4294967294
+     */
+    fun filesWithIdentity(
+        uid: Long,
+        gid: Long,
+    ): Filesystem {
+        val adapter =
+            fileSystemService as? IdentityFilesystem
+                ?: throw UnsupportedOperationException(
+                    "The selected filesystem adapter does not support execution identity",
+                )
+        return adapter.withIdentity(uid, gid)
+    }
 
     /**
      * Provides access to command execution operations.
@@ -521,6 +543,7 @@ class Sandbox internal constructor(
             metadata: Map<String, String>,
             networkPolicy: NetworkPolicy?,
             extensions: Map<String, String>,
+            idlePolicy: IdlePolicy?,
             connectionConfig: ConnectionConfig,
             healthCheck: ((Sandbox) -> Boolean)?,
             healthCheckPollingInterval: Duration,
@@ -546,6 +569,7 @@ class Sandbox internal constructor(
                                 metadata = metadata,
                                 networkPolicy = networkPolicy,
                                 extensions = extensions,
+                                idlePolicy = idlePolicy,
                             )
                         createdSandboxId = response.id
                         InitializationResult.NewSandbox(response.id)
@@ -652,10 +676,11 @@ class Sandbox internal constructor(
     }
 
     /**
-     * Gets the current status of this sandbox.
+     * Gets the public endpoint for a sandbox service port.
      *
-     * @return Current sandbox status including state and metadata
-     * @throws SandboxException if status cannot be retrieved
+     * @param port The port number to get the endpoint for
+     * @return Endpoint address and request headers for the service
+     * @throws SandboxException if the endpoint cannot be resolved
      */
     fun getEndpoint(port: Int): SandboxEndpoint {
         return sandboxService.getSandboxEndpoint(id, port, httpClientProvider.config.useServerProxy)
@@ -676,9 +701,9 @@ class Sandbox internal constructor(
     }
 
     /**
-     * Gets the current status of this sandbox.
+     * Gets current resource metrics (CPU/memory) for this sandbox.
      *
-     * @return Current sandbox status including state and metadata
+     * @return Latest reported metrics snapshot
      */
     fun getMetrics(): SandboxMetrics {
         return metricsService.getMetrics(id)
@@ -707,9 +732,11 @@ class Sandbox internal constructor(
     }
 
     /**
-     * Renew the sandbox expiration time to delay automatic termination.
+     * Set the sandbox expiration time.
      *
      * The new expiration time will be set to the current time plus the provided duration.
+     * This may shorten or extend the remaining lifetime. The creation-time
+     * server timeout limit does not apply.
      *
      * @param timeout Duration to add to the current time to set the new expiration
      * @throws SandboxException if the operation fails
@@ -780,8 +807,8 @@ class Sandbox internal constructor(
     }
 
     /**
-     * This method sends a termination signal to the remote sandbox instance, causing it to stop immediately.
-     * This is an irreversible operation.
+     * Request irreversible termination of the remote sandbox. Returns when deletion is accepted;
+     * runtime cleanup may continue afterward.
      *
      * Note: This method does NOT close the local `Sandbox` object resources (like connection pools).
      * You should call `close()` or use a try-with-resources block to clean up local resources.
@@ -1769,6 +1796,7 @@ class Sandbox internal constructor(
          * Optional outbound network policy (egress).
          */
         private var networkPolicy: NetworkPolicy? = null
+        private var idlePolicy: IdlePolicy? = null
 
         /**
          * Optional extension parameters for server-side custom behaviors.
@@ -1865,6 +1893,25 @@ class Sandbox internal constructor(
          */
         fun networkPolicy(networkPolicy: NetworkPolicy): TemplateLauncher {
             this.networkPolicy = networkPolicy
+            return this
+        }
+
+        /**
+         * Sets the OSEP-0024 idle policy (fast-sandbox only). Control-plane
+         * state, not workload shape, so template mode accepts it.
+         */
+        fun idlePolicy(idlePolicy: IdlePolicy): TemplateLauncher {
+            this.idlePolicy = idlePolicy
+            return this
+        }
+
+        /**
+         * Configures the OSEP-0024 idle policy using a fluent configuration block.
+         */
+        fun idlePolicy(configure: IdlePolicy.Builder.() -> Unit): TemplateLauncher {
+            val builder = IdlePolicy.builder()
+            builder.configure()
+            this.idlePolicy = builder.build()
             return this
         }
 
@@ -2002,6 +2049,7 @@ class Sandbox internal constructor(
                 metadata = metadata,
                 networkPolicy = networkPolicy,
                 extensions = extensions,
+                idlePolicy = idlePolicy,
                 connectionConfig = connectionConfig ?: ConnectionConfig.builder().build(),
                 healthCheck = healthCheck,
                 healthCheckPollingInterval = healthCheckPollingInterval,

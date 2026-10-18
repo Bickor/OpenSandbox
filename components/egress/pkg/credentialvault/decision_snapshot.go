@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -163,6 +163,9 @@ func validCanonicalStringsOnly(values []string, valid func(string) bool) bool {
 }
 
 func validRenderedCredentials(binding *ActiveBinding, redactions map[string]struct{}) bool {
+	if binding.Dynamic {
+		return len(binding.Headers) == 0 && len(binding.Substitutions) == 0
+	}
 	seenHeaders := make(map[string]struct{}, len(binding.Headers))
 	for _, header := range binding.Headers {
 		key := strings.ToLower(header.Name)

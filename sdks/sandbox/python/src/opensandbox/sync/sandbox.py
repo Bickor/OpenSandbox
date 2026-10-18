@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -39,6 +39,7 @@ from opensandbox.models.diagnostics import DiagnosticContent
 from opensandbox.models.sandboxes import (
     CreateSnapshotRequest,
     CredentialProxyConfig,
+    IdlePolicy,
     NetworkPolicy,
     NetworkRule,
     PlatformSpec,
@@ -195,6 +196,19 @@ class SandboxSync:
         """
         return self._filesystem_service
 
+    def files_with_identity(self, uid: int, gid: int) -> FilesystemSync:
+        """Return an independent filesystem client using explicit Linux credentials.
+
+        Requires identity-aware Execd; unsupported servers never trigger fallback.
+        """
+        from opensandbox.sync.adapters.filesystem_adapter import FilesystemAdapterSync
+
+        if not isinstance(self._filesystem_service, FilesystemAdapterSync):
+            raise NotImplementedError(
+                "The selected filesystem adapter does not support execution identity"
+            )
+        return self._filesystem_service.with_identity(uid, gid)
+
     @property
     def commands(self) -> CommandsSync:
         """
@@ -320,9 +334,11 @@ class SandboxSync:
 
     def renew(self, timeout: timedelta) -> SandboxRenewResponse:
         """
-        Renew the sandbox expiration time to delay automatic termination.
+        Set the sandbox expiration time.
 
         The new expiration time will be set to the current time plus the provided duration.
+        This may shorten or extend the remaining lifetime. The creation-time
+        server timeout limit does not apply.
 
         Args:
             timeout: Duration to add to the current time to set the new expiration
@@ -400,9 +416,8 @@ class SandboxSync:
 
     def kill(self) -> None:
         """
-        Send a termination signal to the remote sandbox instance.
-
-        This is an irreversible operation that stops the sandbox immediately.
+        Request irreversible termination of the remote sandbox. Returns when
+        deletion is accepted; runtime cleanup may continue afterward.
 
         Note: This method does NOT close the local resources. Use :meth:`close` or
         the sync context manager to clean up local resources.
@@ -614,6 +629,7 @@ class SandboxSync:
         metadata: dict[str, str] | None = None,
         network_policy: NetworkPolicy | None = None,
         extensions: dict[str, str] | None = None,
+        idle_policy: IdlePolicy | None = None,
         connection_config: ConnectionConfigSync | None = None,
         health_check: Callable[["SandboxSync"], bool] | None = None,
         health_check_polling_interval: timedelta = timedelta(milliseconds=200),
@@ -623,10 +639,11 @@ class SandboxSync:
         Create a new sandbox from a ``Succeeded`` fsb template (blocking).
 
         Template mode fixes the workload shape on the server: the entrypoint,
-        env, resources, volumes, platform and lifecycle of the sandbox come
+        env, resources, volumes, platform and lifecycle hooks of the sandbox come
         from the template's golden image and cannot be overridden here. Only
-        metadata, network policy and extensions may accompany the template id,
-        and the timeout is required.
+        metadata, network policy, extensions and the control-plane
+        ``idle_policy`` (OSEP-0024 ``lifecycle.idlePolicy``) may accompany the
+        template id, and the timeout is required.
 
         Args:
             template_id: ID of a ``Succeeded`` fsb template (see
@@ -637,6 +654,7 @@ class SandboxSync:
             network_policy: Optional outbound network policy (egress).
             extensions: Opaque extension parameters passed through to the server as-is.
                 Prefer namespaced keys (e.g. ``storage.id``).
+            idle_policy: Optional idle behavior (OSEP-0024, fast-sandbox only).
             connection_config: Connection configuration
             health_check: Custom sync health check function
             health_check_polling_interval: Polling interval used while waiting for endpoint publication and readiness/health.
@@ -676,6 +694,7 @@ class SandboxSync:
                 metadata=metadata,
                 network_policy=network_policy,
                 extensions=extensions,
+                idle_policy=idle_policy,
             ),
             origin=SandboxOrigin.TEMPLATE,
         )
@@ -709,17 +728,23 @@ class SandboxSync:
                 # Template-backed (fsb) sandboxes have no sandbox-side egress
                 # sidecar: policy operations go through the lifecycle control
                 # plane.
-                execd_endpoint = budget.endpoint_sync(lambda: sandbox_service.get_sandbox_endpoint(
-                    response.id, DEFAULT_EXECD_PORT, config.use_server_proxy
-                ))
+                execd_endpoint = budget.endpoint_sync(
+                    lambda: sandbox_service.get_sandbox_endpoint(
+                        response.id, DEFAULT_EXECD_PORT, config.use_server_proxy
+                    )
+                )
                 egress_service = factory.create_network_policy_service(response.id)
             else:
-                execd_endpoint = budget.endpoint_sync(lambda: sandbox_service.get_sandbox_endpoint(
-                    response.id, DEFAULT_EXECD_PORT, config.use_server_proxy
-                ))
-                egress_endpoint = budget.endpoint_sync(lambda: sandbox_service.get_sandbox_endpoint(
-                    response.id, DEFAULT_EGRESS_PORT, config.use_server_proxy
-                ))
+                execd_endpoint = budget.endpoint_sync(
+                    lambda: sandbox_service.get_sandbox_endpoint(
+                        response.id, DEFAULT_EXECD_PORT, config.use_server_proxy
+                    )
+                )
+                egress_endpoint = budget.endpoint_sync(
+                    lambda: sandbox_service.get_sandbox_endpoint(
+                        response.id, DEFAULT_EGRESS_PORT, config.use_server_proxy
+                    )
+                )
                 # The server is authoritative about the runtime backing: for
                 # fsb- prefixed sandboxes it reports `template` even when the
                 # create used a snapshotId (a restore boots the template's
@@ -771,7 +796,7 @@ class SandboxSync:
             )
 
             return sandbox
-        except Exception as e:
+        except BaseException as e:
             report_sandbox_create_metric(
                 config,
                 sandbox_id=sandbox_id,
@@ -785,9 +810,14 @@ class SandboxSync:
                         f"Sandbox creation failed during initialization. Attempting to terminate zombie sandbox: {sandbox_id}"
                     )
                     sandbox_service.kill_sandbox(sandbox_id)
-                except Exception:
-                    pass
+                except Exception as cleanup_ex:
+                    logger.error(
+                        f"Failed to clean up sandbox {sandbox_id} after creation failure",
+                        exc_info=cleanup_ex,
+                    )
             config.close_transport_if_owned()
+            if not isinstance(e, Exception):
+                raise
             if isinstance(e, SandboxException):
                 raise
             raise SandboxInternalException(
@@ -835,9 +865,11 @@ class SandboxSync:
         try:
             sandbox_service = factory.create_sandbox_service()
             budget = ReadinessBudget(connect_timeout, health_check_polling_interval)
-            execd_endpoint = budget.endpoint_sync(lambda: sandbox_service.get_sandbox_endpoint(
-                sandbox_id, DEFAULT_EXECD_PORT, config.use_server_proxy
-            ))
+            execd_endpoint = budget.endpoint_sync(
+                lambda: sandbox_service.get_sandbox_endpoint(
+                    sandbox_id, DEFAULT_EXECD_PORT, config.use_server_proxy
+                )
+            )
             origin = execd_endpoint.origin or SandboxOrigin.UNKNOWN
             if origin == SandboxOrigin.TEMPLATE:
                 # Template-backed (fsb) sandboxes have no sandbox-side egress
@@ -845,9 +877,11 @@ class SandboxSync:
                 # plane, and the egress sidecar endpoint is never resolved.
                 egress_service = factory.create_network_policy_service(sandbox_id)
             else:
-                egress_endpoint = budget.endpoint_sync(lambda: sandbox_service.get_sandbox_endpoint(
-                    sandbox_id, DEFAULT_EGRESS_PORT, config.use_server_proxy
-                ))
+                egress_endpoint = budget.endpoint_sync(
+                    lambda: sandbox_service.get_sandbox_endpoint(
+                        sandbox_id, DEFAULT_EGRESS_PORT, config.use_server_proxy
+                    )
+                )
                 egress_service = factory.create_egress_service(egress_endpoint)
 
             sandbox = cls(
@@ -926,9 +960,11 @@ class SandboxSync:
             sandbox_service.resume_sandbox(sandbox_id)
 
             budget = ReadinessBudget(resume_timeout, health_check_polling_interval)
-            execd_endpoint = budget.endpoint_sync(lambda: sandbox_service.get_sandbox_endpoint(
-                sandbox_id, DEFAULT_EXECD_PORT, config.use_server_proxy
-            ))
+            execd_endpoint = budget.endpoint_sync(
+                lambda: sandbox_service.get_sandbox_endpoint(
+                    sandbox_id, DEFAULT_EXECD_PORT, config.use_server_proxy
+                )
+            )
             origin = execd_endpoint.origin or SandboxOrigin.UNKNOWN
             if origin == SandboxOrigin.TEMPLATE:
                 # Template-backed (fsb) sandboxes have no sandbox-side egress
@@ -936,9 +972,11 @@ class SandboxSync:
                 # plane, and the egress sidecar endpoint is never resolved.
                 egress_service = factory.create_network_policy_service(sandbox_id)
             else:
-                egress_endpoint = budget.endpoint_sync(lambda: sandbox_service.get_sandbox_endpoint(
-                    sandbox_id, DEFAULT_EGRESS_PORT, config.use_server_proxy
-                ))
+                egress_endpoint = budget.endpoint_sync(
+                    lambda: sandbox_service.get_sandbox_endpoint(
+                        sandbox_id, DEFAULT_EGRESS_PORT, config.use_server_proxy
+                    )
+                )
                 egress_service = factory.create_egress_service(egress_endpoint)
 
             sandbox = cls(

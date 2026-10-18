@@ -446,7 +446,9 @@ export interface paths {
         post?: never;
         /**
          * Delete a sandbox
-         * @description Delete a sandbox, terminating its execution. The sandbox will transition through Stopping state to Terminated.
+         * @description Request sandbox deletion. Runtime cleanup may continue after the response.
+         *     For Kubernetes BatchSandbox workloads, queries report Stopping during cleanup
+         *     and return 404 once the resource is removed.
          */
         delete: {
             parameters: {
@@ -460,11 +462,7 @@ export interface paths {
             };
             requestBody?: never;
             responses: {
-                /**
-                 * @description Sandbox successfully deleted.
-                 *
-                 *     Sandbox has been scheduled for termination and will transition to Stopping state, then Terminated.
-                 */
+                /** @description Sandbox deletion accepted. Runtime cleanup may still be in progress. */
                 204: {
                     headers: {
                         "X-Request-ID": components["headers"]["XRequestId"];
@@ -740,7 +738,10 @@ export interface paths {
         put?: never;
         /**
          * Renew sandbox expiration
-         * @description Renew the absolute expiration time of a sandbox.
+         * @description Set the absolute expiration time of a sandbox to the supplied future timestamp.
+         *     This may shorten, preserve, or extend the current expiration.
+         *     The server configuration `server.max_sandbox_timeout_seconds` applies only
+         *     to `timeout` on creation and does not limit this operation.
          */
         post: {
             parameters: {
@@ -1249,11 +1250,14 @@ export interface components {
             timeoutSeconds?: number;
         };
         /**
-         * @description Extensible container for sandbox lifecycle hooks. All fields are optional.
-         *     Future lifecycle events are added as new optional fields without changing
-         *     the semantics of existing fields.
+         * @description Extensible container for sandbox lifecycle configuration. All fields
+         *     are optional. Future lifecycle events are added as new optional
+         *     fields without changing the semantics of existing fields.
          *
-         *     This release supports only `preStart` and `periodic`.
+         *     `preStart` and `periodic` are hooks executed inside the sandbox by
+         *     execd. `idlePolicy` is control-plane policy (OSEP-0024): it tells the
+         *     server how to treat the sandbox's state machine and never reaches the
+         *     guest.
          */
         SandboxLifecycle: {
             /**
@@ -1268,6 +1272,75 @@ export interface components {
              *     its previous run is still active.
              */
             periodic?: components["schemas"]["PeriodicLifecycleHook"][];
+            /**
+             * @description Auto-pause and wake-on-access behavior (OSEP-0024). Supported only
+             *     by the fast-sandbox backend; other backends reject the field.
+             *     Omitting `idlePolicy` preserves non-automated behavior exactly:
+             *     the sandbox is never auto-paused and never auto-woken.
+             */
+            idlePolicy?: components["schemas"]["IdlePolicy"];
+        };
+        /**
+         * @description Idle behavior declared by the sandbox (OSEP-0024). The policy is
+         *     desired state: the server validates it and persists it as the
+         *     reserved `sandbox.opensandbox.io/idle-policy` Sandbox CR annotation.
+         *
+         *     With `idleTimeoutSeconds`, the sandbox is auto-paused after that many
+         *     seconds without ingress-observed activity. Without it, the policy is
+         *     wake-only: the sandbox is never auto-paused, but a (manually) paused
+         *     sandbox wakes on access. A missing, malformed, or invalid policy is
+         *     treated exactly as absent — never as an implicit opt-in.
+         *
+         *     Constraints: `idleTimeoutSeconds` must not exceed the server's
+         *     configured activity TTL (default 1800), so a present-but-stale
+         *     activity key always implies idle-by-value. Enabling deployment flags
+         *     never changes the behavior of sandboxes that do not declare a policy.
+         */
+        IdlePolicy: {
+            /**
+             * @description Idle threshold X in seconds: the sandbox is auto-paused after X
+             *     continuously idle seconds. Absent together with `onIdle` means a
+             *     wake-only policy.
+             */
+            idleTimeoutSeconds?: number;
+            /**
+             * @description Action taken at the idle threshold. Required with, and only
+             *     valid with, `idleTimeoutSeconds`. Only `pause` exists today; the
+             *     enum exists so future actions are additive.
+             * @enum {string}
+             */
+            onIdle?: "pause";
+            /**
+             * @description Whether incoming traffic may wake the sandbox from `Paused`.
+             *     Defaults to `true` when omitted.
+             *     `false` keeps today's paused behavior (permanent 503 through the
+             *     gateway) and only `POST /sandboxes/{sandboxId}/resume` restores
+             *     the sandbox.
+             */
+            wakeOnAccess?: boolean;
+            /**
+             * @description Application-declared activity probe. When the sandbox is
+             *     otherwise idle, the server issues `GET {path}` on `{port}`;
+             *     `200 {"active": true}` counts as activity and resets the idle
+             *     clock, while `{"active": false}`, any failure, or a timeout
+             *     records nothing. Relevant only with auto-pause.
+             */
+            activeProbe?: components["schemas"]["ActivityProbe"];
+        };
+        /**
+         * @description Endpoint inside the sandbox that answers `{"active": bool,
+         *     "message"?: string}` with 200 while work is in progress.
+         */
+        ActivityProbe: {
+            /** @description Sandbox port serving the probe endpoint. */
+            port: number;
+            /**
+             * @description Absolute HTTP path of the probe endpoint. Must not contain
+             *     whitespace or control characters.
+             */
+            path: string;
+            /** @description Probe request budget in seconds. The server defaults to 2 when omitted. */
+            timeoutSeconds?: number;
         };
         /**
          * @description JSON Merge Patch (RFC 7396) request body for updating sandbox metadata.
@@ -1327,7 +1400,9 @@ export interface components {
              *     the workload shape is fixed by the template's golden image, so
              *     `entrypoint`, `env`, `resourceLimits`, `resourceRequests`,
              *     `volumes`, `platform`, `credentialProxy`, `secureAccess` and
-             *     `lifecycle` are rejected (400), and `timeout` is required.
+             *     lifecycle hooks are rejected (400), and `timeout` is required.
+             *     `lifecycle.idlePolicy` is allowed: it is control-plane state,
+             *     not workload shape.
              *     The template must belong to the requester's tenant and be
              *     `Succeeded`; anything else yields 404 (no existence leak).
              */
@@ -1390,15 +1465,17 @@ export interface components {
                 [key: string]: string;
             };
             /**
-             * @description Optional declarative sandbox lifecycle hooks. This release supports
-             *     `preStart` and `periodic`. The server transports this configuration to
-             *     execd; callers must not depend on the internal transport mechanism.
-             *     The configuration is not included in Sandbox responses.
+             * @description Optional declarative sandbox lifecycle configuration. `preStart`
+             *     and `periodic` are hooks; the server transports them to execd and
+             *     callers must not depend on the internal transport mechanism. The
+             *     configuration is not included in Sandbox responses.
              *
-             *     Not supported together with `extensions.poolRef`, because Pool Pods
-             *     are pre-created before request-specific lifecycle hooks are known.
-             *     Runtimes that do not implement lifecycle hook transport reject this
-             *     field.
+             *     Lifecycle hooks are not supported together with
+             *     `extensions.poolRef`, because Pool Pods are pre-created before
+             *     request-specific hooks are known. Runtimes that do not implement
+             *     lifecycle hook transport reject hooks. `lifecycle.idlePolicy` is
+             *     not a hook and may accompany `extensions.poolRef`; it is honored
+             *     only by the fast-sandbox backend and rejected by others.
              */
             lifecycle?: components["schemas"]["SandboxLifecycle"];
             /**
@@ -1499,7 +1576,8 @@ export interface components {
             /**
              * Format: date-time
              * @description New absolute expiration time in UTC (RFC 3339 format).
-             *     Must be in the future and after the current expiresAt time.
+             *     Must be in the future. May be earlier than, equal to, or later than the current expiresAt.
+             *     The creation-time limit `server.max_sandbox_timeout_seconds` does not apply.
              *
              *     Example: "2025-11-16T14:30:45Z"
              */
@@ -1593,6 +1671,7 @@ export interface components {
              */
             enabled: boolean;
         };
+        /** @description Egress rule. At least one of `target` or `ports` must be provided; when both are present the rule applies to `ports` on `target` only. Enforced by the server and the egress sidecar. */
         NetworkRule: {
             /**
              * @description Whether to allow or deny matching targets.
@@ -1600,10 +1679,30 @@ export interface components {
              */
             action: "allow" | "deny";
             /**
-             * @description FQDN or wildcard domain (e.g., "example.com", "*.example.com").
-             *     IP/CIDR not yet supported in the egress MVP.
+             * @description FQDN, wildcard domain (e.g., "example.com", "*.example.com"), IP
+             *     address, or CIDR. May be omitted when `ports` is set (see below);
+             *     otherwise required.
              */
-            target: string;
+            target?: string;
+            /**
+             * @description Restricts this rule to specific TCP destination ports.
+             *
+             *     - `target` omitted, `ports` set: the rule applies to these ports
+             *       across all IPv4/IPv6 destinations.
+             *     - `target` is an IP or CIDR, `ports` set: the rule applies to that
+             *       destination only on these ports.
+             *     - `target` is a domain: `ports` is rejected with a validation
+             *       error. Domain rules are evaluated at the DNS layer, which has no
+             *       port dimension; combining them is not supported yet.
+             *
+             *     TCP only for now; UDP port scoping is not supported.
+             *
+             *     Under `defaultAction: deny`, the DNS proxy still denies hostname
+             *     lookups for targetless allow rules (it matches domain rules
+             *     only), so this shape serves direct-IP clients; hostname access
+             *     requires explicit domain rules or stable IPs.
+             */
+            ports?: number[];
         };
         /**
          * @description Storage mount definition for a sandbox. Each volume entry contains:
@@ -1767,6 +1866,20 @@ export interface components {
              *     `["tail", "-f", "/dev/null"]`.
              */
             entrypoint?: string[];
+            /**
+             * @description Environment variables baked into the golden image (injected as
+             *     `/etc/sandbox-init.env` in the guest; literal values only). The
+             *     source image's own OCI `Config.Env` is inherited like a container
+             *     runtime would; an env with the same name here overrides the
+             *     inherited value. Names must be valid shell variable names
+             *     (`[A-Za-z_][A-Za-z0-9_]*`).
+             * @example {
+             *       "LOG_LEVEL": "info"
+             *     }
+             */
+            env?: {
+                [key: string]: string;
+            };
             /** @description Custom key-value metadata for management, filtering, and tagging. */
             metadata?: {
                 [key: string]: string;
@@ -1811,6 +1924,10 @@ export interface components {
             resourceLimits?: components["schemas"]["ResourceLimits"];
             /** @description Guest business command (argv). */
             entrypoint?: string[];
+            /** @description Environment variables baked into the golden image. */
+            env?: {
+                [key: string]: string;
+            };
             /** @description Custom metadata from the creation request. */
             metadata?: {
                 [key: string]: string;

@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,6 +42,11 @@ class CompositeSandboxService(SandboxService, ExtensionService):
     def __init__(self, kubernetes: KubernetesSandboxService, fsb: FastSandboxService):
         self._kubernetes = kubernetes
         self._fsb = fsb
+
+    @property
+    def fsb_service(self) -> FastSandboxService:
+        """The fsb backend, for background integrations."""
+        return self._fsb
 
     def _backend(self, sandbox_id: str) -> KubernetesSandboxService | FastSandboxService:
         return self._fsb if sandbox_id.startswith("fsb-") else self._kubernetes

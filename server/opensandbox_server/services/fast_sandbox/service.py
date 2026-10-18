@@ -1,7 +1,7 @@
 # pyright: reportAttributeAccessIssue=false
 # protobuf-generated modules expose dynamic attributes.
 
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,10 +25,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import datetime, timezone
+from threading import Lock
 from typing import Optional
 
 from fastapi import HTTPException
+from kubernetes.client import ApiException
 from starlette import status
 
 from opensandbox_server.api.schema import (
@@ -46,7 +49,17 @@ from opensandbox_server.api.schema import (
     SandboxStatus,
 )
 from opensandbox_server.config import AppConfig, KubernetesRuntimeConfig
+from opensandbox_server.extensions.keys import IDLE_POLICY_ANNOTATION_KEY
+from opensandbox_server.integrations.idle_pause.constants import DEFAULT_PROBE_TIMEOUT_SECONDS
+from opensandbox_server.integrations.idle_pause.policy import (
+    ActivityProbe as IdlePauseActivityProbe,
+)
+from opensandbox_server.integrations.idle_pause.policy import (
+    idle_policy_to_annotation,
+    validate_idle_policy,
+)
 from opensandbox_server.middleware.request_id import get_request_id
+from opensandbox_server.services.activity_recorder import ActivityRecorder
 from opensandbox_server.services.constants import SandboxErrorCodes
 from opensandbox_server.services.diagnostics import (
     DiagnosticResult,
@@ -69,7 +82,12 @@ from opensandbox_server.services.fast_sandbox.fastpath_client import (
     FastPathUnavailable,
 )
 from opensandbox_server.services.fast_sandbox.endpoint import build_endpoint
-from opensandbox_server.services.fast_sandbox.cr_reader import SandboxCRReader
+from opensandbox_server.services.fast_sandbox.cr_reader import (
+    GROUP,
+    PLURAL,
+    VERSION,
+    SandboxCRReader,
+)
 from opensandbox_server.services.fast_sandbox.cr_mapping import sandbox_from_cr
 from opensandbox_server.services.fast_sandbox.network_policy import (
     delete_policy_rules,
@@ -89,6 +107,8 @@ from opensandbox_server.services.validators import (
 )
 
 _SUPPORTED_EVENT_SCOPES = ("runtime", "all")
+
+logger = logging.getLogger(__name__)
 
 
 class FastSandboxService(SandboxService, ExtensionService):
@@ -110,8 +130,107 @@ class FastSandboxService(SandboxService, ExtensionService):
             timeout_seconds=self._k8s.fastpath_timeout_seconds,
         )
         self._tenant_provider = None  # type: ignore[assignment]
+        self._k8s_client = k8s_client
+        self._k8s_client_lock = Lock()
         self._cr_reader = SandboxCRReader(self._k8s, k8s_client)
         self._template_service = template_service
+        self._activity_recorder: Optional[ActivityRecorder] = None
+
+    @property
+    def cr_reader(self) -> SandboxCRReader:
+        """Informer-cached Sandbox CR reader, for background integrations."""
+        return self._cr_reader
+
+    @property
+    def fastpath_client(self) -> FastPathClient:
+        """Shared FastPath gRPC client, for background integrations."""
+        return self._fastpath
+
+    def set_activity_recorder(self, recorder: Optional[ActivityRecorder]) -> None:
+        """Inject the OSEP-0024 activity recorder (None disables the writes)."""
+        self._activity_recorder = recorder
+
+    def _record_activity(self, sandbox_id: str) -> None:
+        """Restart the idle clock after a lifecycle transition (fire-and-forget)."""
+        if self._activity_recorder is not None:
+            self._activity_recorder.record(sandbox_id)
+
+    def _validated_idle_policy_annotation(
+        self, request: CreateSandboxRequest
+    ) -> Optional[str]:
+        """Validate the declared policy (deployment bounds included) and
+        return the annotation value, or None. Raises 400 before any create
+        side effect; the TTL bound needs config, so it lives here."""
+        lifecycle = request.lifecycle
+        if lifecycle is None or lifecycle.idle_policy is None:
+            return None
+        policy = lifecycle.idle_policy
+        probe = policy.active_probe
+        try:
+            validated = validate_idle_policy(
+                idle_timeout_seconds=policy.idle_timeout_seconds,
+                on_idle=policy.on_idle,
+                wake_on_access=policy.wake_on_access,
+                active_probe=(
+                    None
+                    if probe is None
+                    else IdlePauseActivityProbe(
+                        port=probe.port,
+                        path=probe.path,
+                        timeout_seconds=(
+                            probe.timeout_seconds
+                            if probe.timeout_seconds is not None
+                            else DEFAULT_PROBE_TIMEOUT_SECONDS
+                        ),
+                    )
+                ),
+                activity_ttl_seconds=self._app_config.automation.idle_pause.activity_ttl_seconds,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": SandboxErrorCodes.INVALID_PARAMETER,
+                    "message": str(exc),
+                },
+            ) from exc
+        return idle_policy_to_annotation(validated)
+
+    def _persist_idle_policy_annotation(
+        self, namespace: str, sandbox_id: str, annotation: str
+    ) -> None:
+        """Best-effort CR annotation write: a failed write leaves the sandbox
+        unpolicied (never auto-paused or auto-woken), so the create itself
+        must not fail after its side effects exist."""
+        try:
+            self._kubernetes_client().patch_custom_object(
+                GROUP,
+                VERSION,
+                namespace,
+                PLURAL,
+                sandbox_id,
+                body={"metadata": {"annotations": {IDLE_POLICY_ANNOTATION_KEY: annotation}}},
+            )
+        except ApiException as exc:
+            logger.warning(
+                f"idle_pause policy annotation write failed sandbox_id={sandbox_id} "
+                f"namespace={namespace} status={exc.status}; sandbox stays unpolicied"
+            )
+        except Exception as exc:
+            logger.warning(
+                f"idle_pause policy annotation write failed sandbox_id={sandbox_id} "
+                f"namespace={namespace} error={exc}; sandbox stays unpolicied"
+            )
+        else:
+            self._cr_reader.invalidate(namespace)
+
+    def _kubernetes_client(self) -> K8sClient:
+        # create_sandbox runs in worker threads; lazy init must not race
+        # (K8sClient._load_config mutates process-global config).
+        with self._k8s_client_lock:
+            if self._k8s_client is None:
+                self._k8s_client = K8sClient(self._k8s)
+            return self._k8s_client
 
     def close(self) -> None:
         self._cr_reader.close()
@@ -217,6 +336,10 @@ class FastSandboxService(SandboxService, ExtensionService):
         return await asyncio.to_thread(self._create_sandbox_sync, request)
 
     def _create_sandbox_sync(self, request: CreateSandboxRequest) -> CreateSandboxResponse:
+        if request.network_policy is not None:
+            self._reject_network_policy_with_upstream_proxy()
+        # Validate the opt-in before any side effect.
+        idle_policy_annotation = self._validated_idle_policy_annotation(request)
         created_at = datetime.now(timezone.utc)
         # Template mode: the resolved artifact reference becomes
         # the FastPath image; workload shape comes from the golden image.
@@ -304,6 +427,12 @@ class FastSandboxService(SandboxService, ExtensionService):
             info = response.sandbox
         finally:
             self._cr_reader.invalidate(namespace)
+
+        # Durable intent exists (accepted or recovery-confirmed): restart the
+        # idle clock from this transition (OSEP-0024).
+        self._record_activity(sandbox_id)
+        if idle_policy_annotation is not None:
+            self._persist_idle_policy_annotation(namespace, sandbox_id, idle_policy_annotation)
 
         return self._build_create_response(
             request,
@@ -414,6 +543,10 @@ class FastSandboxService(SandboxService, ExtensionService):
             )
         except FastPathError as exc:
             raise self._fastpath_http_error(exc) from exc
+        else:
+            # The idle clock restarts from the resume transition (OSEP-0024):
+            # a stale key or aged tombstone must not cause an immediate pause.
+            self._record_activity(sandbox_id)
         finally:
             self._cr_reader.invalidate(namespace)
 
@@ -566,9 +699,17 @@ class FastSandboxService(SandboxService, ExtensionService):
         """Remove rules by target from the persisted egress binding (idempotent)."""
         current = self.get_network_policy(sandbox_id)
         kept = delete_policy_rules(current["policy"], targets)
-        return self._commit_network_policy(sandbox_id, normalized_policy(NetworkPolicy.model_validate(kept)))
+        return self._commit_network_policy(
+            sandbox_id,
+            normalized_policy(NetworkPolicy.model_validate(kept)),
+            guard_upstream_proxy=False,
+        )
 
-    def _commit_network_policy(self, sandbox_id: str, normalized: dict) -> dict:
+    def _commit_network_policy(
+        self, sandbox_id: str, normalized: dict, *, guard_upstream_proxy: bool = True
+    ) -> dict:
+        if guard_upstream_proxy:
+            self._reject_network_policy_with_upstream_proxy()
         current = self._cr_reader.get(self._resolve_namespace(), sandbox_id)
         metadata = current["metadata"]
         bindings = [dict(b) for b in current["spec"].get("actionBindings", [])]
@@ -612,6 +753,26 @@ class FastSandboxService(SandboxService, ExtensionService):
 
     # -- helpers -----------------------------------------------------------
 
+    def _reject_network_policy_with_upstream_proxy(self) -> None:
+        """The shared-Fastlet egress cannot chain through an upstream proxy, so
+        networkPolicy create/replace/patch is refused while it is configured.
+        Deleting rules stays available so operators can still tear down a
+        policy on existing sandboxes."""
+        egress = self._app_config.egress
+        if egress is None or egress.upstream_proxy is None:
+            return
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": SandboxErrorCodes.INVALID_PARAMETER,
+                "message": (
+                    "networkPolicy is not supported for fast sandboxes while "
+                    "egress.upstream_proxy is configured: the shared-Fastlet "
+                    "egress cannot chain through the upstream proxy"
+                ),
+            },
+        )
+
     def _unsupported(
         self, feature: str, status_code: int = status.HTTP_400_BAD_REQUEST
     ) -> HTTPException:
@@ -626,12 +787,20 @@ class FastSandboxService(SandboxService, ExtensionService):
     def _fastpath_http_error(self, exc: FastPathError) -> HTTPException:
         """Map a typed FastPath error to the public HTTP contract."""
         if isinstance(exc, FastPathResourceExhausted):
+            # Upstream may classify runtime admission/create failures (e.g.
+            # Firecracker snapshot/KVM errors) as RESOURCE_EXHAUSTED; keep the
+            # underlying message visible so it is not mistaken for pool
+            # exhaustion (see opensandbox-group/OpenSandbox#2000).
+            logger.warning(
+                "FastPath resource exhausted: code=%s message=%s", exc.code, exc.message
+            )
             return HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 headers={"Retry-After": "1"},
                 detail={
                     "code": SandboxErrorCodes.FSB_API_ERROR,
-                    "message": "FastPath pool capacity is temporarily unavailable.",
+                    "message": exc.message,
+                    "cause": "FastPath pool capacity is temporarily unavailable.",
                 },
             )
         if isinstance(exc, FastPathNotFound):
@@ -667,6 +836,9 @@ class FastSandboxService(SandboxService, ExtensionService):
                 },
             )
         if isinstance(exc, FastPathUnavailable):
+            logger.warning(
+                "FastPath backend unavailable: code=%s message=%s", exc.code, exc.message
+            )
             return HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={

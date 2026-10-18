@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -171,6 +171,7 @@ func TestMarshalDecisionSnapshotRejectsNonCanonicalOrUnsafeInput(t *testing.T) {
 		{"noncanonical port", func(s *ActiveSnapshot) int64 { s.Bindings[0].Match.Ports = []int{443}; return 1 }},
 		{"reserved rendered header", func(s *ActiveSnapshot) int64 { s.Bindings[0].Headers[0].Name = "Content-Length"; return 1 }},
 		{"missing redaction", func(s *ActiveSnapshot) int64 { s.Redactions = nil; return 1 }},
+		{"rendered dynamic binding", func(s *ActiveSnapshot) int64 { s.Bindings[0].Dynamic = true; return 1 }},
 		{"redaction without binding", func(s *ActiveSnapshot) int64 { s.Bindings = nil; return 1 }},
 	}
 	for _, tc := range tests {

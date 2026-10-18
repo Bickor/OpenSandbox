@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -210,6 +210,11 @@ type SandboxFromTemplateOptions struct {
 	// Extensions for provider-specific parameters.
 	Extensions map[string]string
 
+	// IdlePolicy is the optional idle behavior (OSEP-0024, fast-sandbox
+	// only). Control-plane state, not workload shape, so template mode
+	// accepts it.
+	IdlePolicy *IdlePolicy
+
 	// SkipHealthCheck skips the WaitUntilReady call after creation.
 	SkipHealthCheck bool
 
@@ -227,16 +232,20 @@ type SandboxFromTemplateOptions struct {
 // template and waits for it to be ready.
 //
 // Template mode fixes the workload shape on the server: the entrypoint, env,
-// resources, volumes, platform and lifecycle of the sandbox come from the
-// template's golden image and cannot be overridden here. Only metadata,
-// network policy and extensions may accompany the template ID, and the
-// timeout is required.
+// resources, volumes, platform and lifecycle hooks of the sandbox come from
+// the template's golden image and cannot be overridden here. Only metadata,
+// network policy, extensions and the OSEP-0024 idle policy (control-plane
+// state, not workload shape) may accompany the template ID, and the timeout
+// is required.
 func CreateSandboxFromTemplate(ctx context.Context, config ConnectionConfig, templateID string, opts SandboxFromTemplateOptions) (*Sandbox, error) {
 	if templateID == "" {
 		return nil, &InvalidArgumentError{Field: "templateID", Message: "template ID is required"}
 	}
 	if opts.TimeoutSeconds <= 0 {
 		return nil, &InvalidArgumentError{Field: "TimeoutSeconds", Message: "timeout is required when creating from a template"}
+	}
+	if err := opts.IdlePolicy.Validate(); err != nil {
+		return nil, err
 	}
 
 	lc := config.lifecycleClient()
@@ -249,6 +258,9 @@ func CreateSandboxFromTemplate(ctx context.Context, config ConnectionConfig, tem
 		Metadata:      opts.Metadata,
 		NetworkPolicy: opts.NetworkPolicy,
 		Extensions:    opts.Extensions,
+	}
+	if opts.IdlePolicy != nil {
+		req.Lifecycle = &SandboxLifecycle{IdlePolicy: opts.IdlePolicy}
 	}
 
 	created, err := lc.CreateSandbox(ctx, req)
@@ -414,7 +426,8 @@ func (s *Sandbox) Resume(ctx context.Context, opts ...ReadyOptions) (*Sandbox, e
 	return ResumeSandbox(ctx, *s.config, s.id, opts...)
 }
 
-// Kill terminates the sandbox. This is irreversible.
+// Kill requests irreversible sandbox termination.
+// Returns when deletion is accepted; runtime cleanup may continue afterward.
 func (s *Sandbox) Kill(ctx context.Context) error {
 	if s.lifecycle.cache != nil {
 		s.lifecycle.cache.Invalidate(s.id)
@@ -463,7 +476,9 @@ func (s *Sandbox) Ping(ctx context.Context) error {
 	return s.execd.Ping(ctx)
 }
 
-// Renew extends the sandbox's expiration by the given duration from now.
+// Renew sets the sandbox's expiration to the given duration from now.
+// This may shorten or extend the remaining lifetime. The creation-time
+// server timeout limit does not apply.
 func (s *Sandbox) Renew(ctx context.Context, duration time.Duration) (*RenewExpirationResponse, error) {
 	return s.lifecycle.RenewExpiration(ctx, s.id, time.Now().Add(duration))
 }

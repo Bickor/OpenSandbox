@@ -21,7 +21,7 @@ This is the complete list of OpenSandbox Enhancement Proposals:
 | [OSEP-0013](0013-isolated-execution-api.md)                    |      Isolated Execution API                                               | implementing  |  2026-06-23  |
 | [OSEP-0014](0014-multi-tenancy.md)                             |      Multi-Tenancy Support for Kubernetes Runtime                         |  implemented  |  2026-07-27  |
 | [OSEP-0015](0015-pod-snapshot.md)                              |      Spec-Driven Pod Snapshot for Pause and Resume                        |     draft     |  2026-06-27  |
-| [OSEP-0016](0016-unified-umbrella-release-governance.md)       |      Unified Umbrella Release Governance                                  |     draft     |  2026-07-21  |
+| [OSEP-0016](0016-unified-umbrella-release-governance.md)       |      Unified Umbrella Release Governance                                  |  implemented  |  2026-09-21  |
 | [OSEP-0017](0017-resilient-sdk-transport.md)                   |      Resilient SDK Transport                                              | implementing  |  2026-07-22  |
 | [OSEP-0018](0018-execd-as-sandbox-init.md)                     |      execd as Sandbox Init                                                |     draft     |  2026-07-27  |
 | [OSEP-0019](0019-node-agent-sandbox-collection.md)             |      Node Agent for Node-Level Sandbox Collection                         | implementing  |  2026-08-11  |
@@ -29,3 +29,4 @@ This is the complete list of OpenSandbox Enhancement Proposals:
 | [OSEP-0021](0021-scalable-asynchronous-client-side-pool-warmup.md) |      Scalable Asynchronous Client-Side Pool Warmup                      |     draft     |  2026-08-19  |
 | [OSEP-0022](0022-multi-sandbox-egress-control-plane.md)        |      Multi-Sandbox Egress Control Plane                                  | implementing  |  2026-08-21  |
 | [OSEP-0023](0023-credential-bound-tls-interception.md)          |      Credential-Bound TLS Interception                                    | implementing  |  2026-09-09  |
+| [OSEP-0024](0024-auto-pause-and-wake-on-access-for-fast-sandbox.md) |      Auto-Pause and Wake-on-Access for Fast Sandbox                  | implementing  |  2026-10-12  |

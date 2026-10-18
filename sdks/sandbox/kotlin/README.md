@@ -58,7 +58,7 @@ public class QuickStart {
             System.out.println(execution.getLogs().getStdout().get(0).getText());
 
             // 5. Cleanup (sandbox.close() called automatically)
-            // Note: kill() must be called explicitly if you want to terminate the remote sandbox instance immediately
+            // kill() requests remote deletion; runtime cleanup may continue after it returns.
             sandbox.kill();
         } catch (SandboxException e) {
             // Handle Sandbox specific exceptions
@@ -238,7 +238,9 @@ the session around:
 ```java
 IsolationSession session = sandbox.isolation().create(
     new CreateIsolatedSessionRequest(
-        new IsolatedWorkspaceSpec("/workspace", "rw"),  // path, mode
+        new IsolatedWorkspaceSpec("/workspace", "rw"),  // legacy workspace sugar, prepended
+        List.of(                                        // overlays: path, mode, persist
+            new IsolatedOverlaySpec("/data/scratch", "overlay", false)),
         "strict",                                       // profile
         null,                                           // extraWritable
         List.of(new BindMount("/data", "/data", true)), // binds: source, dest, readonly
@@ -418,6 +420,16 @@ Pool lifecycle semantics:
 ### 1. Connection Configuration
 
 The `ConnectionConfig` class manages API server connection settings.
+
+Transfer timeouts:
+
+- `requestTimeout` bounds each transport phase - connecting, waiting for response
+  headers, and waiting for more of a response body - but it never caps a healthy
+  file upload or download that keeps making progress. A transfer that stalls for
+  longer than the timeout, or an upload that gets no response headers within it
+  after the body has been sent, fails instead of hanging (the Go SDK's
+  `ResponseHeaderTimeout` contract). An explicit `RetryPolicy.overallDeadline`
+  still caps the whole transfer.
 
 | Parameter        | Description                                | Default                      | Environment Variable   |
 | ---------------- | ------------------------------------------ | ---------------------------- | ---------------------- |

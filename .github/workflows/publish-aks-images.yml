@@ -206,6 +206,7 @@ jobs:
               egress)
                 (cd components/egress && CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" go build -trimpath -buildvcs=false -ldflags "$VERSION_LDFLAGS" -o "../../${outdir}/egress" .)
                 (cd components/egress && CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" go build -trimpath -buildvcs=false -ldflags "-buildid= -B none" -o "../../${outdir}/opensandbox-psat" ./cmd/opensandbox-psat)
+                (cd components/egress && CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" go build -trimpath -buildvcs=false -ldflags "-s -w -buildid= -B none" -o "../../${outdir}/egress-trace" ./tools/egress-trace)
                 (cd components/internal && CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" go build -trimpath -buildvcs=false -ldflags "$VERSION_LDFLAGS" -o "../../${outdir}/opensandbox-supervisor" ./cmd/supervisor)
                 ;;
               controller)
@@ -323,10 +324,12 @@ jobs:
                   python3 \
                   python3-pip \
               && rm -rf /var/lib/apt/lists/*
+          COPY components/egress/requirements-mitmproxy.txt /tmp/requirements-mitmproxy.txt
           RUN useradd -r -u 10042 -d /var/lib/mitmproxy -s /usr/sbin/nologin mitmproxy \
               && mkdir -p /var/lib/mitmproxy/.mitmproxy \
               && chown -R mitmproxy:mitmproxy /var/lib/mitmproxy \
-              && pip3 install --no-cache-dir --break-system-packages 'mitmproxy==11.0.2' \
+              && pip3 install --no-cache-dir --break-system-packages \
+                  -r /tmp/requirements-mitmproxy.txt \
               && (command -v mitmdump && mitmdump --version) \
               && mkdir -p /var/egress/mitmscripts \
               && install -d -o root -g root -m 0755 /usr/libexec/opensandbox/credential-providers
@@ -335,14 +338,21 @@ jobs:
               && chmod 0644 /var/lib/mitmproxy/.mitmproxy/config.yaml
           COPY .build/aks/egress/linux_${TARGETARCH}/egress /opt/opensandbox-egress/egress
           COPY .build/aks/egress/linux_${TARGETARCH}/opensandbox-supervisor /opt/opensandbox-egress/supervisor
+          COPY .build/aks/egress/linux_${TARGETARCH}/egress-trace /opt/opensandbox-egress/egress-trace
           COPY .build/aks/egress/linux_${TARGETARCH}/opensandbox-psat /usr/libexec/opensandbox/credential-providers/opensandbox-psat
           COPY components/egress/scripts/cleanup.sh /opt/opensandbox-egress/cleanup.sh
           RUN chmod 0755 /opt/opensandbox-egress/cleanup.sh \
                       /opt/opensandbox-egress/egress \
                       /opt/opensandbox-egress/supervisor \
+                      /opt/opensandbox-egress/egress-trace \
               && chmod 0500 /usr/libexec/opensandbox/credential-providers/opensandbox-psat \
-              && ln -s /opt/opensandbox-egress/egress /egress
+              && ln -s /opt/opensandbox-egress/egress /egress \
+              && ln -s /opt/opensandbox-egress/egress-trace /usr/local/bin/egress-trace
           COPY components/egress/mitmscripts /var/egress/mitmscripts
+          RUN chmod -R a+rX /var/egress/mitmscripts \
+              && PYTHONPATH=/var/egress/mitmscripts python3 -c \
+                  'import sys; from credential_bound_h2 import PINS, dependency_versions_supported; \
+                   raise SystemExit(0 if dependency_versions_supported() else f"unsupported H2 runtime: interpreter={sys.implementation.name}, sys.version={sys.version!r}; required CPython 3.10/3.11 and packages={PINS}")'
           ENTRYPOINT ["/opt/opensandbox-egress/supervisor", \
                       "--pre-start=/opt/opensandbox-egress/cleanup.sh", \
                       "--name=egress", \

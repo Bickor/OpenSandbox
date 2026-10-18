@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,11 +20,13 @@ import http.client
 import importlib.util
 import json
 import os
+import select
 import shutil
 import socket
 import stat
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -44,6 +46,12 @@ def load(name):
 
 
 receiver = load("revision_receiver")
+load("host_selectors")
+load("decision_snapshot")
+load("static_passthrough")
+load("tls_decision")
+load("tls_registry")
+publication = load("revision_publication")
 ipc = load("revision_ipc")
 
 
@@ -58,7 +66,24 @@ class UnixConnection(http.client.HTTPConnection):
         self.sock.connect(self.path)
 
 
+class LateBodyConnection(UnixConnection):
+    """Send the body only after the server has replied and closed."""
+
+    def __init__(self, path):
+        super().__init__(path)
+        self.sends = 0
+
+    def send(self, data):
+        self.sends += 1
+        if self.sends == 2:  # http.client writes headers and body separately
+            select.select([self.sock], [], [], self.timeout)
+            time.sleep(0.05)
+        super().send(data)
+
+
 class RevisionIPCTest(unittest.TestCase):
+    connection_class = UnixConnection
+
     def setUp(self):
         self.directory = tempfile.mkdtemp(prefix="osri-", dir="/tmp")
         self.path = os.path.join(self.directory, "receiver.sock")
@@ -101,8 +126,14 @@ class RevisionIPCTest(unittest.TestCase):
         headers = {"Authorization": f"Bearer {token}"}
         if body is not None:
             headers["Content-Type"] = "application/json"
-        connection = UnixConnection(self.path)
-        connection.request(method, target, body=body, headers=headers)
+        connection = self.connection_class(self.path)
+        try:
+            connection.request(method, target, body=body, headers=headers)
+        except (BrokenPipeError, ConnectionResetError):
+            # 401/404 replies fail closed without reading the body and close the
+            # socket, which can beat http.client's separate body write. The reply
+            # is already complete; with no reply, getresponse() still raises.
+            pass
         response = connection.getresponse()
         data = response.read()
         connection.close()
@@ -178,6 +209,21 @@ class RevisionIPCTest(unittest.TestCase):
             (404, {"error": "not_found"}),
         )
 
+    def test_reply_before_body_is_read_is_returned(self):
+        self.start()
+        self.connection_class = LateBodyConnection
+        self.assertEqual(
+            self.request("POST", "/v1/revisions/missing", {"secret": "never-log-me"}),
+            (404, {"error": "not_found"}),
+        )
+        revision = self.revision(1, 1, b"secret")
+        self.assertEqual(
+            self.request(
+                "POST", "/v1/revisions/commit", {"revision": revision}, token="x" * 32
+            ),
+            (401, {"error": "unauthorized"}),
+        )
+
     def test_lifecycle_refuses_existing_path_and_fences_receiver(self):
         invalid = (
             (self.path, "short", 128, 1),
@@ -240,6 +286,60 @@ class RevisionIPCTest(unittest.TestCase):
         with self.assertRaises(receiver.RevisionError):
             self.receiver.readback()
         self.server.close()
+
+
+class InstallationIPCTest(unittest.TestCase):
+    def test_exact_backend_types_reject_subclasses_and_duck_typing_before_socket_creation(self):
+        class Subclass(publication.InstallationReceiver):
+            pass
+        class ReceiverSubclass(receiver.Receiver):
+            pass
+        invalid = (
+            Subclass("control-a", "subject-a", max_snapshot_bytes=65536),
+            ReceiverSubclass("control-a", "subject-a", lambda value: None, max_snapshot_bytes=65536),
+            publication.RevisionPublisher("control-a", "subject-a", max_snapshot_bytes=65536, capacity=1),
+            object(),
+        )
+        with tempfile.TemporaryDirectory(prefix="osri-", dir="/tmp") as directory:
+            for backend in invalid:
+                with (
+                    self.subTest(backend=type(backend).__name__),
+                    self.assertRaisesRegex(ipc.ServerError, "^invalid revision IPC configuration$"),
+                ):
+                    ipc.Server(backend, os.path.join(directory, "receiver.sock"), TOKEN,
+                               max_snapshot_bytes=65536, request_timeout=1)
+
+    def test_joint_backend_over_real_unix_socket(self):
+        from test_tls_registry import TLSRegistryTest
+        fixture = TLSRegistryTest()
+        backend = publication.InstallationReceiver("control-a", "subject-a", max_snapshot_bytes=65536)
+        with tempfile.TemporaryDirectory(prefix="osri-", dir="/tmp") as directory:
+            path = os.path.join(directory, "receiver.sock")
+            server = ipc.Server(backend, path, TOKEN, max_snapshot_bytes=65536, request_timeout=1)
+            try:
+                server.start()
+                for snapshot in (fixture.snapshot(host=None), fixture.snapshot(epoch=2, secret="private-old"),
+                                 fixture.snapshot(epoch=3, secret="private-new"), fixture.snapshot(epoch=4, host=None)):
+                    wire = ipc._to_wire(snapshot.revision)
+                    for operation in ("prepare", "commit"):
+                        value = {"revision": wire}
+                        if operation == "prepare":
+                            value["payload"] = base64.b64encode(snapshot.payload).decode()
+                        connection = UnixConnection(path)
+                        try:
+                            connection.request("POST", "/v1/revisions/" + operation, json.dumps(value),
+                                               {"Authorization": "Bearer " + TOKEN, "Content-Type": "application/json"})
+                            response = connection.getresponse()
+                            self.assertEqual((response.status, json.loads(response.read())), (200, {"revision": wire}))
+                        finally:
+                            connection.close()
+                    self.assertEqual(backend.acquire(), snapshot)
+                    self.assertEqual(backend._publisher.registry._view.revision, snapshot.revision)
+            finally:
+                server.close()
+            self.assertFalse(os.path.exists(path))
+            self.assertTrue(backend._publisher.registry._closed)
+            self.assertTrue(backend._publisher._receiver._closed)
 
 
 if __name__ == "__main__":

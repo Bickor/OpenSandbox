@@ -1,7 +1,7 @@
 # pyright: reportAttributeAccessIssue=false
 # protobuf-generated modules expose dynamic attributes.
 
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -278,10 +278,13 @@ def _canonical_quantity(value: str) -> decimal.Decimal:
 def _reject_unsupported_fields(request: CreateSandboxRequest) -> None:
     """Reject pod-identity-dependent fields that have no shared-Fastlet meaning."""
     if request.lifecycle is not None:
-        raise UnsupportedFieldError(
-            "lifecycle",
-            "lifecycle hooks are not supported by the fsb backend",
-        )
+        if request.lifecycle.has_hooks:
+            raise UnsupportedFieldError(
+                "lifecycle",
+                "lifecycle hooks are not supported by the fsb backend; "
+                "only lifecycle.idlePolicy is accepted (OSEP-0024)",
+            )
+        # idlePolicy is validated and persisted as a CR annotation by the service.
     # snapshotId is allowed: restore resolution replaced it with the snapshot
     # artifact reference (restore_config.image) before routing reached fsb.
     if request.platform is not None:

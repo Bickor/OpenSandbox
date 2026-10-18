@@ -16,10 +16,12 @@
 
 """Contains all the data models used in inputs/outputs"""
 
+from .activity_probe import ActivityProbe
 from .allocation_summary import AllocationSummary
 from .allocation_summary_mode import AllocationSummaryMode
 from .allocation_summary_state import AllocationSummaryState
 from .create_fsb_template_request import CreateFsbTemplateRequest
+from .create_fsb_template_request_env import CreateFsbTemplateRequestEnv
 from .create_fsb_template_request_format import CreateFsbTemplateRequestFormat
 from .create_fsb_template_request_metadata import CreateFsbTemplateRequestMetadata
 from .create_sandbox_request import CreateSandboxRequest
@@ -35,12 +37,15 @@ from .endpoint import Endpoint
 from .endpoint_headers import EndpointHeaders
 from .error_response import ErrorResponse
 from .fsb_template import FsbTemplate
+from .fsb_template_env import FsbTemplateEnv
 from .fsb_template_format import FsbTemplateFormat
 from .fsb_template_metadata import FsbTemplateMetadata
 from .fsb_template_readiness import FsbTemplateReadiness
 from .fsb_template_status import FsbTemplateStatus
 from .fsb_template_status_phase import FsbTemplateStatusPhase
 from .host import Host
+from .idle_policy import IdlePolicy
+from .idle_policy_on_idle import IdlePolicyOnIdle
 from .image_spec import ImageSpec
 from .image_spec_auth import ImageSpecAuth
 from .lifecycle_hook import LifecycleHook
@@ -76,10 +81,12 @@ from .snapshot_status import SnapshotStatus
 from .volume import Volume
 
 __all__ = (
+    "ActivityProbe",
     "AllocationSummary",
     "AllocationSummaryMode",
     "AllocationSummaryState",
     "CreateFsbTemplateRequest",
+    "CreateFsbTemplateRequestEnv",
     "CreateFsbTemplateRequestFormat",
     "CreateFsbTemplateRequestMetadata",
     "CreateSandboxRequest",
@@ -95,12 +102,15 @@ __all__ = (
     "EndpointHeaders",
     "ErrorResponse",
     "FsbTemplate",
+    "FsbTemplateEnv",
     "FsbTemplateFormat",
     "FsbTemplateMetadata",
     "FsbTemplateReadiness",
     "FsbTemplateStatus",
     "FsbTemplateStatusPhase",
     "Host",
+    "IdlePolicy",
+    "IdlePolicyOnIdle",
     "ImageSpec",
     "ImageSpecAuth",
     "LifecycleHook",

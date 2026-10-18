@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -676,6 +676,7 @@ def test_sync_create_from_template_passes_only_allowed_fields(
             metadata=None,
             network_policy=None,
             extensions=None,
+            idle_policy=None,
         ):
             self.template_calls.append(
                 {
@@ -684,6 +685,7 @@ def test_sync_create_from_template_passes_only_allowed_fields(
                     "metadata": metadata,
                     "network_policy": network_policy,
                     "extensions": extensions,
+                    "idle_policy": idle_policy,
                 }
             )
             return _CreateResponse()

@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -996,6 +996,7 @@ async def test_create_from_template_passes_only_allowed_fields(
             metadata=None,
             network_policy=None,
             extensions=None,
+            idle_policy=None,
         ):
             self.template_calls.append(
                 {
@@ -1004,6 +1005,7 @@ async def test_create_from_template_passes_only_allowed_fields(
                     "metadata": metadata,
                     "network_policy": network_policy,
                     "extensions": extensions,
+                    "idle_policy": idle_policy,
                 }
             )
             return _CreateResponse()
@@ -1069,6 +1071,7 @@ async def test_create_from_template_passes_only_allowed_fields(
     assert call["metadata"] == {"team": "platform"}
     assert call["network_policy"] is None
     assert call["extensions"] is None
+    assert call["idle_policy"] is None
 
 
 @pytest.mark.asyncio
