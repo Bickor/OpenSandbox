@@ -98,6 +98,8 @@ type SandboxSnapshotReconciler struct {
 
 	// SnapshotPushSecret is the K8s Secret name for pushing to registry (from Controller Manager startup params)
 	SnapshotPushSecret string
+	// ResumePullSecret is included in prepared public QEMU restore templates.
+	ResumePullSecret string
 
 	// ImageCommitterPullSecret is the K8s Secret name used to pull the image-committer image in commit Jobs.
 	// Required when imageCommitterImage lives in a private registry.

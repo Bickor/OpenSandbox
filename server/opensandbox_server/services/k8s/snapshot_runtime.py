@@ -52,9 +52,7 @@ PUBLIC_SNAPSHOT_ID_LABEL = "opensandbox.io/snapshot-id"
 PUBLIC_SNAPSHOT_SOURCE_SANDBOX_ID_LABEL = "opensandbox.io/source-sandbox-id"
 PUBLIC_SNAPSHOT_SCOPE_VALUE = "public"
 MAIN_CONTAINER_NAME = "sandbox"
-SUPPORTED_SNAPSHOT_FORMATS = frozenset(
-    {"rootfs-v1", "qemu-v1", "kata-vmstate-v1"}
-)
+SUPPORTED_SNAPSHOT_FORMATS = frozenset({"rootfs-v1", "qemu-v1", "kata-vmstate-v1"})
 
 
 def _stable_hex(value: str) -> str:
@@ -364,9 +362,7 @@ class KubernetesSnapshotRuntime:
         try:
             callback(snapshot_id, namespace)
         except Exception as exc:  # noqa: BLE001 - never propagate into the watch
-            logger.warning(
-                f"Snapshot status callback failed for {namespace}/{snapshot_id}: {exc}"
-            )
+            logger.warning(f"Snapshot status callback failed for {namespace}/{snapshot_id}: {exc}")
 
     def close(self) -> None:
         """Stop informer threads owned by the runtime's dedicated client."""
@@ -421,7 +417,9 @@ class KubernetesSnapshotRuntime:
             if exc.status == 404:
                 logger.info(f"Kubernetes SandboxSnapshot {snapshot_name} already absent")
                 return
-            raise RuntimeError(f"Failed to delete Kubernetes SandboxSnapshot {snapshot_name}: {exc}") from exc
+            raise RuntimeError(
+                f"Failed to delete Kubernetes SandboxSnapshot {snapshot_name}: {exc}"
+            ) from exc
 
     def preflight_delete_snapshot(
         self,
@@ -474,9 +472,7 @@ class KubernetesSnapshotRuntime:
         if snapshot is None:
             return SnapshotRuntimeStatus(
                 state=(
-                    SnapshotState.CREATING
-                    if self._postgresql_ha_enabled
-                    else SnapshotState.FAILED
+                    SnapshotState.CREATING if self._postgresql_ha_enabled else SnapshotState.FAILED
                 ),
                 reason="snapshot_recovery_missing_snapshot",
                 message=(
@@ -595,7 +591,9 @@ class KubernetesSnapshotRuntime:
         normalized = handler.lower()
         return normalized == "runsc" or normalized.startswith("runsc-")
 
-    def _get_snapshot_cr(self, snapshot_name: str, *, namespace: str | None = None) -> Optional[dict]:
+    def _get_snapshot_cr(
+        self, snapshot_name: str, *, namespace: str | None = None
+    ) -> Optional[dict]:
         return self._k8s_client.get_custom_object(
             group=_GROUP,
             version=_VERSION,
@@ -615,13 +613,9 @@ class KubernetesSnapshotRuntime:
             return None
 
         existing_sandbox = (
-            snapshot.get("spec", {}).get("sandboxName")
-            if isinstance(snapshot, dict)
-            else None
+            snapshot.get("spec", {}).get("sandboxName") if isinstance(snapshot, dict) else None
         )
-        if existing_sandbox == sandbox_id or (
-            existing_sandbox is None and not require_source
-        ):
+        if existing_sandbox == sandbox_id or (existing_sandbox is None and not require_source):
             return None
 
         return SnapshotRuntimeStatus(
@@ -648,6 +642,26 @@ class KubernetesSnapshotRuntime:
 
         if phase == "Succeed":
             if snapshot_format == "qemu-v1":
+                metadata = snapshot.get("metadata") or {}
+                if all(
+                    (
+                        status.get("restorePlanSecretName"),
+                        status.get("sourceNodeName"),
+                        metadata.get("name"),
+                        metadata.get("uid"),
+                        status.get("virtualMachine"),
+                    )
+                ):
+                    return SnapshotRuntimeStatus(
+                        state=SnapshotState.READY,
+                        format=snapshot_format,
+                        source_node_name=status["sourceNodeName"],
+                        restore_plan_secret_name=status["restorePlanSecretName"],
+                        restore_plan_owner_name=metadata["name"],
+                        restore_plan_owner_uid=metadata["uid"],
+                        reason="snapshot_runtime_ready",
+                        message="QEMU VM-state snapshot and restore template are ready.",
+                    )
                 return SnapshotRuntimeStatus(
                     state=SnapshotState.FAILED,
                     format=snapshot_format,
@@ -702,18 +716,16 @@ class KubernetesSnapshotRuntime:
             "restore_plan_owner_name": metadata.get("name"),
             "restore_plan_owner_uid": metadata.get("uid"),
         }
-        if (
-            any(
-                not isinstance(value, str) or not value.strip()
-                for value in (
-                    values["restore_plan_secret_name"],
-                    values["restore_plan_owner_name"],
-                    values["restore_plan_owner_uid"],
-                    values["source_node_name"],
-                    values["snapshot_name"],
-                    values["runtime_version"],
-                    values["runtime_class_name"],
-                )
+        if any(
+            not isinstance(value, str) or not value.strip()
+            for value in (
+                values["restore_plan_secret_name"],
+                values["restore_plan_owner_name"],
+                values["restore_plan_owner_uid"],
+                values["source_node_name"],
+                values["snapshot_name"],
+                values["runtime_version"],
+                values["runtime_class_name"],
             )
         ):
             return SnapshotRuntimeStatus(
@@ -737,7 +749,6 @@ class KubernetesSnapshotRuntime:
             message="Kata VM-state snapshot created successfully.",
         )
 
-
     def _select_restore_image(self, containers: list[dict]) -> SnapshotRuntimeStatus:
         if not containers:
             return SnapshotRuntimeStatus(
@@ -747,7 +758,8 @@ class KubernetesSnapshotRuntime:
             )
 
         sandbox_containers = [
-            container for container in containers
+            container
+            for container in containers
             if container.get("containerName") == MAIN_CONTAINER_NAME
         ]
         if sandbox_containers:
@@ -799,8 +811,7 @@ class KubernetesSnapshotRuntime:
                     ),
                 )
             logger.warning(
-                f"Failed to observe Kubernetes SandboxSnapshot {snapshot_name} "
-                f"before create: {exc}"
+                f"Failed to observe Kubernetes SandboxSnapshot {snapshot_name} before create: {exc}"
             )
             return SnapshotRuntimeStatus(
                 state=SnapshotState.CREATING,
@@ -811,8 +822,7 @@ class KubernetesSnapshotRuntime:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                f"Failed to observe Kubernetes SandboxSnapshot {snapshot_name} "
-                f"before create: {exc}"
+                f"Failed to observe Kubernetes SandboxSnapshot {snapshot_name} before create: {exc}"
             )
             return SnapshotRuntimeStatus(
                 state=SnapshotState.CREATING,
@@ -824,9 +834,7 @@ class KubernetesSnapshotRuntime:
 
     @staticmethod
     def _is_retryable_api_error(exc: ApiException) -> bool:
-        return exc.status in (408, 429) or (
-            isinstance(exc.status, int) and exc.status >= 500
-        )
+        return exc.status in (408, 429) or (isinstance(exc.status, int) and exc.status >= 500)
 
 
 __all__ = [

@@ -110,6 +110,19 @@ class CompositeSnapshotRuntime:
     def get_snapshot_status(self, snapshot_id: str) -> Optional[SnapshotRuntimeStatus]:
         return self._default.get_snapshot_status(snapshot_id)
 
+    def preflight_delete_snapshot(
+        self,
+        snapshot_id: str,
+        *,
+        namespace: str | None = None,
+        source_sandbox_id: str | None = None,
+    ) -> None:
+        # Preserve backend deletion guards before the service marks the catalog
+        # Deleting. Older backends without a preflight retain their existing flow.
+        preflight = getattr(self._for_source(source_sandbox_id), "preflight_delete_snapshot", None)
+        if preflight is not None:
+            preflight(snapshot_id, namespace=namespace, source_sandbox_id=source_sandbox_id)
+
     def delete_snapshot(
         self,
         snapshot_id: str,

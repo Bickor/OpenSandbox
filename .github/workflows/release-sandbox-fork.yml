@@ -21,6 +21,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Resolve immutable release version
         id: release
         env:
@@ -29,6 +30,10 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            git merge-base --is-ancestor "$GITHUB_SHA" origin/aks-dev || {
+              echo 'Release tags must point to aks-dev history; dispatch an integration branch for a draft.' >&2
+              exit 1
+            }
             [[ "$GITHUB_REF_NAME" =~ ^sandbox-v([0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+)$ ]]
             version="${BASH_REMATCH[1]}"
           else
@@ -48,7 +53,7 @@ jobs:
           cache-dependency-path: kubernetes/go.sum
       - name: Test snapshot worker and controllers
         working-directory: kubernetes
-        run: go test ./pkg/imagecommitter/katavmstate ./internal/controller -run 'Test.*(Kata|Snapshot|Blob)'
+        run: go test ./pkg/imagecommitter/katavmstate ./cmd/image-committer ./cmd/image-committer-azure ./internal/controller -run 'Test.*(Kata|Snapshot|Blob|QEMU)'
       - name: Test release assembly
         run: python3 -m unittest discover -s manifests/release -p 'test_fork_release.py'
 
@@ -128,6 +133,10 @@ jobs:
               context=.build/dashboard
               dockerfile=.build/dashboard/Dockerfile
               ;;
+            image-committer-azure)
+              context=kubernetes
+              dockerfile=kubernetes/Dockerfile.image-committer-azure
+              ;;
             *)
               context=.build/fork
               dockerfile=manifests/release/Dockerfile.fork-component
@@ -144,6 +153,10 @@ jobs:
             "${args[@]}" --metadata-file "$RUNNER_TEMP/image.json" --push "$context"
           digest=$(jq -er '."containerimage.digest"' "$RUNNER_TEMP/image.json")
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          if [[ "$COMPONENT" == image-committer-azure ]]; then
+            docker run --rm --entrypoint /bin/sh "$REGISTRY/$COMPONENT@$digest" -c \
+              'test -x /usr/local/bin/image-committer-qemu && test -x /usr/local/bin/qemu-checkpoint-helper && test -x /usr/local/bin/vmstate-loader && nerdctl --version'
+          fi
           mkdir -p release-metadata
           jq -n --arg component "$COMPONENT" --arg image "$REGISTRY/$COMPONENT@$digest" \
             --arg digest "$digest" --arg commit "$GITHUB_SHA" \
@@ -229,6 +242,7 @@ jobs:
           if [[ -f kubernetes/pkg/imagecommitter/katavmstate/remote.go ]]; then
             features+=(--remote-snapshots)
           fi
+          features+=(--qemu-snapshots)
           python3 manifests/release/fork_release.py --metadata release-metadata \
             --output dist/fork --version "$VERSION" --commit "$GITHUB_SHA" \
             --repository "$GITHUB_REPOSITORY" "${features[@]}"
@@ -239,9 +253,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.validate.outputs.tag }}
+          DRAFT: ${{ github.ref_type == 'branch' && github.ref_name != 'aks-dev' }}
         run: |
           set -euo pipefail
+          draft_args=()
+          if [[ "$DRAFT" == true ]]; then
+            draft_args+=(--draft)
+          fi
           gh release create "$TAG" dist/fork/* \
-            --target "$GITHUB_SHA" --prerelease --latest=false \
+            --target "$GITHUB_SHA" --prerelease --latest=false "${draft_args[@]}" \
             --title "Sandbox fork $TAG" --notes-file manifests/release/fork-release-notes.md
           echo "Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
