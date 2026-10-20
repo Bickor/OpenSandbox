@@ -259,6 +259,9 @@ func pushImage(targetImage string) error {
 
 	// Try to login using credentials from mounted secret
 	credDir := "/var/run/opensandbox/registry"
+	if configured := os.Getenv("DOCKER_CONFIG"); configured != "" {
+		credDir = configured
+	}
 	configPath := filepath.Join(credDir, "config.json")
 	if _, err := os.Stat(configPath); err == nil {
 		fmt.Printf("Found registry credentials at %s\n", configPath)
@@ -335,13 +338,14 @@ func nerdctlLogin(configPath, registryHost string, insecure bool) error {
 
 	fmt.Printf("Logging in to registry %s as %s\n", registryHost, username)
 
-	loginOpts := append(nerdctlBaseArgs(), "login", "-u", username, "-p", password)
+	loginOpts := append(nerdctlBaseArgs(), "login", "-u", username, "--password-stdin")
 	if insecure {
 		loginOpts = append(loginOpts, "--insecure-registry")
 	}
 	loginOpts = append(loginOpts, registryHost)
 
 	cmd := exec.Command("nerdctl", loginOpts...)
+	cmd.Stdin = strings.NewReader(password)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("nerdctl login failed: %v, output: %s", err, string(output))

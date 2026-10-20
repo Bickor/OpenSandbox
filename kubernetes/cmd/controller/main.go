@@ -501,6 +501,7 @@ func main() {
 		SnapshotRegistry:          snapshotRegistry,
 		SnapshotRegistryInsecure:  snapshotRegistryInsecure,
 		SnapshotPushSecret:        snapshotPushSecret,
+		ResumePullSecret:          resumePullSecret,
 		ImageCommitterPullSecret:  imageCommitterPullSecret,
 		ImageCommitterPodTemplate: imageCommitterPodTemplate,
 		KataVMStateEnabled:        kataVMStateEnabled,

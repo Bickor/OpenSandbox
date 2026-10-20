@@ -5,6 +5,22 @@ description: Publish a complete, digest-pinned AKS demo bundle after every merge
 
 # Fork releases
 
+`aks-dev` is the single maintained source for the complete AKS demo bundle,
+including Kata and QEMU snapshot support, remote storage, and deletion preflight.
+Do not combine snapshot-only releases with components from another release.
+Integration branches can build draft candidates before their PR merges:
+
+```bash
+gh workflow run release-sandbox-fork.yml --repo Bickor/OpenSandbox --ref <integration-branch>
+```
+
+Branch dispatches outside `aks-dev` create a **draft** GitHub prerelease with
+public digest-addressed GHCR images. Download draft assets with authenticated
+`gh release download`. Draft status does not make the container images private.
+Validate the complete candidate in the consuming demo, then merge the PR into
+`aks-dev`; that merge publishes a new complete prerelease from the canonical
+branch. Do not promote an integration-branch draft as the canonical release.
+
 Every push to `Bickor/OpenSandbox:aks-dev` (including each merged PR) runs
 **Release Sandbox Fork**. The release version is `1.1.0-rc.<run-id>.<attempt>`;
 the source SHA, immutable image digests, chart, CRDs and checksums are published
@@ -28,8 +44,8 @@ follow a mutable `latest` tag.
 Push a new `sandbox-vX.Y.Z-rc.N` tag on the commit containing the desired changes.
 The **Release Sandbox Fork** workflow publishes a complete demo-component
 preview to the fork's own GHCR namespace and creates a GitHub prerelease.
-The tag must contain this workflow. No default-branch or upstream merge is
-required for tag-triggered releases. Keep draft PRs open for code review.
+The tag must contain this workflow and point to a commit reachable from
+`aks-dev`. Use a branch dispatch for an unmerged candidate.
 
 ```bash
 git tag sandbox-v0.1.0-rc.2 <reviewed-commit>
@@ -50,6 +66,13 @@ New GHCR packages may default to private: grant consumers package read access or
 explicitly make these fork packages public before anonymous AKS/ACR pulls.
 
 ## Consume a release
+
+QEMU-capable releases declare `capabilities.qemuSnapshots: true`. Their Azure
+committer uses `kubernetes/Dockerfile.image-committer-azure`, including nerdctl,
+the standard QEMU worker, checkpoint helper and VMState loader. The release job
+checks those executables in the published image before publishing the bundle.
+Consumers should verify the source commit includes the public QEMU restore
+changes as well as checking the capability and immutable image/chart digests.
 
 `release.json` records the source SHA, all demo-component image
 digests and matching chart checksum. `release-values.json` is a Helm override;

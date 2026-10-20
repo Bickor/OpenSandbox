@@ -80,7 +80,6 @@ SNAPSHOT_LIST_SYNC_BUDGET_SECONDS = 2.0
 
 
 class SnapshotService(ABC):
-
     @abstractmethod
     def create_snapshot(self, sandbox_id: str, request: CreateSnapshotRequest) -> Snapshot:
         pass
@@ -211,7 +210,9 @@ class PersistedSnapshotService(SnapshotService):
             )
         )
 
-        total_pages = ceil(result.total_items / pagination.page_size) if result.total_items > 0 else 0
+        total_pages = (
+            ceil(result.total_items / pagination.page_size) if result.total_items > 0 else 0
+        )
         page_items = list(result.items)
         self._sync_creating_records(page_items)
         if request.filter.state:
@@ -363,9 +364,7 @@ class PersistedSnapshotService(SnapshotService):
                 source_sandbox_id=record.source_sandbox_id,
             )
         except Exception as exc:  # noqa: BLE001 - convergence retries on the next read
-            logger.warning(
-                f"Snapshot status read failed for {record.id}: {exc}"
-            )
+            logger.warning(f"Snapshot status read failed for {record.id}: {exc}")
             return None
 
     def _sync_creating_records(self, records: list[SnapshotRecord]) -> None:
@@ -639,7 +638,9 @@ class PersistedSnapshotService(SnapshotService):
                 runtime_version=runtime_status.runtime_version,
                 runtime_class_name=runtime_status.runtime_class_name,
             )
-            if not runtime_status.image and not restore_config.is_complete_kata_plan():
+            if not runtime_status.image and not (
+                restore_config.is_complete_kata_plan() or restore_config.is_complete_qemu_plan()
+            ):
                 return SnapshotRecord(
                     id=record.id,
                     source_sandbox_id=record.source_sandbox_id,
@@ -677,9 +678,7 @@ class PersistedSnapshotService(SnapshotService):
             )
 
         if runtime_status.state == SnapshotState.FAILED:
-            restore_config = SnapshotRestoreConfig.from_dict(
-                record.restore_config.to_dict()
-            )
+            restore_config = SnapshotRestoreConfig.from_dict(record.restore_config.to_dict())
             restore_config.format = runtime_status.format or restore_config.format
             return SnapshotRecord(
                 id=record.id,
@@ -708,7 +707,7 @@ class PersistedSnapshotService(SnapshotService):
         source_sandbox_id: str | None = None,
         format: str | None = None,
     ) -> bool:
-        if not image and format != "kata-vmstate-v1":
+        if not image and format not in {"kata-vmstate-v1", "qemu-v1"}:
             return False
 
         try:
@@ -757,7 +756,7 @@ class PersistedSnapshotService(SnapshotService):
     def _to_snapshot_response(record: SnapshotRecord) -> Snapshot:
         restore_constraints = None
         if (
-            record.restore_config.format == "kata-vmstate-v1"
+            record.restore_config.format in {"kata-vmstate-v1", "qemu-v1"}
             and record.restore_config.source_node_name
         ):
             restore_constraints = SnapshotRestoreConstraints(
@@ -860,10 +859,7 @@ def create_snapshot_service(sandbox_service) -> SnapshotService:
         docker_client=getattr(sandbox_service, "docker_client", None),
     )
 
-    if (
-        active_config.store.type == "postgresql"
-        and active_config.runtime.type == "kubernetes"
-    ):
+    if active_config.store.type == "postgresql" and active_config.runtime.type == "kubernetes":
         return PostgreSQLKubernetesSnapshotService(
             snapshot_repository=get_snapshot_repository(),
             sandbox_service=sandbox_service,

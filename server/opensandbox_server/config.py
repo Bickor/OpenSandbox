@@ -613,6 +613,10 @@ class ProxyConfig(BaseModel):
 
 
 class KubernetesRuntimeConfig(BaseModel):
+    runtime_class_templates: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Operator-approved RuntimeClass to BatchSandbox template paths; selected by extensions.runtimeClassName.",
+    )
     kubeconfig_path: Optional[str] = Field(
         default=None,
         description="Absolute path to the kubeconfig file used for API authentication.",

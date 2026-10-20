@@ -1764,7 +1764,7 @@ components:
         When `image` is provided, `entrypoint` is required. When `snapshotId` is
         provided for an image-backed snapshot, `entrypoint` is optional. If omitted,
         the server defaults the sandbox entrypoint to `["tail", "-f", "/dev/null"]`.
-        A `kata-vmstate-v1` snapshot restore accepts only `snapshotId`, `timeout`,
+        A `kata-vmstate-v1` or `qemu-v1` snapshot restore accepts only `snapshotId`, `timeout`,
         and `metadata` and does not inject an image or default entrypoint.
 
         **Pool mode**: When `extensions.poolRef` is set, the sandbox is created from
