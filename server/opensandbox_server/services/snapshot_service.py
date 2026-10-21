@@ -30,7 +30,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 import logging
 from math import ceil
-from threading import Event, Lock, Thread
+from threading import Event, RLock, Thread
 import time
 from uuid import uuid4
 
@@ -126,6 +126,8 @@ class PersistedSnapshotService(SnapshotService):
         self._snapshot_repository = snapshot_repository
         self._sandbox_service = sandbox_service
         self._snapshot_runtime = snapshot_runtime or NoopSnapshotRuntime()
+        self._inflight_snapshot_ids: set[str] = set()
+        self._inflight_lock = RLock()
         self._snapshot_executor = snapshot_executor or ThreadPoolExecutor(
             max_workers=SNAPSHOT_WORKER_MAX_WORKERS,
             thread_name_prefix="snapshot-create",
@@ -192,8 +194,10 @@ class PersistedSnapshotService(SnapshotService):
             created_at=now,
             updated_at=now,
         )
-        self._snapshot_repository.create(record)
-        self._submit_snapshot_worker(record)
+        # A reader must not observe the row before its worker is registered.
+        with self._inflight_lock:
+            self._snapshot_repository.create(record)
+            self._submit_snapshot_worker(record)
         return self._to_snapshot_response(record)
 
     def list_snapshots(self, request: ListSnapshotsRequest) -> ListSnapshotsResponse:
@@ -346,6 +350,9 @@ class PersistedSnapshotService(SnapshotService):
 
     def _converge_from_runtime(self, record: SnapshotRecord) -> bool:
         """One runtime observation; CAS-complete the row when terminal."""
+        with self._inflight_lock:
+            if record.id in self._inflight_snapshot_ids:
+                return False
         runtime_status = self._observe_runtime(record)
         if runtime_status is None or runtime_status.state not in (
             SnapshotState.READY,
@@ -505,10 +512,24 @@ class PersistedSnapshotService(SnapshotService):
             logger.exception(f"Snapshot worker exited unexpectedly: {exc}")
 
     def _submit_snapshot_worker(self, record: SnapshotRecord) -> None:
-        future = self._snapshot_executor.submit(
-            self._create_snapshot_worker,
-            record,
-        )
+        with self._inflight_lock:
+            if record.id in self._inflight_snapshot_ids:
+                return
+            self._inflight_snapshot_ids.add(record.id)
+
+        def run_tracked_worker() -> None:
+            try:
+                self._create_snapshot_worker(record)
+            finally:
+                with self._inflight_lock:
+                    self._inflight_snapshot_ids.discard(record.id)
+
+        try:
+            future = self._snapshot_executor.submit(run_tracked_worker)
+        except BaseException:
+            with self._inflight_lock:
+                self._inflight_snapshot_ids.discard(record.id)
+            raise
         future.add_done_callback(self._log_worker_failure)
 
     def _complete_snapshot(self, record: SnapshotRecord, runtime_status) -> None:
@@ -798,8 +819,6 @@ class PostgreSQLKubernetesSnapshotService(PersistedSnapshotService):
             raise ValueError("recovery_interval_seconds must be greater than zero")
         self._recovery_interval_seconds = recovery_interval_seconds
         self._recovery_stop = Event()
-        self._inflight_snapshot_ids: set[str] = set()
-        self._inflight_lock = Lock()
         super().__init__(
             snapshot_repository,
             sandbox_service,
@@ -829,28 +848,6 @@ class PostgreSQLKubernetesSnapshotService(PersistedSnapshotService):
                     exc_info=True,
                 )
             self._recovery_stop.wait(self._recovery_interval_seconds)
-
-    def _submit_snapshot_worker(self, record: SnapshotRecord) -> None:
-        with self._inflight_lock:
-            if record.id in self._inflight_snapshot_ids:
-                return
-            self._inflight_snapshot_ids.add(record.id)
-
-        def run_tracked_worker() -> None:
-            try:
-                self._create_snapshot_worker(record)
-            finally:
-                with self._inflight_lock:
-                    self._inflight_snapshot_ids.discard(record.id)
-
-        try:
-            future = self._snapshot_executor.submit(run_tracked_worker)
-        except BaseException:
-            with self._inflight_lock:
-                self._inflight_snapshot_ids.discard(record.id)
-            raise
-        future.add_done_callback(self._log_worker_failure)
-
 
 def create_snapshot_service(sandbox_service) -> SnapshotService:
     active_config = get_config()
